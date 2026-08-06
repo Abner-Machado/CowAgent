@@ -12,7 +12,7 @@ class ToolStage(Enum):
 
 class ToolResult:
     """Tool execution result"""
-    
+
     def __init__(self, status: str = None, result: Any = None, ext_data: Any = None):
         self.status = status
         self.result = result
