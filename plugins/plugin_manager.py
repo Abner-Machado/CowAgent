@@ -244,7 +244,7 @@ class PluginManager:
                     instance.handlers[e_context.event](e_context, *args, **kwargs)
                     if e_context.is_break():
                         e_context["breaked_by"] = name
-                        logger.debug("Plugin %s breaked event %s" % (name, e_context.event))
+                        logger.debug("Plugin %s broke event %s" % (name, e_context.event))
         return e_context
 
     def set_plugin_priority(self, name: str, priority: int):
