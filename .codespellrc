@@ -1,0 +1,10 @@
+[codespell]
+skip = .git,*.lock,*.min.js,node_modules,dist,build,*.spec,desktop/build,plugins/role/roles.json
+# Falsos positivos que NAO devem ser "corrigidos":
+#   datas    -> chave da API do PyInstaller (desktop/build/*.spec)
+#   scaned   -> valor de status vindo de API externa (channel/weixin)
+#   uptodate -> identificador upToDate no codigo do desktop
+#   provid   -> identificador provId
+#   oldes    -> identificador oldEs
+#   nd       -> identificador curto em KnowledgeGraph.tsx
+ignore-words-list = datas,scaned,uptodate,provid,oldes,nd
