@@ -3,10 +3,9 @@ Skill loader for discovering and loading skills from directories.
 """
 
 import os
-from pathlib import Path
-from typing import List, Optional, Dict
+from typing import Optional, Dict
 from common.log import logger
-from agent.skills.types import Skill, SkillEntry, LoadSkillsResult, SkillMetadata
+from agent.skills.types import Skill, SkillEntry, LoadSkillsResult
 from agent.skills.frontmatter import parse_frontmatter, parse_metadata, parse_boolean_value, get_frontmatter_value
 
 

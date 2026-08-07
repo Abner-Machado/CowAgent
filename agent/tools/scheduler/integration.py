@@ -4,7 +4,6 @@ Integration module for scheduler with AgentBridge
 
 import os
 import threading
-from typing import Optional
 from config import conf
 from common.log import logger
 from common.utils import expand_path

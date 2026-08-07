@@ -5,7 +5,6 @@ Translates agent events (message_update, message_end, tool_execution_end, etc.)
 into the CHAT socket protocol format (content chunks with segment_id, tool_calls chunks).
 """
 
-import time
 from typing import Callable, Optional
 
 from common.log import logger

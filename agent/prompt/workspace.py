@@ -6,7 +6,7 @@ Initializes the workspace, creates template files, and loads context files.
 
 from __future__ import annotations
 import os
-from typing import List, Optional, Dict
+from typing import List, Optional
 from dataclasses import dataclass
 
 from common.log import logger

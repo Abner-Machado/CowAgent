@@ -5,7 +5,6 @@ Provides global memory configuration with simplified workspace structure
 """
 
 from __future__ import annotations
-import os
 from dataclasses import dataclass, field
 from typing import Optional, List
 from pathlib import Path

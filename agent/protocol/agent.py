@@ -4,9 +4,9 @@ import time
 import threading
 
 from common.log import logger
-from agent.protocol.models import LLMRequest, LLMModel
+from agent.protocol.models import LLMModel
 from agent.protocol.agent_stream import AgentStreamExecutor
-from agent.protocol.result import AgentAction, AgentActionType, ToolResult, AgentResult
+from agent.protocol.result import AgentAction, AgentActionType, ToolResult
 from agent.tools.base_tool import BaseTool, ToolStage
 
 

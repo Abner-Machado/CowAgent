@@ -5,9 +5,8 @@ Skill manager for managing skill lifecycle and operations.
 import os
 import json
 from typing import Dict, List, Optional
-from pathlib import Path
 from common.log import logger
-from agent.skills.types import Skill, SkillEntry, SkillSnapshot
+from agent.skills.types import SkillEntry, SkillSnapshot
 from agent.skills.loader import SkillLoader
 from agent.skills.formatter import format_skill_entries_for_prompt
 

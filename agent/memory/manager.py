@@ -8,7 +8,7 @@ import os
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult

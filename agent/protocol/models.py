@@ -3,7 +3,7 @@ Models module for agent system.
 Provides basic model classes needed by tools and bridge integration.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 
 class LLMRequest:
