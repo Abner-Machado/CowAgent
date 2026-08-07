@@ -37,7 +37,7 @@ apt-get install libavcodec-extra
 
 - 选择应用管理, 在自建区选创建应用来创建企业自建应用
 - 上传应用logo，填写应用名称等项
-- 创建应用后进入应用详情页面，记住`AgentId`和`Secert`
+- 创建应用后进入应用详情页面，记住`AgentId`和`Secret`
 
 3.配置应用
 

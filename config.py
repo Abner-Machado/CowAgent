@@ -328,11 +328,11 @@ class Config(dict):
         try:
             with open(os.path.join(get_appdata_dir(), "user_datas.pkl"), "rb") as f:
                 self.user_datas = pickle.load(f)
-                logger.debug("[Config] User datas loaded.")
+                logger.debug("[Config] User data loaded.")
         except FileNotFoundError as e:
-            logger.debug("[Config] User datas file not found, ignore.")
+            logger.debug("[Config] User data file not found, ignore.")
         except Exception as e:
-            logger.warning("[Config] User datas error: {}".format(e))
+            logger.warning("[Config] User data error: {}".format(e))
             self.user_datas = {}
 
     def save_user_datas(self):
@@ -341,9 +341,9 @@ class Config(dict):
             # process. See note on load_user_datas() above.
             with open(os.path.join(get_appdata_dir(), "user_datas.pkl"), "wb") as f:
                 pickle.dump(self.user_datas, f)
-                logger.info("[Config] User datas saved.")
+                logger.info("[Config] User data saved.")
         except Exception as e:
-            logger.info("[Config] User datas error: {}".format(e))
+            logger.info("[Config] User data error: {}".format(e))
 
 
 config = Config()

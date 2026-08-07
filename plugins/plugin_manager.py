@@ -174,7 +174,7 @@ class PluginManager:
                 try:
                     instance = plugincls()
                 except Exception as e:
-                    logger.warn("Failed to init %s, diabled. %s" % (name, e))
+                    logger.warn("Failed to init %s, disabled. %s" % (name, e))
                     self.disable_plugin(name)
                     failed_plugins.append(name)
                     continue
@@ -244,7 +244,7 @@ class PluginManager:
                     instance.handlers[e_context.event](e_context, *args, **kwargs)
                     if e_context.is_break():
                         e_context["breaked_by"] = name
-                        logger.debug("Plugin %s breaked event %s" % (name, e_context.event))
+                        logger.debug("Plugin %s broke event %s" % (name, e_context.event))
         return e_context
 
     def set_plugin_priority(self, name: str, priority: int):

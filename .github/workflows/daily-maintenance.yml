@@ -1,0 +1,68 @@
+name: Daily maintenance
+
+on:
+  schedule:
+    # 09:00 UTC = 06:00 America/Sao_Paulo
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: pip install --quiet ruff codespell
+
+      - name: Run lint cleanup
+        id: cleanup
+        run: python scripts/daily_maintenance.py
+
+      - name: Fix documentation typos
+        if: steps.cleanup.outputs.summary == ''
+        id: typos
+        run: |
+          # So roda se o passo de lint nao achou nada, para manter um
+          # assunto por commit. Restrito a markdown: corrigir texto dentro
+          # de codigo automaticamente e arriscado demais sem revisao.
+          codespell --write-changes -- '*.md' || true
+          if ! git diff --quiet; then
+            {
+              echo 'summary<<EOF'
+              echo 'docs: corrige erros de digitacao'
+              echo ''
+              echo 'Correcoes de ortografia apontadas pelo codespell na'
+              echo 'documentacao. Falsos positivos ficam na allowlist do'
+              echo '.codespellrc.'
+              echo 'EOF'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push
+        env:
+          SUMMARY: ${{ steps.cleanup.outputs.summary || steps.typos.outputs.summary }}
+        run: |
+          if git diff --quiet; then
+            echo "Sem alteracoes. Encerrando sem commit."
+            exit 0
+          fi
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+          git add -A
+          git commit -m "$SUMMARY"
+          git push origin master
