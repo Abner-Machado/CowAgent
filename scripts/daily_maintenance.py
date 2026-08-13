@@ -57,7 +57,13 @@ def count_issues(target):
         items = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return 0
-    return sum(1 for i in items if i.get("fix"))
+    # ruff --fix (sem --unsafe-fixes) so aplica correcoes "safe". Contar as
+    # "unsafe" aqui faria o script escolher um diretorio como alvo, falhar
+    # em corrigir nada, e desistir sem passar para o proximo.
+    return sum(
+        1 for i in items
+        if (i.get("fix") or {}).get("applicability") == "safe"
+    )
 
 
 def changed_python_files():
