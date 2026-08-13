@@ -274,7 +274,6 @@ class AgentInitializer:
         try:
             from agent.memory import MemoryManager, MemoryConfig
             from agent.tools import MemorySearchTool, MemoryGetTool
-            from config import conf
 
             memory_config = MemoryConfig(workspace_root=workspace_root)
 
