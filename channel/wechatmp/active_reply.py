@@ -1,4 +1,3 @@
-import time
 
 import web
 from wechatpy import parse_message

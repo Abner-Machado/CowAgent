@@ -1,5 +1,4 @@
 import os
-import re
 
 import requests
 from dingtalk_stream import ChatbotMessage
@@ -8,7 +7,6 @@ from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 # -*- coding=utf-8 -*-
 from common.log import logger
-from common.tmp_dir import TmpDir
 from common.utils import expand_path
 from config import conf
 

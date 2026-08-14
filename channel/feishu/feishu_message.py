@@ -4,7 +4,6 @@ import json
 import os
 import requests
 from common.log import logger
-from common.tmp_dir import TmpDir
 from common import utils
 from common.utils import expand_path
 from config import conf

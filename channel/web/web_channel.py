@@ -3211,7 +3211,7 @@ class ModelsHandler:
               "make_active": true            # optional, also activate it
             }
         """
-        from models.custom_provider import generate_provider_id, parse_custom_bot_type
+        from models.custom_provider import generate_provider_id
 
         name = (data.get("name") or "").strip()
         if not name:
