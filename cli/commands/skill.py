@@ -17,7 +17,6 @@ import click
 import requests
 
 from cli.utils import (
-    get_project_root,
     get_skills_dir,
     get_builtin_skills_dir,
     load_skills_config,
