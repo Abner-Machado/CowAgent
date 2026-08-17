@@ -1,6 +1,6 @@
 # encoding:utf-8
 
-import requests, json
+import json
 from models.bot import Bot
 from models.session_manager import SessionManager
 from models.chatgpt.chat_gpt_session import ChatGPTSession
@@ -86,7 +86,7 @@ class XunFeiBot(Bot):
 
                     reply_map[request_id] += data_item.reply
                     depth += 1
-                except Exception as e:
+                except Exception:
                     depth += 1
                     continue
             t2 = time.time()

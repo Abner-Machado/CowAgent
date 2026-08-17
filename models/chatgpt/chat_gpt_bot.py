@@ -1,10 +1,8 @@
 # encoding:utf-8
 
 import time
-import json
 
 from models.openai.openai_compat import (
-    error as openai_error,
     RateLimitError,
     Timeout,
     APIError,

@@ -127,7 +127,7 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                             else:
                                 body["sender_name"] = context.kwargs.get("msg").from_user_nickname
 
-            except Exception as e:
+            except Exception:
                 pass
             file_id = context.kwargs.get("file_id")
             if file_id:

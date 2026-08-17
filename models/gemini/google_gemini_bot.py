@@ -22,7 +22,6 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from config import conf
 from models.chatgpt.chat_gpt_session import ChatGPTSession
-from models.baidu.baidu_wenxin_session import BaiduWenxinSession
 
 
 # OpenAI对话模型API (可用)

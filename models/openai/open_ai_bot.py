@@ -6,7 +6,6 @@ from models.openai.openai_compat import (
     RateLimitError,
     Timeout,
     APIConnectionError,
-    APIError,
     wrap_http_error,
 )
 from models.openai.openai_http_client import OpenAIHTTPClient, OpenAIHTTPError
