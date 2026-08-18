@@ -9,7 +9,7 @@ import sys
 from common.log import logger
 from common.singleton import singleton
 from common.sorted_dict import SortedDict
-from config import conf, remove_plugin_config, write_plugin_config, get_data_root, get_resource_root
+from config import remove_plugin_config, write_plugin_config, get_data_root, get_resource_root
 
 from .event import *
 

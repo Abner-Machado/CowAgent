@@ -615,8 +615,6 @@ class CowCliPlugin(Plugin):
     _CONFIG_READABLE = _CONFIG_WRITABLE | {"channel_type"}
 
     def _cmd_config(self, args: str, e_context, **_) -> str:
-        from config import conf, load_config
-        import json as _json
 
         parts = args.strip().split(None, 1)
         if not parts:

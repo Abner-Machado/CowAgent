@@ -7,7 +7,7 @@ from bridge.bridge import Bridge
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from common import const
-from config import conf, get_appdata_dir
+from config import conf
 from plugins import *
 
 

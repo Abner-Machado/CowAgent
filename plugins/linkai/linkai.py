@@ -9,7 +9,7 @@ from common.expired_dict import ExpiredDict
 from common import const
 import os
 from .utils import Util
-from config import plugin_config, conf
+from config import conf
 
 
 @plugins.register(

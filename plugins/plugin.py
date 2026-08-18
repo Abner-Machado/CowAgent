@@ -1,6 +1,6 @@
 import os
 import json
-from config import pconf, plugin_config, conf, write_plugin_config
+from config import pconf, plugin_config, write_plugin_config
 from common.log import logger
 
 
