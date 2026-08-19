@@ -21,7 +21,6 @@ import base64
 import hmac
 import json
 from urllib.parse import urlencode
-import time
 import ssl
 from wsgiref.handlers import format_date_time
 from datetime import datetime

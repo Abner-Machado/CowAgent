@@ -1,7 +1,6 @@
 """
 google voice service
 """
-import json
 
 from bridge.reply import Reply, ReplyType
 from common.log import logger
