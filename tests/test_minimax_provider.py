@@ -7,9 +7,8 @@ Unit tests for MiniMax provider additions:
 """
 import sys
 import os
-import json
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -72,7 +71,6 @@ class TestMinimaxBotDefaultModel(unittest.TestCase):
 
     def test_default_model_string(self):
         """Verify the fallback string literal in minimax_bot.py is MiniMax-M3."""
-        import ast
         bot_path = os.path.join(os.path.dirname(__file__), "..", "models", "minimax", "minimax_bot.py")
         with open(bot_path) as f:
             source = f.read()
