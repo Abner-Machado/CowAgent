@@ -28,7 +28,6 @@ from wsgiref.handlers import format_date_time
 from datetime import datetime
 from time import mktime
 import _thread as thread
-import os
 import wave
 
 
