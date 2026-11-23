@@ -1,6 +1,6 @@
 ---
 title: Coding Plan
-description: Coding Planモデルの設定
+description: "各ベンダーの Coding Plan（コーディング向け定額プラン）を CowAgent で使う方法。OpenAI 互換 API で MiniMax、Zhipu、Kimi などを設定します。"
 ---
 
 > Coding Planは各プロバイダーが提供する月額サブスクリプションパッケージで、高頻度のAgent利用に最適です。CowAgentはOpenAI互換モードにより、すべてのCoding Planプロバイダーをサポートしています。
@@ -69,9 +69,11 @@ description: Coding Planモデルの設定
 
 | パラメータ | 説明 |
 | --- | --- |
-| `model` | `MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed` |
+| `model` | `MiniMax-M3.1-Flash`、`MiniMax-M3`、`MiniMax-M2.7`、`MiniMax-M2.7-highspeed` |
 | `open_ai_api_base` | 中国: `https://api.minimaxi.com/v1`、グローバル: `https://api.minimax.io/v1` |
 | `open_ai_api_key` | Coding Plan専用キー（従量課金とは共有不可） |
+
+`MiniMax-M3.1-Flash` は最新の高速モデルです。既存のモデル設定も引き続き使用できます。
 
 参考: [中国キー](https://platform.minimaxi.com/docs/coding-plan/quickstart)、[モデル一覧](https://platform.minimaxi.com/docs/guides/pricing-coding-plan)、[グローバルキー](https://platform.minimax.io/docs/coding-plan/quickstart)
 
@@ -115,7 +117,7 @@ description: Coding Planモデルの設定
 | `moonshot_base_url` | `https://api.kimi.com/coding/v1` |
 | `moonshot_api_key` | Coding Plan専用キー（従量課金とは共有不可） |
 
-参考: [キー & ドキュメント](https://www.kimi.com/code/docs/)
+参考: [キー & ドキュメント](https://www.kimi.com/code/docs/?aff=cowagent)
 
 ---
 

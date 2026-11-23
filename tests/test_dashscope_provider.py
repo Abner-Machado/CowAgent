@@ -24,7 +24,13 @@ class TestDashscopeConst(unittest.TestCase):
             len(qwen_models),
             1,
         )
-        self.assertEqual(qwen_models[0], "qwen3.7-plus")
+        # The list is ordered by release, so a newer model (e.g. qwen3.8-flash)
+        # can legitimately sit ahead of qwen3.7-plus; what must hold is that
+        # plus is offered before max.
+        self.assertLess(
+            qwen_models.index(const.QWEN37_PLUS),
+            qwen_models.index(const.QWEN37_MAX),
+        )
 
 
 class TestDashscopeBotDefaultModel(unittest.TestCase):

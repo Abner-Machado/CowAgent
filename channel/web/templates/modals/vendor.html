@@ -1,0 +1,203 @@
+    <!-- Vendor Credentials Modal -->
+    <div id="vendor-modal-overlay" class="fixed inset-0 bg-black/50 z-[100] hidden flex items-center justify-center">
+        <div class="bg-panel rounded-2xl border border-slate-200 dark:border-white/10 shadow-xl
+                    w-full max-w-xl mx-4 max-h-[85vh] flex flex-col">
+            <div class="p-6 overflow-y-auto modal-scroll-body">
+                <div class="flex items-center gap-3 mb-5">
+                    <div id="vendor-modal-key-icon" class="w-10 h-10 rounded-xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center flex-shrink-0">
+                        <i class="fas fa-key text-primary-500"></i>
+                    </div>
+                    <div id="vendor-modal-codex-icon" class="hidden w-10 h-10 rounded-xl bg-slate-50 dark:bg-white/5 flex items-center justify-center flex-shrink-0">
+                        <img src="/assets/logos/codex.svg" alt="" width="26" height="26">
+                    </div>
+                    <div class="min-w-0 flex-1">
+                        <h3 id="vendor-modal-title" class="font-semibold text-slate-800 dark:text-slate-100 text-base"></h3>
+                        <p id="vendor-modal-subtitle" class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono"></p>
+                    </div>
+                </div>
+
+                <!-- Provider selector (only visible when adding via top button) -->
+                <div id="vendor-modal-picker-wrap" class="mb-4 hidden">
+                    <label class="block text-sm font-medium text-slate-600 dark:text-slate-400 mb-1.5" data-i18n="models_provider">厂商</label>
+                    <div id="vendor-modal-picker" class="cfg-dropdown" tabindex="0">
+                        <div class="cfg-dropdown-selected">
+                            <span class="cfg-dropdown-text">--</span>
+                            <i class="fas fa-chevron-down cfg-dropdown-arrow"></i>
+                        </div>
+                        <div class="cfg-dropdown-menu"></div>
+                    </div>
+                </div>
+
+                <div id="vendor-modal-codex-login" class="hidden space-y-4 text-sm">
+                    <div id="codex-intro" class="hidden space-y-2 text-slate-600 dark:text-slate-300 leading-relaxed">
+                        <p data-i18n="models_codex_intro">使用 ChatGPT 账号登录后，CowAgent 会用你的 ChatGPT 订阅额度调用 Codex 模型，无需 API Key。</p>
+                        <p id="codex-intro-install" class="text-xs text-slate-500 dark:text-slate-400"></p>
+                    </div>
+                    <div id="codex-status-box" class="space-y-2.5 rounded-lg border border-slate-200 dark:border-white/10
+                                bg-slate-50 dark:bg-white/5 p-3.5">
+                        <div class="flex items-center gap-3">
+                            <i id="codex-status-icon" aria-hidden="true" class="fas fa-circle-notch fa-spin text-slate-400"></i>
+                            <p id="codex-status-message" class="min-w-0 break-words text-slate-700 dark:text-slate-200" role="status">
+                                <span data-i18n="models_codex_checking">正在读取 Codex 状态…</span>
+                            </p>
+                        </div>
+                        <div id="codex-progress" class="hidden h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+                            <div id="codex-progress-bar" class="h-full w-0 rounded-full bg-primary-500 transition-all duration-300"></div>
+                        </div>
+                    </div>
+                    <div id="codex-device" class="hidden space-y-3 rounded-lg border border-slate-200 dark:border-white/10 p-3.5">
+                        <ol class="list-decimal space-y-1 pl-5 text-slate-600 dark:text-slate-300">
+                            <li data-i18n="models_codex_step_open">点击下方按钮，复制设备码并打开 OpenAI 授权页面</li>
+                            <li data-i18n="models_codex_step_sign_in">登录你的 ChatGPT 账号</li>
+                            <li data-i18n="models_codex_step_code">粘贴设备码并确认授权，完成后此窗口会自动更新</li>
+                        </ol>
+                        <label for="codex-device-code" class="sr-only" data-i18n="models_codex_device_code">设备码</label>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <input id="codex-device-code" type="text" readonly autocomplete="off"
+                                   class="min-w-0 flex-1 rounded-lg border border-slate-200 dark:border-white/10
+                                          bg-slate-50 dark:bg-white/5 px-3 py-2.5 font-mono font-semibold
+                                          tracking-wider text-slate-800 dark:text-slate-100">
+                            <button id="codex-copy" type="button"
+                                    class="shrink-0 rounded-lg border border-slate-200 dark:border-white/10
+                                           px-3 py-2.5 font-medium text-slate-700 dark:text-slate-200
+                                           hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer"
+                                    data-i18n="config_api_copy">复制</button>
+                        </div>
+                    </div>
+                    <details id="codex-models" class="hidden border-t border-slate-100 dark:border-white/10 pt-3">
+                        <summary class="cursor-pointer text-sm font-medium text-slate-700 dark:text-slate-200">
+                            <span data-i18n="models_catalog">模型列表</span>
+                            <span id="codex-model-count" class="ml-1.5 text-xs font-normal text-slate-500 dark:text-slate-400"></span>
+                        </summary>
+                        <ul id="codex-model-list" class="mt-2 max-h-44 divide-y divide-slate-200 dark:divide-white/10 overflow-y-auto
+                                                       rounded-lg border border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/5">
+                        </ul>
+                    </details>
+                </div>
+
+                <div id="vendor-modal-api-fields" class="space-y-4">
+                    <div>
+                        <div class="flex items-center justify-between gap-2 mb-1.5">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400">API Key</label>
+                            <a id="vendor-modal-manage-key" href="https://link-ai.tech/console/models?apikey=1"
+                               target="_blank" rel="noopener noreferrer"
+                               class="hidden inline-flex items-center gap-1 text-xs text-primary-500 hover:underline">
+                                <span data-i18n="models_manage_api_key">管理 API Key</span>
+                                <i class="fas fa-arrow-up-right-from-square text-[10px]"></i>
+                            </a>
+                        </div>
+                        <input id="vendor-modal-key" type="text" autocomplete="off" data-1p-ignore data-lpignore="true"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="sk-...">
+                    </div>
+                    <div id="vendor-modal-base-wrap">
+                        <div class="flex items-center justify-between gap-2 mb-1.5">
+                            <label class="block text-sm font-medium text-slate-600 dark:text-slate-400">API Base</label>
+                            <div id="vendor-modal-base-presets" class="hidden flex items-center gap-1"></div>
+                        </div>
+                        <input id="vendor-modal-base" type="text"
+                               class="w-full px-3 py-2 rounded-lg border border-slate-200 dark:border-slate-600
+                                      bg-slate-50 dark:bg-white/5 text-sm text-slate-800 dark:text-slate-100
+                                      focus:outline-none focus:border-primary-500 font-mono transition-colors"
+                               placeholder="https://...../v1">
+                        <p id="vendor-modal-base-hint" class="mt-1.5 text-xs text-slate-400 dark:text-slate-500 hidden">
+                            <i class="fas fa-info-circle mr-1"></i><span data-i18n="models_base_default_hint">留空将使用官方默认地址</span>
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Model catalog (advanced, optional): override preset metadata
+                     or add models the preset list does not carry. Collapsed by
+                     default so the credential fields stay the focus. -->
+                <div id="vendor-modal-catalog-wrap" class="mt-5 pt-4 border-t border-slate-100 dark:border-white/5">
+                    <button type="button" id="vendor-modal-catalog-toggle"
+                            class="flex items-center gap-2 w-full text-left cursor-pointer group">
+                        <i id="vendor-modal-catalog-caret"
+                           class="fas fa-chevron-right text-[10px] text-slate-400 dark:text-slate-500 transition-transform duration-150"></i>
+                        <span class="text-sm font-medium text-slate-600 dark:text-slate-400 group-hover:text-primary-500 transition-colors"
+                              data-i18n="models_catalog">模型列表</span>
+                        <span class="text-xs text-slate-400 dark:text-slate-500"
+                              data-i18n="models_catalog_advanced">（高级 · 可选）</span>
+                    </button>
+                    <div id="vendor-modal-catalog-body" class="hidden mt-3">
+                        <div id="vendor-modal-catalog-rows" class="space-y-2 max-h-80 overflow-y-auto pr-0.5"></div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" id="vendor-modal-catalog-add"
+                                    class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium
+                                           bg-primary-50 dark:bg-primary-900/30 text-primary-600 dark:text-primary-400
+                                           hover:bg-primary-100 dark:hover:bg-primary-900/50 cursor-pointer transition-colors">
+                                <i class="fas fa-plus text-[10px]"></i><span data-i18n="models_catalog_add">添加模型</span>
+                            </button>
+                            <button type="button" id="vendor-modal-catalog-discover"
+                                    class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium
+                                           text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
+                                           cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                                <i class="fas fa-cloud-arrow-down text-[10px]"></i><span data-i18n="models_catalog_discover">自动发现</span>
+                            </button>
+                            <button type="button" id="vendor-modal-catalog-seed"
+                                    class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium
+                                           text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
+                                           cursor-pointer transition-colors">
+                                <i class="fas fa-rotate-left text-[10px]"></i><span data-i18n="models_catalog_reset">恢复默认</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="vendor-modal-api-footer" class="flex items-center justify-between gap-3 px-6 py-4 border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button id="vendor-modal-clear"
+                        class="px-3 py-2 rounded-lg text-xs
+                               text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20
+                               cursor-pointer transition-colors duration-150 hidden"
+                        data-i18n="models_clear_credential">清除凭据</button>
+                <span id="vendor-modal-status"
+                      class="flex-1 text-xs text-primary-500 opacity-0 transition-opacity duration-300 text-center"></span>
+                <button id="vendor-modal-cancel"
+                        class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                               text-slate-600 dark:text-slate-300 text-sm font-medium
+                               hover:bg-slate-50 dark:hover:bg-white/5
+                               cursor-pointer transition-colors duration-150"
+                        data-i18n="cancel">取消</button>
+                <button id="vendor-modal-save"
+                        class="px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600 text-white text-sm font-medium
+                               cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed"
+                        data-i18n="save">保存</button>
+            </div>
+            <div id="vendor-modal-codex-footer"
+                 class="hidden flex flex-wrap items-center justify-between gap-x-4 gap-y-3 px-6 py-4
+                        border-t border-slate-100 dark:border-white/5 rounded-b-2xl">
+                <button type="button" id="codex-disconnect"
+                        class="hidden rounded-lg border border-red-200 dark:border-red-500/30 px-3 py-2
+                               text-sm font-medium text-red-600 dark:text-red-400
+                               hover:bg-red-50 dark:hover:bg-red-900/20 cursor-pointer"
+                        data-i18n="models_codex_logout">退出登录</button>
+                <button type="button" id="codex-cancel"
+                        class="hidden rounded-lg border border-slate-200 dark:border-white/10 px-3 py-2
+                               text-sm font-medium text-slate-600 dark:text-slate-300
+                               hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer"
+                        data-i18n="models_codex_cancel">取消授权</button>
+                <div class="ml-auto flex flex-wrap items-center justify-end gap-2 sm:gap-3">
+                    <button type="button" id="codex-close"
+                            class="px-4 py-2 rounded-lg border border-slate-200 dark:border-white/10
+                                   text-slate-600 dark:text-slate-300 text-sm font-medium
+                                   hover:bg-slate-50 dark:hover:bg-white/5 cursor-pointer transition-colors"
+                            data-i18n="ws_close">关闭</button>
+                    <button type="button" id="codex-connect"
+                            class="hidden px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600
+                                   text-white text-sm font-medium cursor-pointer transition-colors"></button>
+                    <button type="button" id="codex-refresh"
+                            class="hidden px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600
+                                   text-white text-sm font-medium cursor-pointer transition-colors"
+                            data-i18n="models_codex_refresh">同步模型</button>
+                    <a id="codex-device-link" target="_blank" rel="noopener noreferrer"
+                       class="hidden px-4 py-2 rounded-lg bg-primary-500 hover:bg-primary-600
+                              text-white text-sm font-medium cursor-pointer transition-colors">
+                        <span data-i18n="models_codex_open">复制并打开授权页面</span>
+                        <i aria-hidden="true" class="fas fa-arrow-up-right-from-square ml-1 text-[10px]"></i>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>

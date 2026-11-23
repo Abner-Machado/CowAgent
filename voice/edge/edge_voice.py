@@ -1,5 +1,5 @@
 # Requires: edge-tts  (pip install edge-tts)
-import time
+import uuid
 
 import edge_tts
 import asyncio
@@ -43,9 +43,15 @@ class EdgeVoice(Voice):
         await communicate.save(fileName)
 
     def textToVoice(self, text):
-        fileName = TmpDir().path() + "reply-" + str(int(time.time())) + "-" + str(hash(text) & 0x7FFFFFFF) + ".mp3"
+        fileName = TmpDir().path() + "reply-" + uuid.uuid4().hex + ".mp3"
 
-        asyncio.run(self.gen_voice(text, fileName))
+        try:
+            asyncio.run(self.gen_voice(text, fileName))
+        except Exception as e:
+            # Raising here would drop the text answer too, since this runs while
+            # the text reply is being converted to voice.
+            logger.error("[EdgeTTS] textToVoice failed: {}".format(e))
+            return Reply(ReplyType.ERROR, "抱歉，语音合成失败")
 
         logger.info("[EdgeTTS] textToVoice text={} voice file name={}".format(text, fileName))
         return Reply(ReplyType.VOICE, fileName)

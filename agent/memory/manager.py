@@ -5,16 +5,61 @@ Provides high-level interface for memory operations
 """
 
 import os
-from typing import List, Optional, Dict, Any
+import time
+from typing import List, Optional, Dict, Any, Sequence, Tuple
 from pathlib import Path
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 
+from common.atomic_write import write_text_atomic
 from agent.memory.config import MemoryConfig, get_default_memory_config
 from agent.memory.storage import MemoryStorage, MemoryChunk, SearchResult
 from agent.memory.chunker import TextChunker
 from agent.memory.embedding import EmbeddingProvider, EmbeddingCache
+from agent.memory.reranker import Reranker
 from agent.memory.summarizer import MemoryFlushManager, create_memory_files_if_needed
+
+
+def _real(path: Path) -> Path:
+    """Symlink-resolved path, for prefix comparisons that must not care how a
+    directory was reached (``/var`` vs ``/private/var`` on macOS)."""
+    try:
+        return Path(os.path.realpath(path))
+    except OSError:
+        return Path(path)
+
+
+def _index_rel_path(file_path: Path, roots: Sequence[Tuple[Path, str]]) -> Optional[str]:
+    """Index key for a scanned file, or None when no known root contains it.
+
+    Scanned files do not all come from one root: ``common.state_dir`` sends an
+    Agent that has no local ``knowledge/`` of its own to the SHARED root, so
+    sync() legitimately walks files outside the workspace. Keying those off the
+    workspace alone raises ValueError, and because that ran inside sync()'s file
+    loop a single such file aborted the whole sync — taking down every retrieval
+    that goes through the ``search()`` in front of it (#3175).
+
+    Each root carries the prefix its files are keyed under, so shared knowledge
+    keeps the ``knowledge/note.md`` key it would have had inside the workspace:
+    the index keeps its shape when an Agent gains or loses a private copy, and
+    nothing has to be reindexed. Keys are POSIX-style on every platform, which
+    is also the spelling ``add_memory`` writes — otherwise the same file is
+    indexed twice on Windows, once per separator.
+
+    Roots are matched as given first and only then symlink-resolved, so the
+    common case costs no extra stat calls while a workspace reached through a
+    symlink still matches instead of losing its files to the skip path.
+    """
+    for resolve in (False, True):
+        target = _real(file_path) if resolve else file_path
+        for root, prefix in roots:
+            base = _real(root) if resolve else root
+            try:
+                rel = target.relative_to(base)
+            except ValueError:
+                continue
+            return (Path(prefix) / rel).as_posix() if prefix else rel.as_posix()
+    return None
 
 
 class MemoryManager:
@@ -28,15 +73,17 @@ class MemoryManager:
         self,
         config: Optional[MemoryConfig] = None,
         embedding_provider: Optional[EmbeddingProvider] = None,
-        llm_model: Optional[Any] = None
+        llm_model: Optional[Any] = None,
+        reranker: Optional[Reranker] = None
     ):
         """
         Initialize memory manager
-        
+
         Args:
             config: Memory configuration (uses global config if not provided)
             embedding_provider: Custom embedding provider (optional)
             llm_model: LLM model for summarization (optional)
+            reranker: Reranker that reorders search candidates (optional)
         """
         self.config = config or get_default_memory_config()
         
@@ -65,6 +112,8 @@ class MemoryManager:
         # Cache for query embeddings (avoids redundant API calls within a session)
         self._embedding_cache = EmbeddingCache()
 
+        # Optional reranker; None means un-reranked retrieval
+        self.reranker = reranker
 
         # Initialize memory flush manager
         workspace_dir = self.config.get_workspace()
@@ -109,7 +158,8 @@ class MemoryManager:
             List of search results sorted by relevance
         """
         max_results = max_results or self.config.max_results
-        min_score = min_score or self.config.min_score
+        # min_score=0 means "no threshold", so only None takes the default.
+        min_score = self.config.min_score if min_score is None else min_score
         
         # Determine scopes
         scopes = []
@@ -169,10 +219,37 @@ class MemoryManager:
             self.config.keyword_weight
         )
 
-        # Filter by min score and limit
+        # min_score is a cutoff on the fused score, so it is applied before
+        # rerank; the reranker only reorders the candidates that pass it.
         filtered = [r for r in merged if r.score >= min_score]
-        return filtered[:max_results]
+        filtered = self._rerank(query, filtered)
+        # The hit boost runs last, as a pure reordering multiplier over the
+        # final candidates: it rewards chunks that proved useful before but
+        # can neither rescue below-threshold results nor bypass the reranker.
+        filtered = self._apply_hit_boost(filtered)
+        top = filtered[:max_results]
+
+        # Count one retrieval hit per returned chunk, as ranking feedback for
+        # the hit-popularity boost. Opt-in only: with the boost disabled the
+        # write transaction is skipped entirely. Bookkeeping must never break
+        # the search.
+        if top and self._hit_boost_enabled():
+            try:
+                self.storage.record_hits(
+                    [MemoryManager._fusion_key(r) for r in top]
+                )
+            except Exception as e:
+                logger.warning(f"[MemoryManager] Hit write-back failed: {e}")
+
+        return top
     
+    def _get_workspace_dir(self) -> Optional[Path]:
+        config = getattr(self, "config", None)
+        if config is not None:
+            return Path(config.get_workspace())
+        workspace_dir = getattr(self, "workspace_dir", None)
+        return Path(workspace_dir) if workspace_dir is not None else None
+
     async def add_memory(
         self,
         content: str,
@@ -184,29 +261,46 @@ class MemoryManager:
     ):
         """
         Add new memory content
-        
+
         Args:
             content: Memory content
             user_id: User ID for user-scoped memory
             scope: Memory scope ("shared", "user", "session")
             source: Memory source ("memory" or "session")
-            path: File path (auto-generated if not provided)
+            path: File path (auto-generated if not provided). A generated
+                path is written to disk so sync() keeps its rows; an explicit
+                one belongs to the caller and its file is left untouched.
             metadata: Additional metadata
         """
         if not content.strip():
             return
-        
-        # Generate path if not provided
-        if not path:
+
+        generated = not path
+        if generated:
             content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:8]
             if user_id and scope == "user":
                 path = f"memory/users/{user_id}/memory_{content_hash}.md"
             else:
                 path = f"memory/shared/memory_{content_hash}.md"
-        
+
+        target: Optional[Path] = None
+        workspace_dir = self._get_workspace_dir()
+        if workspace_dir is not None:
+            workspace_real = _real(workspace_dir)
+            candidate = _real(workspace_real / path)
+            try:
+                rel = candidate.relative_to(workspace_real)
+            except ValueError:
+                raise ValueError(f"Memory path escapes workspace: {path}") from None
+            if candidate == workspace_real or candidate.is_dir():
+                raise ValueError(f"Memory path must point to a file inside workspace: {path}")
+            path = rel.as_posix()
+            if generated:
+                target = candidate
+
         # Chunk content
         chunks = self.chunker.chunk_text(content)
-        
+
         # Generate embeddings (if provider available)
         texts = [chunk.text for chunk in chunks]
         if self.embedding_provider:
@@ -214,13 +308,34 @@ class MemoryManager:
         else:
             # No embeddings, just use None
             embeddings = [None] * len(texts)
-        
+
+        # Persist the backing file so sync() keeps the indexed rows.
+        if target is not None:
+            disk_content: Optional[str] = None
+            if target.exists():
+                try:
+                    disk_content = target.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    disk_content = None
+            if disk_content != content:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(target, content, encoding="utf-8")
+                disk_content = target.read_text(encoding="utf-8")
+            stat = target.stat()
+            file_hash = MemoryStorage.compute_hash(disk_content)
+            mtime = int(stat.st_mtime)
+            size = stat.st_size
+        else:
+            file_hash = MemoryStorage.compute_hash(content)
+            mtime = int(time.time())
+            size = len(content.encode("utf-8"))
+
         # Create memory chunks
         memory_chunks = []
         for chunk, embedding in zip(chunks, embeddings):
-            chunk_id = self._generate_chunk_id(path, chunk.start_line, chunk.end_line)
+            chunk_id = self._generate_chunk_id(path, chunk.start_line, chunk.end_line, chunk.part)
             chunk_hash = MemoryStorage.compute_hash(chunk.text)
-            
+
             memory_chunks.append(MemoryChunk(
                 id=chunk_id,
                 user_id=user_id,
@@ -234,18 +349,15 @@ class MemoryManager:
                 hash=chunk_hash,
                 metadata=metadata
             ))
-        
-        # Save to storage
+
+        self.storage.delete_by_path(path)
         self.storage.save_chunks_batch(memory_chunks)
-        
-        # Update file metadata
-        file_hash = MemoryStorage.compute_hash(content)
         self.storage.update_file_metadata(
             path=path,
             source=source,
             file_hash=file_hash,
-            mtime=int(os.path.getmtime(__file__)),  # Use current time
-            size=len(content)
+            mtime=mtime,
+            size=size,
         )
     
     async def sync(self, force: bool = False):
@@ -266,6 +378,16 @@ class MemoryManager:
         """
         memory_dir = self.config.get_memory_dir()
         workspace_dir = self.config.get_workspace()
+
+        # Was the index empty before this sync? Only then can we be sure every
+        # chunk came from the CURRENT chunking algorithm (a fresh index, or one
+        # cleared by rebuild-index), which is what lets us stamp
+        # chunker_version. A non-empty index may still hold chunks from an
+        # older algorithm, so it must not be stamped.
+        try:
+            files_before = int(self.storage.get_stats().get("files", 0) or 0)
+        except Exception:
+            files_before = -1  # unknown -> do not stamp
 
         files_to_scan: List[tuple] = []  # (file_path, source, scope, user_id)
 
@@ -301,11 +423,20 @@ class MemoryManager:
                     scope = "shared"
                 files_to_scan.append((file_path, "memory", scope, user_id))
 
+        from common import state_dir
         from config import conf
+        knowledge_dir: Optional[Path] = None
         if conf().get("knowledge", True):
-            knowledge_dir = Path(workspace_dir) / "knowledge"
+            # Resolve through state_dir so an Agent without its own knowledge/
+            # scans the shared base rather than an empty (or missing) local one.
+            knowledge_dir = Path(state_dir.knowledge_dir(base=workspace_dir))
             if knowledge_dir.exists():
-                for file_path in knowledge_dir.rglob("*.md"):
+                for file_path in knowledge_dir.rglob("*.[mM][dD]"):
+                    # The root index.md / log.md only restate pages indexed on
+                    # their own, and change on every page write, which re-embeds
+                    # the whole file each time.
+                    if file_path.parent == knowledge_dir and file_path.name in ("index.md", "log.md"):
+                        continue
                     files_to_scan.append((file_path, "knowledge", "shared", None))
 
         # Pass 1: inline chunking + change detection. Inlined (instead of
@@ -314,17 +445,57 @@ class MemoryManager:
         # where the class object is older than the method's source.
         pending: List[Dict[str, Any]] = []
         workspace_dir_path = self.config.get_workspace()
+        from common.log import logger
+
+        # Roots a scanned file may legitimately sit under, most specific first,
+        # each paired with the prefix its files are keyed under. Resolved once
+        # rather than per file: shared_root() goes through the Agent registry.
+        # knowledge_dir comes first so a knowledge file keys the same whether it
+        # is this Agent's own copy or the shared one it fell back to.
+        index_roots: List[Tuple[Path, str]] = []
+        if knowledge_dir is not None:
+            index_roots.append((knowledge_dir, "knowledge"))
+        index_roots.append((Path(workspace_dir_path), ""))
+        try:
+            index_roots.append((state_dir.shared_root(), ""))
+        except Exception:
+            # No resolvable shared root (registry not ready). The workspace
+            # still covers every file that is not a shared fallback.
+            pass
+
+        scanned: Dict[str, set] = {}
+
         for file_path, source, scope, user_id in files_to_scan:
+            rel_path = _index_rel_path(file_path, index_roots)
+            if rel_path is None:
+                # Defensive: every scan target above resolves under one of the
+                # roots. Skip just this file so one oddity cannot cost the Agent
+                # its whole memory, and say so rather than dropping it silently.
+                logger.warning(
+                    f"[MemoryManager] Skipping {file_path}: it sits under none of "
+                    f"this Agent's roots, so it has no stable index key"
+                )
+                continue
+            # Recorded before the read, so a file that is present but unreadable
+            # still counts as scanned and keeps the rows it already has.
+            scanned.setdefault(source, set()).add(rel_path)
             try:
                 content = file_path.read_text(encoding='utf-8')
-            except Exception:
+            except Exception as e:
+                # Was silent, which made a half-indexed workspace look healthy.
+                logger.warning(f"[MemoryManager] Skipping {file_path}: cannot read it ({e})")
                 continue
             file_hash = MemoryStorage.compute_hash(content)
-            rel_path = str(file_path.relative_to(workspace_dir_path))
-            if self.storage.get_file_hash(rel_path) == file_hash:
+            previous_hash = self.storage.get_file_hash(rel_path)
+            if previous_hash == file_hash:
                 continue
-            chunks = self.chunker.chunk_text(content)
-            if not chunks:
+            # Markdown files (memory + knowledge) get structure-aware chunking;
+            # anything else (rare) falls back to the plain char splitter.
+            if file_path.suffix.lower() == '.md':
+                chunks = self.chunker.chunk_markdown(content)
+            else:
+                chunks = self.chunker.chunk_text(content)
+            if not chunks and previous_hash is None:
                 continue
             pending.append({
                 "file_path": file_path,
@@ -336,6 +507,41 @@ class MemoryManager:
                 "chunks": chunks,
                 "texts": [c.text for c in chunks],
             })
+
+        # Reconcile before the early return below: an index full of stale rows
+        # is exactly the case where nothing changed and `pending` is empty.
+        #
+        # sync() only ever added and overwrote. Anything that left a scanned
+        # root — a page the user deleted, or every shared page at once when an
+        # Agent is switched to its own knowledge/ — stayed in the index and kept
+        # being returned by memory_search long after no tool could open it.
+        #
+        # Only a source whose root resolved and exists is reconciled. An empty
+        # scan set then means the files are genuinely gone, rather than that the
+        # root was momentarily unresolvable, which must not cost a whole index.
+        reconcilable = []
+        if memory_dir.exists():
+            reconcilable.append("memory")
+        if knowledge_dir is not None and knowledge_dir.exists():
+            reconcilable.append("knowledge")
+        for source in reconcilable:
+            try:
+                stale = set(self.storage.list_paths(source)) - scanned.get(source, set())
+            except Exception as e:
+                logger.warning(f"[MemoryManager] Cannot reconcile {source} index: {e}")
+                continue
+            dropped = 0
+            for stale_path in stale:
+                try:
+                    self.storage.delete_by_path(stale_path)
+                    dropped += 1
+                except Exception as e:
+                    logger.warning(f"[MemoryManager] Cannot drop stale entry {stale_path}: {e}")
+            if dropped:
+                logger.info(
+                    f"[MemoryManager] Dropped {dropped} stale {source} "
+                    f"entries that are no longer on disk"
+                )
 
         if not pending:
             self._dirty = False
@@ -351,9 +557,9 @@ class MemoryManager:
         for entry in pending:
             all_texts.extend(entry["texts"])
 
-        if not self.embedding_provider:
-            # No provider configured at all (legacy keyword-only). Persist
-            # chunks without embeddings — this is the user's intent.
+        if not all_texts or not self.embedding_provider:
+            # Empty files still replace their index entry without an API call.
+            # Keyword-only indexes persist nonempty chunks without embeddings.
             all_embeddings: List[Optional[List[float]]] = [None] * len(all_texts)
         else:
             try:
@@ -378,9 +584,15 @@ class MemoryManager:
 
             rel_path = entry["rel_path"]
             self.storage.delete_by_path(rel_path)
+            if os.sep != "/":
+                # Keys used to be spelled with the platform separator. Drop that
+                # row too, so a Windows index carried over from an older build
+                # does not keep a second copy of the same file under
+                # "knowledge\note.md" and return it twice.
+                self.storage.delete_by_path(rel_path.replace("/", os.sep))
             memory_chunks = []
             for chunk, embedding in zip(entry["chunks"], entry_embeddings):
-                chunk_id = self._generate_chunk_id(rel_path, chunk.start_line, chunk.end_line)
+                chunk_id = self._generate_chunk_id(rel_path, chunk.start_line, chunk.end_line, chunk.part)
                 chunk_hash = MemoryStorage.compute_hash(chunk.text)
                 memory_chunks.append(MemoryChunk(
                     id=chunk_id,
@@ -404,6 +616,19 @@ class MemoryManager:
                 mtime=int(stat.st_mtime),
                 size=stat.st_size,
             )
+
+        # Stamp the chunker version only when we rebuilt from an empty index,
+        # i.e. every chunk in it was produced by the current algorithm. An
+        # index that already had files may still contain chunks from an older
+        # chunker (file hashes do not change when only the chunker does), so it
+        # stays unstamped and /memory status will suggest a rebuild.
+        if files_before == 0:
+            try:
+                self.storage.set_meta(
+                    "chunker_version", str(TextChunker.CHUNKER_VERSION)
+                )
+            except Exception:
+                pass
 
         self._dirty = False
 
@@ -451,7 +676,8 @@ class MemoryManager:
             'embedding_enabled': self.embedding_provider is not None,
             'embedding_provider': self.config.embedding_provider if self.embedding_provider else 'disabled',
             'embedding_model': self.config.embedding_model if self.embedding_provider else 'N/A',
-            'search_mode': 'hybrid (vector + keyword)' if self.embedding_provider else 'keyword only (FTS5)'
+            'search_mode': 'hybrid (vector + keyword)' if self.embedding_provider else 'keyword only (FTS5)',
+            'rerank_enabled': self.reranker is not None,
         }
     
     def mark_dirty(self):
@@ -464,9 +690,12 @@ class MemoryManager:
     
     # Helper methods
     
-    def _generate_chunk_id(self, path: str, start_line: int, end_line: int) -> str:
-        """Generate unique chunk ID"""
+    def _generate_chunk_id(self, path: str, start_line: int, end_line: int,
+                           part: int = 0) -> str:
+        """Generate unique chunk ID; `part` separates the pieces of one split line."""
         content = f"{path}:{start_line}:{end_line}"
+        if part:
+            content += f":{part}"
         return hashlib.md5(content.encode('utf-8')).hexdigest()
     
     @staticmethod
@@ -483,9 +712,20 @@ class MemoryManager:
         import re
         import math
         
-        match = re.search(r'(\d{4})-(\d{2})-(\d{2})\.md$', path)
+        # Normalize legacy backslash paths so the anchor below also matches
+        # paths produced on Windows checkouts.
+        normalized = path.replace("\\", "/")
+
+        # Decay applies only to daily diary files: memory/YYYY-MM-DD.md, the
+        # per-user memory/users/<id>/YYYY-MM-DD.md and memory/dreams/YYYY-MM-DD.md.
+        # Dated knowledge pages (knowledge/analysis/foo-2026-09-02.md) are
+        # event time anchors rather than perishable content, so they stay
+        # evergreen and are never decayed.
+        match = re.search(
+            r'^memory/(?:users/[^/]+/|dreams/)?(\d{4})-(\d{2})-(\d{2})\.md$', normalized
+        )
         if not match:
-            return 1.0  # evergreen: MEMORY.md, non-dated files
+            return 1.0  # evergreen: MEMORY.md, knowledge pages, handoffs...
         
         try:
             file_date = datetime(
@@ -500,6 +740,70 @@ class MemoryManager:
         except (ValueError, OverflowError):
             return 1.0
     
+    @staticmethod
+    def _normalize_weights(vector_weight: float, keyword_weight: float) -> tuple:
+        """Clamp fusion weights into a valid (non-negative, finite) pair.
+
+        The weighted average below is renormalized over only the channels that
+        actually returned a chunk, so only the *ratio* between the two weights
+        matters. Negative and non-finite weights (NaN, +/-inf) are clamped to 0,
+        and an all-zero pair falls back to equal weighting, so a misconfigured
+        value can never produce a negative or meaningless combined score.
+        """
+        import math
+
+        try:
+            v = float(vector_weight)
+            k = float(keyword_weight)
+        except (TypeError, ValueError):
+            return 0.5, 0.5
+        v = v if (math.isfinite(v) and v > 0) else 0.0
+        k = k if (math.isfinite(k) and k > 0) else 0.0
+        if v == 0.0 and k == 0.0:
+            return 0.5, 0.5
+        return v, k
+
+    @staticmethod
+    def _fusion_key(result: "SearchResult") -> tuple:
+        """Per-chunk identity for fusion and hit bookkeeping.
+
+        Hard-split pieces of one long line share (path, start_line,
+        end_line); keying on the triple collapsed them into one fusion
+        entry, let the worst piece's rank overwrite the best one's, and
+        credited sibling pieces for hits they never matched. The chunk id
+        separates them; results without one (hand-built doubles) keep the
+        legacy triple key.
+        """
+        # Always a 4-tuple so storage-side bookkeeping can unpack uniformly;
+        # a missing id leaves the first slot None and the positional triple
+        # still distinguishes the result.
+        return (
+            getattr(result, "chunk_id", None),
+            result.path,
+            result.start_line,
+            result.end_line,
+        )
+
+    @staticmethod
+    def _rank_normalize(results: List[SearchResult]) -> Dict[tuple, float]:
+        """Rank-normalize one channel's already-sorted results onto (0, 1].
+
+        ``search_vector`` and ``search_keyword`` both return their results in
+        descending relevance order, so the position index is the rank. The top
+        hit maps to 1.0 and each later hit decays linearly to 1/N. This puts
+        raw cosine similarity and the BM25-derived keyword score — which live
+        on incommensurable scales — onto a common scale before fusion.
+
+        :return: {(path, start_line, end_line): normalized_score}
+        """
+        n = len(results)
+        if n == 0:
+            return {}
+        return {
+            MemoryManager._fusion_key(r): (n - i) / n
+            for i, r in enumerate(results)
+        }
+
     def _merge_results(
         self,
         vector_results: List[SearchResult],
@@ -507,40 +811,44 @@ class MemoryManager:
         vector_weight: float,
         keyword_weight: float
     ) -> List[SearchResult]:
-        """Merge vector and keyword search results with temporal decay for dated files"""
-        merged_map = {}
-        
-        for result in vector_results:
-            key = (result.path, result.start_line, result.end_line)
-            merged_map[key] = {
-                'result': result,
-                'vector_score': result.score,
-                'keyword_score': 0.0
-            }
-        
-        for result in keyword_results:
-            key = (result.path, result.start_line, result.end_line)
-            if key in merged_map:
-                merged_map[key]['keyword_score'] = result.score
-            else:
-                merged_map[key] = {
-                    'result': result,
-                    'vector_score': 0.0,
-                    'keyword_score': result.score
-                }
-        
+        """Merge vector and keyword search results with temporal decay.
+
+        Each channel is rank-normalized to a common (0, 1] scale first, then a
+        chunk is scored by the weighted average over only the channels that
+        actually returned it. A strong single-channel hit is therefore not
+        diluted by a 0.0 from the missing channel, and the two channels' raw
+        scores no longer have to be comparable to be fused fairly.
+        """
+        vector_weight, keyword_weight = self._normalize_weights(vector_weight, keyword_weight)
+        vector_norm = self._rank_normalize(vector_results)
+        keyword_norm = self._rank_normalize(keyword_results)
+
+        # Keep the first (vector-first) result per chunk for reconstruction;
+        # either channel carries the same snippet/source/path metadata.
+        result_map: Dict[tuple, SearchResult] = {}
+        for result in vector_results + keyword_results:
+            result_map.setdefault(MemoryManager._fusion_key(result), result)
+
         merged_results = []
-        for entry in merged_map.values():
-            combined_score = (
-                vector_weight * entry['vector_score'] +
-                keyword_weight * entry['keyword_score']
+        for key in set(vector_norm) | set(keyword_norm):
+            result = result_map[key]
+            vec = vector_norm.get(key)
+            kw = keyword_norm.get(key)
+            hit_v = vec is not None
+            hit_k = kw is not None
+            numerator = (
+                vector_weight * (vec if hit_v else 0.0)
+                + keyword_weight * (kw if hit_k else 0.0)
             )
-            
+            denominator = (
+                (vector_weight if hit_v else 0.0)
+                + (keyword_weight if hit_k else 0.0)
+            )
+            combined_score = (numerator / denominator) if denominator > 0 else 0.0
+
             # Apply temporal decay for dated memory files
-            result = entry['result']
-            decay = self._compute_temporal_decay(result.path)
-            combined_score *= decay
-            
+            combined_score *= self._compute_temporal_decay(result.path)
+
             merged_results.append(SearchResult(
                 path=result.path,
                 start_line=result.start_line,
@@ -548,8 +856,130 @@ class MemoryManager:
                 score=combined_score,
                 snippet=result.snippet,
                 source=result.source,
-                user_id=result.user_id
+                user_id=result.user_id,
+                chunk_id=getattr(result, "chunk_id", None),
             ))
-        
+
         merged_results.sort(key=lambda r: r.score, reverse=True)
         return merged_results
+
+    def _rerank(
+        self,
+        query: str,
+        results: List[SearchResult]
+    ) -> List[SearchResult]:
+        """Reorder candidates by the reranker's relevance scores.
+
+        Replaces each candidate's fused score with the reranker's score (still
+        subject to temporal decay), then re-sorts. Returns ``results``
+        unchanged when no reranker is configured, and falls back to them when
+        rerank fails, the same way vector search degrades to keyword-only.
+        """
+        if self.reranker is None or not results:
+            return results
+
+        from common.log import logger
+
+        try:
+            scores = self.reranker.rerank(query, [r.snippet for r in results])
+            if len(scores) != len(results):
+                raise ValueError(
+                    f"expected {len(results)} scores, got {len(scores)}"
+                )
+        except Exception as e:
+            logger.warning(f"[MemoryManager] Rerank failed, keeping fused order: {e}")
+            return results
+
+        reranked = []
+        for result, score in zip(results, scores):
+            decayed = score * self._compute_temporal_decay(result.path)
+            reranked.append(SearchResult(
+                path=result.path,
+                start_line=result.start_line,
+                end_line=result.end_line,
+                score=decayed,
+                snippet=result.snippet,
+                source=result.source,
+                user_id=result.user_id,
+                chunk_id=getattr(result, "chunk_id", None),
+            ))
+
+        reranked.sort(key=lambda r: r.score, reverse=True)
+        return reranked
+
+    def _hit_boost_params(self):
+        """(weight, cap) of the hit-popularity boost; weight 0 means off."""
+        config = getattr(self, "config", None)
+        weight = float(getattr(config, "hit_boost_weight", 0.0) or 0.0)
+        cap = float(getattr(config, "hit_boost_max", 1.25) or 1.25)
+        return weight, cap
+
+    def _hit_boost_enabled(self) -> bool:
+        """Opt-in: a retrieval hit is not proof of usefulness, so by default
+        both the re-ranking and the per-search hit write-back stay off."""
+        weight, cap = self._hit_boost_params()
+        return weight > 0 and cap > 1.0
+
+    def _apply_hit_boost(
+        self,
+        results: List[SearchResult]
+    ) -> List[SearchResult]:
+        """Nudge chunks that were retrieved often (and recently) up the ranking.
+
+        The multiplier is ``1 + w*log2(1 + hits)`` plus a same-sized recency
+        term that decays over a week since ``last_hit_at``, capped at
+        ``hit_boost_max``. The log keeps the curve flat at the high end and the
+        cap bounds the feedback loop, so repeated queries can only re-order
+        near-equal candidates, never crowd out everything else. The boost is
+        opt-in: with the default ``hit_boost_weight = 0`` this returns the
+        results untouched and ``search()`` skips the hit write-back too.
+
+        Uses getattr lookups so a bare instance (tests call the pure fusion
+        helpers without storage/config) degrades to a no-op, and any storage
+        failure degrades to the unboosted order like rerank does.
+        """
+        if not results:
+            return results
+        storage = getattr(self, "storage", None)
+        if storage is None or not hasattr(storage, "get_hit_stats"):
+            return results
+        if not self._hit_boost_enabled():
+            return results
+
+        weight, cap = self._hit_boost_params()
+
+        import math
+        import time
+
+        from common.log import logger
+
+        try:
+            keys = [MemoryManager._fusion_key(r) for r in results]
+            stats = storage.get_hit_stats(keys)
+        except Exception as e:
+            logger.warning(f"[MemoryManager] Hit stats unavailable, skipping boost: {e}")
+            return results
+
+        now = time.time()
+        boosted = []
+        for result in results:
+            hits, last_hit_at = stats.get(
+                MemoryManager._fusion_key(result), (0, None)
+            )
+            factor = 1.0 + weight * math.log2(1.0 + max(0, int(hits or 0)))
+            if last_hit_at:
+                age_days = max(0.0, (now - float(last_hit_at)) / 86400.0)
+                factor += weight * math.exp(-age_days / 7.0)
+            boosted.append(SearchResult(
+                path=result.path,
+                start_line=result.start_line,
+                end_line=result.end_line,
+                score=result.score * min(factor, cap),
+                chunk_id=getattr(result, "chunk_id", None),
+                snippet=result.snippet,
+                source=result.source,
+                user_id=result.user_id
+            ))
+
+        boosted.sort(key=lambda r: r.score, reverse=True)
+        return boosted

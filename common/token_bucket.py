@@ -10,11 +10,22 @@ class TokenBucket:
         self.timeout = timeout  # 等待令牌超时时间
         self.cond = threading.Condition()  # 条件变量
         self.is_running = True
-        # 开启令牌生成线程
-        threading.Thread(target=self._generate_tokens).start()
+        # Start the token generator thread. It must be a daemon: a rate limiter
+        # has no reason to keep the process from exiting, and both production
+        # call sites build a bucket without ever calling close().
+        self._thread = threading.Thread(target=self._generate_tokens, daemon=True)
+        self._thread.start()
 
     def _generate_tokens(self):
         """生成令牌"""
+        if self.rate <= 0:
+            # A sub-1 tokens-per-minute config rounds to a rate of zero, so
+            # there is nothing to generate. Stop here instead of dividing by 0
+            # in the sleep below, which would kill this thread silently.
+            with self.cond:
+                self.is_running = False
+                self.cond.notify_all()
+            return
         while self.is_running:
             with self.cond:
                 if self.tokens < self.capacity:
@@ -25,15 +36,28 @@ class TokenBucket:
     def get_token(self):
         """获取令牌"""
         with self.cond:
+            deadline = time.monotonic() + self.timeout if self.timeout is not None else None
             while self.tokens <= 0:
-                flag = self.cond.wait(self.timeout)
+                if not self.is_running:
+                    return False
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                flag = self.cond.wait(remaining)
                 if not flag:  # 超时
                     return False
+            if not self.is_running:
+                return False
             self.tokens -= 1
         return True
 
     def close(self):
-        self.is_running = False
+        with self.cond:
+            self.is_running = False
+            self.cond.notify_all()
+        # The generator may be mid-sleep, so bound the wait. It is a daemon
+        # thread, so a missed join can never keep the process alive.
+        self._thread.join(timeout=1)
 
 
 if __name__ == "__main__":

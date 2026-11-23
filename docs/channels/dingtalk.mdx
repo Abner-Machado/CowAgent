@@ -1,6 +1,6 @@
 ---
 title: DingTalk
-description: Integrate CowAgent into DingTalk application
+description: "Connect CowAgent to DingTalk: create an app with the bot capability on the DingTalk Open Platform, add the credentials, and chat in direct and group chats, with optional streaming cards."
 ---
 
 Integrate CowAgent into DingTalk by creating an intelligent robot app on the DingTalk Open Platform.
@@ -14,6 +14,8 @@ Integrate CowAgent into DingTalk by creating an intelligent robot app on the Din
 2. Click **Add App Capability**, select **Robot** capability and click **Add**:
 
 <img src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/dingtalk-add-bot.png" width="800"/>
+
+> Optional: to reply with streaming Markdown cards, request the `Card.Instance.Write` and `Card.Streaming.Write` permissions under **Permission Management**, and add `"dingtalk_card_enabled": true` to `config.json`.
 
 3. Configure the robot information and click **Publish**. After publishing, click "**Debug**" to automatically create a test group chat, which can be viewed in the client:
 

@@ -29,6 +29,7 @@ from voice.voice import Voice
 from .xunfei_asr import xunfei_asr
 from .xunfei_tts import xunfei_tts
 import shutil
+import uuid
 
 try:
     from voice.audio_convert import any_to_mp3
@@ -47,7 +48,6 @@ class XunfeiVoice(Voice):
             conf = None
             with open(config_path, "r") as fr:
                 conf = json.load(fr)
-            print(conf)
             self.APPID = str(conf.get("APPID"))
             self.APIKey = str(conf.get("APIKey"))
             self.APISecret = str(conf.get("APISecret"))
@@ -76,17 +76,17 @@ class XunfeiVoice(Voice):
             reply = Reply(ReplyType.TEXT, text)
         except Exception as e:
             logger.warn("XunfeiVoice init failed: %s, ignore " % e)
-            reply = Reply(ReplyType.ERROR, "讯飞语音识别出错了；{0}")
+            reply = Reply(ReplyType.ERROR, f"讯飞语音识别出错了；{e}")
         return reply
 
     def textToVoice(self, text):
         try:
             # Avoid the same filename under multithreading
-            fileName = TmpDir().path() + "reply-" + str(int(time.time())) + "-" + str(hash(text) & 0x7FFFFFFF) + ".mp3"
-            return_file = xunfei_tts(self.APPID,self.APIKey,self.APISecret,self.BusinessArgsTTS,text,fileName)
+            fileName = TmpDir().path() + "reply-" + uuid.uuid4().hex + ".mp3"
+            xunfei_tts(self.APPID,self.APIKey,self.APISecret,self.BusinessArgsTTS,text,fileName)
             logger.info("[Xunfei] textToVoice text={} voice file name={}".format(text, fileName))
             reply = Reply(ReplyType.VOICE, fileName)
         except Exception as e:
-            logger.error("[Xunfei] textToVoice error={}".format(fileName))
+            logger.error("[Xunfei] textToVoice error={}".format(e))
             reply = Reply(ReplyType.ERROR, "抱歉，讯飞语音合成失败")
         return reply

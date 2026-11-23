@@ -10,7 +10,7 @@ class _FakeInitializer:
         self.registry = registry
         self.calls = []
 
-    def initialize_agent(self, session_id=None, agent_id=None):
+    def initialize_agent(self, session_id=None, agent_id=None, host_agent_id=None):
         profile = self.registry.get(agent_id)
         self.calls.append((profile.id, session_id))
         return SimpleNamespace(

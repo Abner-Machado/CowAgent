@@ -3,14 +3,28 @@ Scheduler tool for creating and managing scheduled tasks
 """
 
 import uuid
-from datetime import datetime
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from typing import Optional
+
 from croniter import croniter
+from agent.tools.scheduler.time_utils import (
+    display_local,
+    format_scheduled_time,
+    next_cron_occurrence,
+    parse_scheduled_time,
+    resolve_timezone,
+    scheduled_reference_time,
+    task_timezone,
+    utc_now,
+)
 
 from agent.tools.base_tool import BaseTool, ToolResult
-from bridge.context import Context, ContextType
-from bridge.reply import Reply, ReplyType
+from bridge.context import Context
 from common.log import logger
+
+
+class _SchedulerError(str):
+    """A refused operation, retaining the helpers' existing text interface."""
 
 
 class SchedulerTool(BaseTool):
@@ -30,14 +44,16 @@ class SchedulerTool(BaseTool):
         "- once: 一次性任务，支持相对时间(+5s,+10m,+1h,+1d)或ISO时间\n"
         "- interval: 固定间隔(秒)，如3600表示每小时\n"
         "- cron: cron表达式，如'0 8 * * *'表示每天8点\n\n"
-        "注意：'X秒后'用once+相对时间，'每X秒'用interval"
+        "注意：'X秒后'用once+相对时间，'每X秒'用interval\n"
+        "For Web cross-channel delivery, call action='list_recipients' first, "
+        "then create a task (fixed message or ai_task) using the returned channel_type and receiver."
     )
     params: dict = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "list", "get", "delete", "enable", "disable"],
+                "enum": ["create", "list", "list_recipients", "get", "delete", "enable", "disable"],
                 "description": "操作类型: create(创建), list(列表), get(查询), delete(删除), enable(启用), disable(禁用)"
             },
             "task_id": {
@@ -72,7 +88,23 @@ class SchedulerTool(BaseTool):
                 "type": "boolean",
                 "default": False,
                 "description": "Silent mode (default false): when true, the task runs normally but its result is not pushed. Set true only when the user explicitly says they don't need the result; reminder, notification and broadcast tasks must keep it false"
-            }
+            },
+            "channel_type": {
+                "type": "string",
+                "description": "Target channel type for a Web-created cross-channel task. Use list_recipients first."
+            },
+            "instance_id": {
+                "type": "string",
+                "description": "The specific channel instance the recipient belongs to, as returned by list_recipients. Required when a channel type runs more than one instance; the same receiver on two instances is two different targets. Omit for a single-instance channel."
+            },
+            "timezone": {
+                "type": "string",
+                "description": "Optional IANA timezone (e.g. Asia/Shanghai) used for cron wall-clock times and naive ISO timestamps"
+            },
+            "receiver": {
+                "type": "string",
+                "description": "Trusted target receiver returned by list_recipients. It cannot be an arbitrary user ID."
+            },
         },
         "required": ["action"]
     }
@@ -83,6 +115,7 @@ class SchedulerTool(BaseTool):
         
         # Will be set by agent bridge
         self.task_store = None
+        self.recipient_store = None
         self.current_context = None
     
     def execute(self, params: dict) -> ToolResult:
@@ -107,24 +140,23 @@ class SchedulerTool(BaseTool):
         try:
             if action == "create":
                 result = self._create_task(**kwargs)
-                return ToolResult.success(result)
             elif action == "list":
                 result = self._list_tasks(**kwargs)
-                return ToolResult.success(result)
+            elif action == "list_recipients":
+                result = self._list_recipients(**kwargs)
             elif action == "get":
                 result = self._get_task(**kwargs)
-                return ToolResult.success(result)
             elif action == "delete":
                 result = self._delete_task(**kwargs)
-                return ToolResult.success(result)
             elif action == "enable":
                 result = self._enable_task(**kwargs)
-                return ToolResult.success(result)
             elif action == "disable":
                 result = self._disable_task(**kwargs)
-                return ToolResult.success(result)
             else:
                 return ToolResult.fail(f"未知操作: {action}")
+            if isinstance(result, _SchedulerError):
+                return ToolResult.fail(str(result))
+            return ToolResult.success(result)
         except Exception as e:
             logger.error(f"[SchedulerTool] Error: {e}")
             return ToolResult.fail(f"操作失败: {str(e)}")
@@ -136,32 +168,51 @@ class SchedulerTool(BaseTool):
         ai_task = kwargs.get("ai_task")
         schedule_type = kwargs.get("schedule_type")
         schedule_value = kwargs.get("schedule_value")
+        timezone_name = kwargs.get("timezone")
         
         # Validate required fields
         if not name:
-            return "错误: 缺少任务名称 (name)"
+            return _SchedulerError("错误: 缺少任务名称 (name)")
         
         # Check that exactly one of message/ai_task is provided
         if not message and not ai_task:
-            return "错误: 必须提供 message（固定消息）或 ai_task（AI任务）之一"
+            return _SchedulerError("错误: 必须提供 message（固定消息）或 ai_task（AI任务）之一")
         if message and ai_task:
-            return "错误: message 和 ai_task 只能提供其中一个"
+            return _SchedulerError("错误: message 和 ai_task 只能提供其中一个")
         
         if not schedule_type:
-            return "错误: 缺少调度类型 (schedule_type)"
+            return _SchedulerError("错误: 缺少调度类型 (schedule_type)")
         if not schedule_value:
-            return "错误: 缺少调度值 (schedule_value)"
+            return _SchedulerError("错误: 缺少调度值 (schedule_value)")
         
         # Validate schedule
-        schedule = self._parse_schedule(schedule_type, schedule_value)
+        schedule = self._parse_schedule(schedule_type, schedule_value, timezone_name)
         if not schedule:
-            return f"错误: 无效的调度配置 - type: {schedule_type}, value: {schedule_value}"
+            return _SchedulerError(f"错误: 无效的调度配置 - type: {schedule_type}, value: {schedule_value}")
         
         # Get context info for receiver
         if not self.current_context:
-            return "错误: 无法获取当前对话上下文"
+            return _SchedulerError("错误: 无法获取当前对话上下文")
         
         context = self.current_context
+
+        target_channel = kwargs.get("channel_type")
+        target_receiver = kwargs.get("receiver")
+        # A channel type can run several instances; delivery must go back through
+        # the exact one that saw the contact. When the caller does not name an
+        # instance (legacy single-instance channel), it equals the channel type.
+        target_instance = kwargs.get("instance_id") or target_channel
+        target = None
+        if target_channel or target_receiver:
+            if context.get("channel_type") != "web":
+                return _SchedulerError("Error: cross-channel recipients can only be selected from the Web console")
+            if not target_channel or not target_receiver:
+                return _SchedulerError("Error: channel_type and receiver must be provided together")
+            if not self.recipient_store:
+                return _SchedulerError("Error: trusted recipient directory is unavailable")
+            target = self.recipient_store.get(target_instance, target_receiver)
+            if not target:
+                return _SchedulerError("Error: target is not in the trusted recipient directory; use list_recipients")
         
         # Create task
         task_id = str(uuid.uuid4())[:8]
@@ -169,28 +220,46 @@ class SchedulerTool(BaseTool):
         # Capture the real chat session_id at task creation time so that scheduler
         # can later inject the delivered output into the user's actual conversation
         # (in group chats, session_id != receiver, e.g. "user_id:group_id" on feishu).
-        notify_session_id = context.get("session_id")
+        notify_session_id = target["session_id"] if target else context.get("session_id")
+        receiver = target["receiver"] if target else context.get("receiver")
+        receiver_name = target["name"] if target else self._get_receiver_name(context)
+        is_group = target["is_group"] if target else context.get("isgroup", False)
+        channel_type = target["channel_type"] if target else self.config.get("channel_type", "unknown")
+        # The instance to deliver back through: the target's own for a
+        # cross-channel task, else this conversation's. Defaults to the channel
+        # type so a legacy single-instance channel keeps resolving as before.
+        instance_id = (
+            target.get("instance_id") if target else context.get("instance_id")
+        ) or channel_type
 
         # Build action based on message or ai_task
         if message:
             action = {
                 "type": "send_message",
                 "content": message,
-                "receiver": context.get("receiver"),
-                "receiver_name": self._get_receiver_name(context),
-                "is_group": context.get("isgroup", False),
-                "channel_type": self.config.get("channel_type", "unknown"),
+                "receiver": receiver,
+                "receiver_name": receiver_name,
+                "is_group": is_group,
+                "channel_type": channel_type,
+                "instance_id": instance_id,
                 "notify_session_id": notify_session_id,
             }
         else:  # ai_task
             action = {
                 "type": "agent_task",
                 "task_description": ai_task,
-                "receiver": context.get("receiver"),
-                "receiver_name": self._get_receiver_name(context),
-                "is_group": context.get("isgroup", False),
-                "channel_type": self.config.get("channel_type", "unknown"),
+                "receiver": receiver,
+                "receiver_name": receiver_name,
+                "is_group": is_group,
+                "channel_type": channel_type,
+                "instance_id": instance_id,
                 "notify_session_id": notify_session_id,
+                # Each run gets its own session with no permission override, so
+                # record the conversation the task came from and the mode it had:
+                # a run must never be allowed more than that conversation.
+                "origin_session_id": context.get("session_id") or "",
+                "origin_agent_id": context.get("agent_id") or "",
+                "permission_mode": self._creator_permission_mode(context),
             }
             # silent only applies to ai_task; fixed messages always deliver
             if kwargs.get("silent", False):
@@ -201,9 +270,15 @@ class SchedulerTool(BaseTool):
         if msg and hasattr(msg, 'sender_staff_id') and not context.get("isgroup", False):
             action["dingtalk_sender_staff_id"] = msg.sender_staff_id
         
+        # The Agent this task runs as. Stored on the task (not implied by which
+        # file it lives in) so the global scheduler can scope execution to it and
+        # so re-binding a channel instance to a different Agent never moves data.
+        owner_agent_id = self._resolve_owner_agent_id(context, target)
+
         task_data = {
             "id": task_id,
             "name": name,
+            "agent_id": owner_agent_id,
             "enabled": True,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
@@ -214,6 +289,24 @@ class SchedulerTool(BaseTool):
         # Calculate initial next_run_at
         next_run = self._calculate_next_run(task_data)
         if next_run:
+            # A one-time task whose run time has already passed would be
+            # stored all the same, then deleted on the service's first
+            # tick once the catch-up window has passed
+            # (SchedulerService._is_task_due): the reminder never fires
+            # and only a server-side log says why. Refuse it here, where
+            # the caller can still pick another time - the service's own
+            # _calculate_next_run answers a past run_at with no next run.
+            # Compared in the task's own mode (aware UTC for a declared
+            # zone, naive local otherwise) so a zoned task cannot raise
+            # a naive/aware TypeError.
+            if schedule.get("type") == "once" and next_run <= scheduled_reference_time(
+                task_data, datetime.now()
+            ):
+                return _SchedulerError(
+                    f"错误: 定时时间已过去 - {schedule.get('run_at')}。"
+                    "一次性任务只能安排在将来的时间，请改用一个将来的时间"
+                    "或 +10m 这类相对时间。"
+                )
             task_data["next_run_at"] = next_run.isoformat()
         
         # Save task
@@ -238,12 +331,46 @@ class SchedulerTool(BaseTool):
             f"⏰ 调度: {schedule_desc}\n"
             f"👤 接收者: {receiver_desc}\n"
             f"{content_desc}{silent_desc}\n"
-            f"🕐 下次执行: {next_run.strftime('%Y-%m-%d %H:%M:%S') if next_run else '未知'}"
+            f"🕐 下次执行: {next_run.astimezone().strftime('%Y-%m-%d %H:%M:%S') if next_run else '未知'}"
         )
     
+    def _caller_agent_id(self) -> str:
+        """The Agent this turn runs as, or "" when it cannot be determined.
+
+        Resolved in the same order as a new task's owner, so an Agent can
+        always list and delete what it created. A bare tool (CLI, unit tests)
+        knows no identity and stays unscoped.
+        """
+        agent_id = ((self.current_context or {}).get("agent_id") or "").strip()
+        if not agent_id:
+            try:
+                from common.runtime_identity import current_identity
+
+                agent_id = (current_identity().agent_id or "").strip()
+            except Exception:
+                agent_id = ""
+        return agent_id or ((self.config or {}).get("agent_id") or "").strip()
+
+    def _owned_task(self, task_id: str):
+        """Fetch a task the calling Agent owns, or the error to report.
+
+        Another Agent's task is indistinguishable from a missing one: the
+        caller learns nothing about a roster it is not part of, and cannot
+        read, disable or delete what it does not own.
+        """
+        from agent.tools.scheduler.integration import effective_task_agent_id
+
+        task = self.task_store.get_task(task_id)
+        if not task:
+            return None, _SchedulerError(f"错误: 任务 '{task_id}' 不存在")
+        owner = self._caller_agent_id()
+        if owner and effective_task_agent_id(task) != owner:
+            return None, _SchedulerError(f"错误: 任务 '{task_id}' 不存在")
+        return task, None
+
     def _list_tasks(self, **kwargs) -> str:
-        """List all tasks"""
-        tasks = self.task_store.list_tasks()
+        """List the calling Agent's tasks"""
+        tasks = self.task_store.list_tasks(agent_id=self._caller_agent_id() or None)
         
         if not tasks:
             return "📋 暂无定时任务"
@@ -254,7 +381,7 @@ class SchedulerTool(BaseTool):
             status = "✅" if task.get("enabled", True) else "❌"
             schedule_desc = self._format_schedule_description(task.get("schedule", {}))
             next_run = task.get("next_run_at")
-            next_run_str = datetime.fromisoformat(next_run).strftime('%m-%d %H:%M') if next_run else "未知"
+            next_run_str = display_local(next_run, task_timezone(task)).strftime('%m-%d %H:%M') if next_run else "未知"
             
             lines.append(
                 f"{status} [{task['id']}] {task['name']}\n"
@@ -262,24 +389,44 @@ class SchedulerTool(BaseTool):
             )
         
         return "\n".join(lines)
+
+    def _list_recipients(self, **kwargs) -> str:
+        """List trusted targets available to the Web scheduler."""
+        if not self.current_context or self.current_context.get("channel_type") != "web":
+            return _SchedulerError("Error: trusted recipients can only be listed from the Web console")
+        if not self.recipient_store:
+            return _SchedulerError("Error: trusted recipient directory is unavailable")
+        recipients = self.recipient_store.list()
+        if not recipients:
+            return "No trusted recipients yet. A recipient must contact CowAgent first."
+        lines = ["Trusted scheduler recipients:"]
+        for item in recipients:
+            kind = "group" if item["is_group"] else "user"
+            instance_id = item.get("instance_id") or item["channel_type"]
+            lines.append(
+                f"- {item['name']} ({kind}): channel_type={item['channel_type']}, "
+                f"instance_id={instance_id}, receiver={item['receiver']}"
+            )
+        return "\n".join(lines)
     
     def _get_task(self, **kwargs) -> str:
         """Get task details"""
         task_id = kwargs.get("task_id")
         if not task_id:
-            return "错误: 缺少任务ID (task_id)"
-        
-        task = self.task_store.get_task(task_id)
-        if not task:
-            return f"错误: 任务 '{task_id}' 不存在"
-        
+            return _SchedulerError("错误: 缺少任务ID (task_id)")
+
+        task, error = self._owned_task(task_id)
+        if error:
+            return error
+
         status = "启用" if task.get("enabled", True) else "禁用"
         schedule_desc = self._format_schedule_description(task.get("schedule", {}))
         action = task.get("action", {})
         next_run = task.get("next_run_at")
-        next_run_str = datetime.fromisoformat(next_run).strftime('%Y-%m-%d %H:%M:%S') if next_run else "未知"
+        zone = task_timezone(task)
+        next_run_str = display_local(next_run, zone).strftime('%Y-%m-%d %H:%M:%S') if next_run else "未知"
         last_run = task.get("last_run_at")
-        last_run_str = datetime.fromisoformat(last_run).strftime('%Y-%m-%d %H:%M:%S') if last_run else "从未执行"
+        last_run_str = display_local(last_run, zone).strftime('%Y-%m-%d %H:%M:%S') if last_run else "从未执行"
         
         return (
             f"📋 任务详情\n\n"
@@ -291,19 +438,19 @@ class SchedulerTool(BaseTool):
             f"消息: {action.get('content')}\n"
             f"下次执行: {next_run_str}\n"
             f"上次执行: {last_run_str}\n"
-            f"创建时间: {datetime.fromisoformat(task['created_at']).strftime('%Y-%m-%d %H:%M:%S')}"
+            f"创建时间: {display_local(task['created_at']).strftime('%Y-%m-%d %H:%M:%S')}"
         )
     
     def _delete_task(self, **kwargs) -> str:
         """Delete a task"""
         task_id = kwargs.get("task_id")
         if not task_id:
-            return "错误: 缺少任务ID (task_id)"
-        
-        task = self.task_store.get_task(task_id)
-        if not task:
-            return f"错误: 任务 '{task_id}' 不存在"
-        
+            return _SchedulerError("错误: 缺少任务ID (task_id)")
+
+        task, error = self._owned_task(task_id)
+        if error:
+            return error
+
         self.task_store.delete_task(task_id)
         return f"✅ 任务 '{task['name']}' ({task_id}) 已删除"
     
@@ -311,12 +458,12 @@ class SchedulerTool(BaseTool):
         """Enable a task"""
         task_id = kwargs.get("task_id")
         if not task_id:
-            return "错误: 缺少任务ID (task_id)"
-        
-        task = self.task_store.get_task(task_id)
-        if not task:
-            return f"错误: 任务 '{task_id}' 不存在"
-        
+            return _SchedulerError("错误: 缺少任务ID (task_id)")
+
+        task, error = self._owned_task(task_id)
+        if error:
+            return error
+
         self.task_store.enable_task(task_id, True)
         return f"✅ 任务 '{task['name']}' ({task_id}) 已启用"
     
@@ -324,101 +471,122 @@ class SchedulerTool(BaseTool):
         """Disable a task"""
         task_id = kwargs.get("task_id")
         if not task_id:
-            return "错误: 缺少任务ID (task_id)"
-        
-        task = self.task_store.get_task(task_id)
-        if not task:
-            return f"错误: 任务 '{task_id}' 不存在"
-        
+            return _SchedulerError("错误: 缺少任务ID (task_id)")
+
+        task, error = self._owned_task(task_id)
+        if error:
+            return error
+
         self.task_store.enable_task(task_id, False)
         return f"✅ 任务 '{task['name']}' ({task_id}) 已禁用"
     
-    def _parse_schedule(self, schedule_type: str, schedule_value: str) -> Optional[dict]:
-        """Parse and validate schedule configuration"""
+    def _parse_schedule(
+        self, schedule_type: str, schedule_value: str, timezone_name: str = None
+    ) -> Optional[dict]:
+        """Parse and validate schedule configuration."""
         try:
+            zone = resolve_timezone(timezone_name) if timezone_name else None
+
             if schedule_type == "cron":
-                # Validate cron expression
+                # Validate the cron expression and preserve the declared IANA
+                # zone. Without a declared zone, keep the legacy naive mode.
                 croniter(schedule_value)
-                return {"type": "cron", "expression": schedule_value}
-            
-            elif schedule_type == "interval":
-                # Parse interval in seconds
+                schedule = {"type": "cron", "expression": schedule_value}
+                if timezone_name:
+                    schedule["timezone"] = timezone_name.strip()
+                return schedule
+
+            if schedule_type == "interval":
                 seconds = int(schedule_value)
                 if seconds <= 0:
                     return None
                 return {"type": "interval", "seconds": seconds}
-            
-            elif schedule_type == "once":
-                # Parse datetime - support both relative and absolute time
-                
-                # Check if it's relative time (e.g., "+5s", "+10m", "+1h", "+1d")
+
+            if schedule_type == "once":
+                # Support relative times such as "+5s", "+10m", "+1h", "+1d".
                 if schedule_value.startswith("+"):
                     import re
-                    match = re.match(r'\+(\d+)([smhd])', schedule_value)
-                    if match:
-                        amount = int(match.group(1))
-                        unit = match.group(2)
-                        
-                        from datetime import timedelta
-                        now = datetime.now()
-                        
-                        if unit == 's':  # seconds
-                            target_time = now + timedelta(seconds=amount)
-                        elif unit == 'm':  # minutes
-                            target_time = now + timedelta(minutes=amount)
-                        elif unit == 'h':  # hours
-                            target_time = now + timedelta(hours=amount)
-                        elif unit == 'd':  # days
-                            target_time = now + timedelta(days=amount)
-                        else:
-                            return None
-                        
-                        return {"type": "once", "run_at": target_time.isoformat()}
-                    else:
-                        logger.error(f"[SchedulerTool] Invalid relative time format: {schedule_value}")
+                    # fullmatch, not match: a prefix match silently truncated
+                    # "+1h30m" to "+1h" (firing an hour early) and "+30minutes"
+                    # to "+30m"; malformed input must fail loudly instead.
+                    match = re.fullmatch(r'\+(\d+)([smhd])', schedule_value)
+                    if not match:
+                        logger.error(
+                            f"[SchedulerTool] Invalid relative time format: {schedule_value}"
+                        )
                         return None
+
+                    amount = int(match.group(1))
+                    unit = match.group(2)
+                    now = utc_now() if zone is not None else datetime.now()
+                    seconds_per_unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+                    if unit not in seconds_per_unit:
+                        return None
+                    target_time = now + timedelta(
+                        seconds=seconds_per_unit[unit] * amount
+                    )
+
+                    schedule = {
+                        "type": "once",
+                        "run_at": format_scheduled_time(target_time),
+                    }
+                    if timezone_name:
+                        schedule["timezone"] = timezone_name.strip()
+                    return schedule
+
+                parsed = parse_scheduled_time(schedule_value, zone)
+                if zone is not None:
+                    run_at = format_scheduled_time(parsed)
                 else:
-                    # Absolute ISO time. Normalize to tz-naive local so it
-                    # stays comparable with the scheduler's datetime.now().
-                    parsed = datetime.fromisoformat(schedule_value)
+                    # Preserve the scheduler's legacy local wall clock when no
+                    # IANA zone was declared. An input with an offset is still
+                    # normalized to a concrete local wall time.
                     if parsed.tzinfo is not None:
                         parsed = parsed.astimezone().replace(tzinfo=None)
-                    return {"type": "once", "run_at": parsed.isoformat()}
-            
+                    run_at = parsed.isoformat()
+
+                schedule = {"type": "once", "run_at": run_at}
+                if timezone_name:
+                    schedule["timezone"] = timezone_name.strip()
+                return schedule
+
+            return None
         except Exception as e:
             logger.error(f"[SchedulerTool] Invalid schedule: {e}")
             return None
-        
-        return None
-    
+
     def _calculate_next_run(self, task: dict) -> Optional[datetime]:
-        """Calculate next run time for a task"""
+        """Calculate next run time for a task."""
         schedule = task.get("schedule", {})
         schedule_type = schedule.get("type")
-        now = datetime.now()
-        
+        now = scheduled_reference_time(task, datetime.now())
+
         if schedule_type == "cron":
             expression = schedule.get("expression")
-            cron = croniter(expression, now)
-            return cron.get_next(datetime)
-        
-        elif schedule_type == "interval":
+            return next_cron_occurrence(expression, now, task_timezone(task))
+
+        if schedule_type == "interval":
             seconds = schedule.get("seconds", 0)
-            from datetime import timedelta
             return now + timedelta(seconds=seconds)
-        
-        elif schedule_type == "once":
+
+        if schedule_type == "once":
             run_at_str = schedule.get("run_at")
-            return datetime.fromisoformat(run_at_str)
-        
+            return parse_scheduled_time(run_at_str, task_timezone(task))
+
         return None
-    
-    def _format_schedule_description(self, schedule: dict) -> str:
+
+    def _format_schedule_description(self, schedule) -> str:
         """Format schedule as human-readable description"""
+        if not isinstance(schedule, dict):
+            # A stored schedule that is not a mapping declares no schedule. Every
+            # read path has to survive it: one hand-edited task must not take the
+            # whole list/get down, or the user cannot even find it to delete it.
+            return "未知"
         schedule_type = schedule.get("type")
         
         if schedule_type == "cron":
             expr = schedule.get("expression", "")
+            zone_name = schedule.get("timezone")
             # Try to provide friendly description
             if expr == "0 9 * * *":
                 return "每天 9:00"
@@ -427,7 +595,7 @@ class SchedulerTool(BaseTool):
             elif expr == "*/30 * * * *":
                 return "每30分钟"
             else:
-                return f"Cron: {expr}"
+                return f"Cron: {expr} ({zone_name})" if zone_name else f"Cron: {expr}"
         
         elif schedule_type == "interval":
             seconds = schedule.get("seconds", 0)
@@ -446,7 +614,8 @@ class SchedulerTool(BaseTool):
         elif schedule_type == "once":
             run_at = schedule.get("run_at", "")
             try:
-                dt = datetime.fromisoformat(run_at)
+                zone = resolve_timezone(schedule["timezone"]) if schedule.get("timezone") else None
+                dt = display_local(run_at, zone)
                 return f"一次性 ({dt.strftime('%Y-%m-%d %H:%M')})"
             except Exception:
                 return "一次性"
@@ -465,3 +634,61 @@ class SchedulerTool(BaseTool):
         except Exception:
             pass
         return "未知"
+
+    def _resolve_owner_agent_id(self, context: Context, target: Optional[dict]) -> str:
+        """Which Agent the new task runs as.
+
+        For a cross-channel task the owner is the Agent the target's channel
+        instance is bound to (delivery and identity should match how an inbound
+        message from that instance would route). For a normal conversation task
+        it is simply the Agent handling this conversation. Falls back to the
+        ambient runtime identity, then the default Agent.
+        """
+        # Cross-channel: derive from the target instance's binding.
+        if target:
+            iid = (target.get("instance_id") or "").strip()
+            if iid:
+                try:
+                    from channel.channel_instances import get_instance
+                    from config import conf as _conf
+
+                    inst = get_instance(_conf(), iid)
+                    if inst and getattr(inst, "agent_id", ""):
+                        return inst.agent_id
+                except Exception:
+                    pass
+        # Conversation task: the Agent on the context, else ambient identity.
+        agent_id = (context.get("agent_id") if context else "") or ""
+        if not agent_id:
+            try:
+                from common.runtime_identity import current_identity
+
+                agent_id = current_identity().agent_id or ""
+            except Exception:
+                agent_id = ""
+        if agent_id:
+            return agent_id
+        try:
+            from agent.registry import get_agent_registry
+
+            return get_agent_registry().default_agent_id
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _creator_permission_mode(context: Context) -> str:
+        """The permission mode in force in the conversation creating the task.
+
+        Mirrors how the bridge resolves a turn's mode: a delegated turn carries
+        the delegating conversation's mode, otherwise the session's own
+        override, otherwise the instance-wide default.
+        """
+        from agent.permission import global_mode, normalize_mode
+        from agent.workspace import session_prefs
+
+        fallback = global_mode()
+        mode = context.get("delegated_permission_mode")
+        if not mode:
+            prefs = session_prefs.get_prefs(context.get("session_id"), context.get("agent_id"))
+            mode = prefs.get("permission")
+        return normalize_mode(mode, fallback) if mode else fallback

@@ -18,7 +18,9 @@ Provider resolution:
 
 import base64
 import os
+import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -26,16 +28,19 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from agent.tools.base_tool import BaseTool, ToolResult
-from agent.tools.utils.url_safety import validate_url_safe
+from agent.tools.utils.credentials import DENIED_MESSAGE, is_credential_path
+from agent.tools.utils.url_safety import validate_url_safe, safe_get
 from common import const
 from common.log import logger
+from common.media_download import MAX_IMAGE_BYTES, MediaTooLargeError, read_response
 from common.utils import expand_path
 from config import conf
 
 DEFAULT_MODEL = const.GPT_41_MINI
 DEFAULT_TIMEOUT = 180
 MAX_TOKENS = 4000
-COMPRESS_THRESHOLD = 1_048_576  # 1 MB
+COMPRESS_THRESHOLD = 3 * 1_048_576  # 3 MB; base64 stays under the common 5 MB per-image limit
+COMPRESS_MAX_DIM = "3072"  # small print on documents and drawings is unreadable much below this
 
 SUPPORTED_EXTENSIONS = {
     "jpg": "image/jpeg",
@@ -53,13 +58,14 @@ _MAIN_MODEL_PROVIDER_NAME = "MainModel"
 _DISCOVERABLE_MODELS = [
     ("moonshot_api_key", const.MOONSHOT, const.KIMI_K2_6, "Moonshot"),
     ("ark_api_key", const.DOUBAO, const.DOUBAO_SEED_2_PRO, "Doubao"),
-    ("dashscope_api_key", const.QWEN_DASHSCOPE, const.QWEN37_PLUS, "DashScope"),
+    ("dashscope_api_key", const.QWEN_DASHSCOPE, const.QWEN38_FLASH, "DashScope"),
     ("claude_api_key", const.CLAUDEAPI, const.CLAUDE_SONNET_5, "Claude"),
-    ("gemini_api_key", const.GEMINI, const.GEMINI_37_FLASH, "Gemini"),
+    ("gemini_api_key", const.GEMINI, const.GEMINI_38_FLASH, "Gemini"),
     ("qianfan_api_key", const.QIANFAN, const.ERNIE_45_TURBO_VL, "Qianfan"),
     ("zhipu_ai_api_key", const.ZHIPU_AI, const.GLM_4_7, "ZhipuAI"),
-    ("minimax_api_key", const.MiniMax, const.MINIMAX_M2_7, "MiniMax"),
-    ("mimo_api_key", const.MIMO, const.MIMO_V2_5_PRO, "MiMo"),
+    ("minimax_api_key", const.MiniMax, const.MINIMAX_M3, "MiniMax"),
+    ("mimo_api_key", const.MIMO, const.MIMO_V2_6_PRO, "MiMo"),
+    ("deepseek_api_key", const.DEEPSEEK, const.DEEPSEEK_FLASH, "DeepSeek"),
 ]
 
 # Model name prefix → discoverable provider display_name.
@@ -77,7 +83,11 @@ _MODEL_PREFIX_TO_PROVIDER = [
     ("minimax-", "MiniMax"),
     ("abab", "MiniMax"),
     ("mimo-", "MiMo"),
+    ("deepseek-", "DeepSeek"),
 ]
+
+# Vision model of the CowAgent API when the user has not pinned one.
+_COWAGENT_VISION_MODEL = "deepseek-v4.1-flash"
 
 # Model prefixes that natively belong to OpenAI / LinkAI (raw HTTP providers).
 _OPENAI_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
@@ -88,6 +98,7 @@ _OPENAI_MODEL_PREFIXES = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
 _PROVIDER_ID_TO_DISPLAY = {
     "openai": "OpenAI",
     "linkai": "LinkAI",
+    "cowagent": "CowAgent",
     "moonshot": "Moonshot",
     "doubao": "Doubao",
     "dashscope": "DashScope",
@@ -97,6 +108,7 @@ _PROVIDER_ID_TO_DISPLAY = {
     "zhipu": "ZhipuAI",
     "minimax": "MiniMax",
     "mimo": "MiMo",
+    "deepseek": "DeepSeek",
 }
 
 
@@ -110,6 +122,7 @@ class VisionProvider:
     model_override: Optional[str] = None
     use_bot: bool = False  # When True, call via bot.call_vision instead of raw HTTP
     fallback_bot: Any = None  # Bot instance for non-main-model providers
+    use_responses: bool = False  # When True, call /responses instead of /chat/completions
 
 
 class VisionAPIError(Exception):
@@ -124,6 +137,7 @@ class Vision(BaseTool):
     description: str = (
         "Analyze a local image or image URL (jpg/jpeg/png) using Vision API. "
         "Can describe content, extract text, identify objects, colors, etc. "
+        "Ask for everything needed in one call."
     )
 
     params: dict = {
@@ -158,13 +172,22 @@ class Vision(BaseTool):
         return True
 
     def execute(self, args: Dict[str, Any]) -> ToolResult:
-        image = args.get("image", "").strip()
-        question = args.get("question", "").strip()
+        # Explicit nulls keep the key present, so the dict defaults never
+        # apply; `or` also covers them.
+        image = (args.get("image") or "").strip()
+        question = (args.get("question") or "").strip()
 
         if not image:
             return ToolResult.fail("Error: 'image' parameter is required")
         if not question:
             return ToolResult.fail("Error: 'question' parameter is required")
+
+        # The file is sent to an external API, so it gets the same credential
+        # guard as the file tools; the resolved path also catches symlinks.
+        if not image.startswith(("http://", "https://")):
+            resolved = self._resolve_path(image)
+            if is_credential_path(resolved):
+                return ToolResult.fail(DENIED_MESSAGE)
 
         providers = self._resolve_providers()
         if not providers:
@@ -172,7 +195,7 @@ class Vision(BaseTool):
                 "Error: No model available for Vision.\n"
                 "The main model does not support vision and no other API keys are configured.\n"
                 "Options:\n"
-                "  1. Switch to a multimodal model (e.g. claude-sonnet-5, qwen3.7-plus, gemini-2.0-flash, ernie-4.5-turbo-vl)\n"
+                "  1. Switch to a multimodal model (e.g. claude-sonnet-5, qwen3.8-flash, gemini-2.0-flash, ernie-4.5-turbo-vl)\n"
                 "  2. Configure OPENAI_API_KEY: env_config(action=\"set\", key=\"OPENAI_API_KEY\", value=\"your-key\")\n"
                 "  3. Configure LINKAI_API_KEY: env_config(action=\"set\", key=\"LINKAI_API_KEY\", value=\"your-key\")"
             )
@@ -232,8 +255,8 @@ class Vision(BaseTool):
              and its API key is configured) — using the user-specified model
              name verbatim.
           2. Auto-discovery chain as fallback:
-               - use_linkai=true → [LinkAI, MainModel?, OtherModels…, OpenAI]
-               - default         → [MainModel?, OtherModels…, OpenAI, LinkAI]
+               - use_linkai=true → [LinkAI, MainModel?, OtherModels…, OpenAI, CowAgent]
+               - default         → [MainModel?, OtherModels…, OpenAI, CowAgent, LinkAI]
              MainModel is only included when the main bot is known to support
              vision (see _main_bot_supports_vision).
 
@@ -265,10 +288,12 @@ class Vision(BaseTool):
             self._append_provider(fallback, self._build_main_model_provider)
             self._append_other_model_providers(fallback, preferred_model=user_model)
             self._append_provider(fallback, lambda: self._build_openai_provider(user_model))
+            self._append_provider(fallback, self._build_cowagent_provider)
         else:
             self._append_provider(fallback, self._build_main_model_provider)
             self._append_other_model_providers(fallback, preferred_model=user_model)
             self._append_provider(fallback, lambda: self._build_openai_provider(user_model))
+            self._append_provider(fallback, self._build_cowagent_provider)
             self._append_provider(fallback, lambda: self._build_linkai_provider(user_model))
 
         for p in fallback:
@@ -284,6 +309,39 @@ class Vision(BaseTool):
         p = builder()
         if p:
             providers.append(p)
+
+    def _current_main_model(self) -> str:
+        """The model name the *current agent* actually runs on.
+
+        Sessions can pin their own model (e.g. claude-sonnet-5) via a session
+        override, so the global ``conf().get("model")`` (e.g. deepseek-v4-flash)
+        is the wrong source — forwarding it to the session's real bot causes a
+        vendor-foreign 404 (a Claude bot asked for deepseek-v4-flash). Prefer
+        the bridge's resolved model, fall back to global config.
+        """
+        model = getattr(self.model, "model", None)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+        return conf().get("model") or ""
+
+    def runs_on_main_model(self) -> bool:
+        """Whether image analysis resolves to the agent's own main model:
+        vision is on auto (or set to the main model's name) and the main model
+        supports vision. The agent then hands images to it directly."""
+        main_model = self._current_main_model()
+        if not main_model or not (self.model and hasattr(self.model, "bot")):
+            return False
+        try:
+            bot = self.model.bot
+        except Exception:
+            return False
+        if not self._main_bot_supports_vision(bot):
+            return False
+        user_model = self._resolve_user_vision_model()
+        if user_model:
+            return user_model.lower() == main_model.lower()
+        # On auto with use_linkai set, that provider's default vision model goes first.
+        return not (conf().get("use_linkai", False) and conf().get("linkai_api_key"))
 
     @staticmethod
     def _resolve_user_vision_model() -> Optional[str]:
@@ -357,6 +415,9 @@ class Vision(BaseTool):
             return [p] if p else None
         if provider_id == "linkai":
             p = self._build_linkai_provider(user_model)
+            return [p] if p else None
+        if provider_id == "cowagent":
+            p = self._build_cowagent_provider(user_model)
             return [p] if p else None
 
         # Discoverable bot-backed providers.
@@ -466,7 +527,7 @@ class Vision(BaseTool):
         main_bot_type = None
         main_bot_supports_vision = False
         if self.model and hasattr(self.model, '_resolve_bot_type'):
-            main_bot_type = self.model._resolve_bot_type(conf().get("model", ""))
+            main_bot_type = self.model._resolve_bot_type(self._current_main_model())
             main_bot = getattr(self.model, "bot", None)
             main_bot_supports_vision = self._main_bot_supports_vision(main_bot)
 
@@ -525,23 +586,46 @@ class Vision(BaseTool):
         vendor-foreign model name is forwarded.
 
         Resolution order:
-          1. If the bot explicitly declares `supports_vision`, trust it.
-             This lets bots opt in or out based on their own runtime
-             configuration (e.g. the currently selected model).
-          2. Otherwise, fall back to a model-name prefix heuristic: trust
+          1. The user ticked vision for the main model in the model catalog
+             (the only way to declare it for a custom provider's models).
+          2. If the bot explicitly declares `model_supports_vision(model)` or
+             `supports_vision`, trust it. This lets bots opt in or out based on
+             the currently selected model.
+          3. Otherwise, fall back to a model-name prefix heuristic: trust
              call_vision when the main model looks like an OpenAI family
              model or matches a known multimodal vendor prefix.
         """
         if bot is None:
             return False
+        if self._catalog_declares_vision():
+            return True
+        # supports_vision reads global config, which misses a session's own
+        # model or an engaged fallback.
+        per_model = getattr(type(bot), "model_supports_vision", None)
+        if callable(per_model) and self._current_main_model():
+            return bool(per_model(self._current_main_model()))
         if hasattr(bot, "supports_vision"):
             return bool(getattr(bot, "supports_vision"))
-        main_model = (conf().get("model") or "").lower()
+        main_model = self._current_main_model().lower()
         if not main_model:
             return False
-        if main_model.startswith(_OPENAI_MODEL_PREFIXES):
-            return True
-        return self._infer_provider_from_model(main_model) is not None
+        # Gateways namespace upstream models ("cn:glm-5v", "openai/gpt-4o").
+        # The bot still sends the full name; only the match uses the tail.
+        for name in {main_model, re.split(r"[:/]", main_model)[-1]}:
+            if name.startswith(_OPENAI_MODEL_PREFIXES) or self._infer_provider_from_model(name):
+                return True
+        return False
+
+    def _catalog_declares_vision(self) -> bool:
+        """Positive only: catalog entries default to text, so a missing tag is no verdict."""
+        meta = getattr(self.model, "catalog_model_meta", None)
+        if not callable(meta):
+            return False
+        try:
+            caps = (meta() or {}).get("capabilities")
+        except Exception:
+            return False
+        return isinstance(caps, list) and "vision" in caps
 
     def _build_main_model_provider(self) -> Optional[VisionProvider]:
         """
@@ -560,11 +644,11 @@ class Vision(BaseTool):
         if not self._main_bot_supports_vision(bot):
             return None
 
-        # Use the configured main model name; do NOT inject tools.vision.model
-        # here, because by the time we reach this branch the tools.vision.model
-        # routing has already been attempted (and either matched the main bot
-        # or failed to find a provider).
-        main_model_name = conf().get("model") or None
+        # Use the *current agent's* main model name (session override aware);
+        # do NOT inject tools.vision.model here, because by the time we reach
+        # this branch the tools.vision.model routing has already been attempted
+        # (and either matched the main bot or failed to find a provider).
+        main_model_name = self._current_main_model() or None
 
         return VisionProvider(
             name=_MAIN_MODEL_PROVIDER_NAME,
@@ -585,11 +669,17 @@ class Vision(BaseTool):
         model_override = preferred_model if (
             preferred_model and preferred_model.lower().startswith(_OPENAI_MODEL_PREFIXES)
         ) else None
+        from models.openai import responses_adapter
+        use_responses = (
+            responses_adapter.resolve_api_type(conf().get("open_ai_api_type"))
+            == responses_adapter.API_TYPE_RESPONSES
+        )
         return VisionProvider(
             name="OpenAI",
             api_key=api_key,
             api_base=self._ensure_v1(api_base),
             model_override=model_override,
+            use_responses=use_responses,
         )
 
     def _build_linkai_provider(self, preferred_model: Optional[str] = None) -> Optional[VisionProvider]:
@@ -612,11 +702,29 @@ class Vision(BaseTool):
             model_override=preferred_model,
         )
 
+    def _build_cowagent_provider(self, preferred_model: Optional[str] = None) -> Optional[VisionProvider]:
+        """The CowAgent API over Chat Completions. ``preferred_model`` is only
+        passed when the user pinned this provider: as a fallback link it uses
+        its own vision model, since a name meant for another vendor may not be
+        served here."""
+        from models.cowagent_provider import resolve_cowagent_credentials
+        api_key, api_base = resolve_cowagent_credentials()
+        if not api_key:
+            return None
+        return VisionProvider(
+            name="CowAgent",
+            api_key=api_key,
+            api_base=self._ensure_v1(api_base),
+            model_override=preferred_model or _COWAGENT_VISION_MODEL,
+        )
+
     def _build_custom_provider(self, provider_id: str, preferred_model: Optional[str] = None) -> Optional[VisionProvider]:
         """Build a VisionProvider from a custom:<id> entry in custom_providers.
         Uses the standard OpenAI /chat/completions endpoint — any
         OpenAI-compatible multimodal endpoint works."""
-        from models.custom_provider import parse_custom_bot_type, get_custom_providers, _find_provider_by_id
+        from models.custom_provider import (
+            parse_custom_bot_type, get_custom_providers, get_provider_headers, _find_provider_by_id,
+        )
         _, custom_id = parse_custom_bot_type(provider_id)
         if not custom_id:
             return None
@@ -637,6 +745,7 @@ class Vision(BaseTool):
             name=entry.get("name") or provider_id,
             api_key=api_key,
             api_base=self._ensure_v1(api_base.rstrip("/")),
+            extra_headers=get_provider_headers(entry),
             model_override=model,
         )
 
@@ -742,6 +851,8 @@ class Vision(BaseTool):
             )
 
         file_path = self._maybe_compress(image)
+        if file_path != image:
+            mime_type = "image/jpeg"
         try:
             with open(file_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("ascii")
@@ -754,20 +865,35 @@ class Vision(BaseTool):
 
     @staticmethod
     def _download_to_data_url(url: str) -> dict:
-        """Download a remote image and return it as a base64 data URL."""
-        resp = requests.get(url, timeout=30)
-        if resp.status_code != 200:
-            raise VisionAPIError(f"Failed to download image: HTTP {resp.status_code}")
-        content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-        if not content_type.startswith("image/"):
-            content_type = "image/jpeg"
-        b64 = base64.b64encode(resp.content).decode("ascii")
+        """Download a remote image and return it as a base64 data URL.
+
+        Fetches through the shared redirect-aware SSRF helper. The guard in
+        ``_validate_url_safe`` only checks the URL the model supplied, so a
+        public URL that 3xx-redirects into a loopback / link-local /
+        cloud-metadata address would otherwise be pulled in unchecked.
+        """
+        resp = safe_get(url, timeout=30, stream=True)
+        try:
+            if resp.status_code != 200:
+                raise VisionAPIError(f"Failed to download image: HTTP {resp.status_code}")
+            content_type = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+            if not content_type.startswith("image/"):
+                content_type = "image/jpeg"
+            try:
+                image = read_response(resp, MAX_IMAGE_BYTES)
+            except MediaTooLargeError as error:
+                raise VisionAPIError(
+                    f"Image too large: over {MAX_IMAGE_BYTES} bytes, url={url}"
+                ) from error
+            b64 = base64.b64encode(image).decode("ascii")
+        finally:
+            resp.close()
         data_url = f"data:{content_type};base64,{b64}"
         return {"type": "image_url", "image_url": {"url": data_url}}
 
     @staticmethod
     def _maybe_compress(path: str) -> str:
-        """Compress image to under COMPRESS_THRESHOLD with max long-edge 1536px."""
+        """Compress image to under COMPRESS_THRESHOLD with max long-edge 3072px (2048px as fallback)."""
         file_size = os.path.getsize(path)
         if file_size <= COMPRESS_THRESHOLD:
             return path
@@ -777,16 +903,34 @@ class Vision(BaseTool):
 
         def _try_sips(max_dim: str, quality: str) -> bool:
             try:
+                info = subprocess.run(
+                    ["sips", "-g", "pixelHeight", "-g", "pixelWidth", path],
+                    capture_output=True, text=True, check=True,
+                )
+                dimensions = {}
+                for line in info.stdout.splitlines():
+                    name, _, value = line.strip().partition(": ")
+                    if name in ("pixelHeight", "pixelWidth"):
+                        dimensions[name] = int(value)
+                if len(dimensions) != 2 or min(dimensions.values()) <= 0:
+                    return False
+                # Unlike convert's ">" geometry, sips -Z also enlarges images.
+                # Omit resampling when the source already fits the maximum.
+                resize = ["-Z", max_dim] if max(dimensions.values()) > int(max_dim) else []
                 subprocess.run(
-                    ["sips", "-Z", max_dim, "-s", "formatOptions", quality,
+                    ["sips", *resize, "-s", "format", "jpeg", "-s", "formatOptions", quality,
                      path, "--out", tmp.name],
                     capture_output=True, check=True,
                 )
                 return True
-            except (FileNotFoundError, subprocess.CalledProcessError):
+            except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
                 return False
 
         def _try_convert(max_dim: str, quality: str) -> bool:
+            # On Windows a bare "convert" is System32's FAT-to-NTFS volume
+            # converter, which is found before anything on PATH.
+            if sys.platform == "win32":
+                return False
             try:
                 subprocess.run(
                     ["convert", path, "-resize", f"{max_dim}x{max_dim}>",
@@ -797,14 +941,37 @@ class Vision(BaseTool):
             except (FileNotFoundError, subprocess.CalledProcessError):
                 return False
 
+        def _try_pillow(max_dim: str, quality: str) -> bool:
+            # Windows and the Docker image have neither tool; Pillow is a core dependency.
+            try:
+                from PIL import Image, ImageOps
+                with Image.open(path) as img:
+                    # The JPEG is saved without EXIF, so bake the orientation in.
+                    img = ImageOps.exif_transpose(img)
+                    if img.mode in ("I", "I;16"):
+                        # 16-bit grayscale: scale it to 8 bits, or the conversion below clips it to white.
+                        img = img.point(lambda v: v / 256)
+                    if img.mode != "RGB" or "transparency" in img.info:
+                        # Flatten to RGB for JPEG, with transparent areas on white rather than black.
+                        rgba = img.convert("RGBA")
+                        img = Image.new("RGB", rgba.size, "white")
+                        img.paste(rgba, mask=rgba)
+                    img.thumbnail((int(max_dim), int(max_dim)))  # only shrinks, like convert's ">"
+                    img.save(tmp.name, "JPEG", quality=int(quality))
+                return True
+            except Exception as e:
+                logger.debug(f"[Vision] Pillow compression failed: {e}")
+                return False
+
         attempts = [
-            ("1536", "85"),
-            ("1536", "70"),
-            ("1536", "50"),
+            (COMPRESS_MAX_DIM, "85"),
+            (COMPRESS_MAX_DIM, "70"),
+            ("2048", "70"),
+            ("2048", "50"),
         ]
 
         for max_dim, quality in attempts:
-            ok = _try_sips(max_dim, quality) or _try_convert(max_dim, quality)
+            ok = _try_sips(max_dim, quality) or _try_convert(max_dim, quality) or _try_pillow(max_dim, quality)
             if not ok:
                 continue
             new_size = os.path.getsize(tmp.name)
@@ -840,14 +1007,28 @@ class Vision(BaseTool):
             ],
         }
 
+        endpoint = "/chat/completions"
+        if provider.use_responses:
+            from models.openai import responses_adapter
+            from models.openai_compatible_bot import OpenAICompatibleBot
+            payload = responses_adapter.build_responses_payload(
+                model=model,
+                messages=payload["messages"],
+                reasoning_effort=OpenAICompatibleBot._responses_reasoning_effort(model, {}),
+            )
+            endpoint = "/responses"
+
+        from models.openai.openai_http_client import resolve_host_headers
+        url = f"{provider.api_base}{endpoint}"
         headers = {
             "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
+            **resolve_host_headers(url),
             **provider.extra_headers,
         }
 
         resp = requests.post(
-            f"{provider.api_base}/chat/completions",
+            url,
             headers=headers,
             json=payload,
             timeout=DEFAULT_TIMEOUT,
@@ -858,14 +1039,20 @@ class Vision(BaseTool):
 
         data = resp.json()
 
-        if "error" in data:
+        if data.get("error"):
             msg = data["error"].get("message", "Unknown API error")
             raise VisionAPIError(f"API error - {msg}")
+
+        if provider.use_responses:
+            data = responses_adapter.responses_to_chat_completion(data)
 
         content = ""
         choices = data.get("choices", [])
         if choices:
             content = choices[0].get("message", {}).get("content", "")
+
+        if not content or (isinstance(content, str) and not content.strip()):
+            raise VisionAPIError("Vision API returned no text content")
 
         usage = data.get("usage", {})
         result = {

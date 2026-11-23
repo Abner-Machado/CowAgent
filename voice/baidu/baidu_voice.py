@@ -6,14 +6,22 @@ import os
 import time
 import threading
 import requests
+import uuid
 
 from aip import AipSpeech
 
 from bridge.reply import Reply, ReplyType
 from common.log import logger
+from common.media_download import MAX_FILE_BYTES, download_to_file
 from common.tmp_dir import TmpDir
 from config import conf
 from voice.voice import Voice
+
+# Bound every outbound call. An unbounded request waits forever when the
+# service stalls: nothing is raised, nothing is logged, the turn never
+# finishes and the user never gets a reply. Same (connect, read) shape as the
+# other providers (mimo/openai/zhipuai define REQUEST_TIMEOUT the same way).
+REQUEST_TIMEOUT = (5, 60)
 
 try:
     from voice.audio_convert import get_pcm_from_wav
@@ -68,7 +76,7 @@ class BaiduVoice(Voice):
                 "client_id":     self.api_key,
                 "client_secret": self.secret_key,
             }
-            resp = requests.post(url, params=params).json()
+            resp = requests.post(url, params=params, timeout=REQUEST_TIMEOUT).json()
             token = resp.get("access_token")
             expires_in = resp.get("expires_in", 2592000)
             if token:
@@ -110,7 +118,9 @@ class BaiduVoice(Voice):
             "enable_subtitle": 0,
         }
         headers = {"Content-Type": "application/json"}
-        create_resp = requests.post(create_url, headers=headers, json=payload).json()
+        create_resp = requests.post(
+            create_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+        ).json()
         task_id = create_resp.get("task_id")
         if not task_id:
             logger.error("[Baidu] 长文本合成创建任务失败: %s", create_resp)
@@ -121,7 +131,10 @@ class BaiduVoice(Voice):
         query_url = f"https://aip.baidubce.com/rpc/2.0/tts/v1/query?access_token={token}"
         for _ in range(100):
             time.sleep(3)
-            resp = requests.post(query_url, headers=headers, json={"task_ids":[task_id]})
+            resp = requests.post(
+                query_url, headers=headers, json={"task_ids":[task_id]},
+                timeout=REQUEST_TIMEOUT,
+            )
             result = resp.json()
             infos = result.get("tasks_info") or result.get("tasks") or []
             if not infos:
@@ -140,11 +153,17 @@ class BaiduVoice(Voice):
         else:
             return Reply(ReplyType.ERROR, "长文本合成超时，请稍后重试")
 
-        # 下载并保存音频
-        audio_data = requests.get(audio_url).content
-        fn = TmpDir().path() + f"reply-long-{int(time.time())}-{hash(text)&0x7FFFFFFF}.mp3"
-        with open(fn, "wb") as f:
-            f.write(audio_data)
+        # 下载并保存音频。`audio_address` comes back from the task API, so the
+        # body is streamed and counted: an endless or multi-gigabyte response
+        # used to be buffered whole by `.content` and written out before
+        # anything could object. `download_to_file` also writes through a temp
+        # file, so an oversized or truncated download leaves nothing behind.
+        fn = TmpDir().path() + f"reply-long-{uuid.uuid4().hex}.mp3"
+        try:
+            download_to_file(audio_url, fn, MAX_FILE_BYTES, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            logger.error("[Baidu] 长文本合成音频下载失败: %s", e)
+            return Reply(ReplyType.ERROR, "长文本语音合成下载失败")
         logger.info("[Baidu] 长文本合成 success: %s", fn)
         return Reply(ReplyType.VOICE, fn)
 
@@ -159,7 +178,7 @@ class BaiduVoice(Voice):
                     {"spd":self.spd, "pit":self.pit, "vol":self.vol, "per":self.per}
                 )
                 if not isinstance(result, dict):
-                    fn = TmpDir().path() + f"reply-{int(time.time())}-{hash(text)&0x7FFFFFFF}.mp3"
+                    fn = TmpDir().path() + f"reply-{uuid.uuid4().hex}.mp3"
                     with open(fn, "wb") as f:
                         f.write(result)
                     logger.info("[Baidu] 短文本合成 success: %s", fn)

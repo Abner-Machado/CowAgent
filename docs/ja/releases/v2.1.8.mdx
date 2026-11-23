@@ -1,0 +1,121 @@
+---
+title: v2.1.8
+description: "CowAgent 2.1.8：マルチ Agent チーム、定期タスクの手動作成、コンテキスト使用量の可視化、モデルと検索プロバイダーの追加、ワークスペースファイルの編集"
+---
+
+🌐 [English](https://docs.cowagent.ai/releases/v2.1.8) | [中文](https://docs.cowagent.ai/zh/releases/v2.1.8)
+
+## 🤝 マルチ Agent チーム
+
+CowAgent は**マルチ Agent フレームワーク**へと進化しました。それぞれ役割の異なる複数の Agent を作成してチームを組み、同一セッション内で協調して複雑なタスクを処理できます。Web コンソール、デスクトップクライアント、チャネル連携のいずれにも対応します：
+
+- **チーム管理**：Agent の作成と管理に対応し、名前・役割・デフォルトモデル・Skill・ナレッジを設定できます。既存の Agent から設定を複製することもできます。
+- **リソースの分離**：各 Agent は独立したワークスペース・メモリ・セッションを持ちます。ナレッジベースと Skill は共有か独立かを選べます。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/team-overview.png" alt="Agent team" width="800" />
+</Frame>
+
+- **グループでの協調**：1 つのセッションに複数の Agent を追加し、`@` で特定のメンバーを指名して応答させられます。各 Agent はそれぞれ設定されたモデルを使用します。
+- **タスクの委譲**：グループチャットにはリード Agent がいて、メンバーの役割に応じて、より適したメンバーにタスクを委ねられます。多段の委譲に対応し、範囲・深さ・タイムアウトを設定できます。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/agent-group-chat-demo.png" alt="Agent-team-group" width="800"/>
+</Frame>
+
+- **チャネルの複数インスタンス**：同じ種類の IM チャネルを複数インスタンス起動できるようになり、それぞれに単一 Agent または Agent チームを紐づけられます。WeChat、WeCom スマートボット、Feishu、DingTalk、QQ、Telegram、Slack、Discord などに対応します。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/channel-config.png" alt="Agent-team-channel" width="800"/>
+</Frame>
+
+Thanks @AaronZ345 (#2975, #2973)、@zkjqd (#3096)、@cowagent (#3118)
+
+ドキュメント：[Agent チーム](https://docs.cowagent.ai/ja/multi-agent/team)
+
+## ⏰ 定期タスクの強化
+
+定期タスクをコンソールから手動で作成・管理できるようになり、チャネルの宛先と実行履歴を追加しました：
+
+- **定期タスクの手動作成**：タスクページから直接タスクを新規作成・編集・実行でき、チャネルインスタンスと宛先を選択できます。
+- **チャネル宛先の管理**：チャネルインスタンスごとに信頼できる宛先を管理でき、作成時のチャネルに限らず、指定した宛先にタスクを配信できます。Thanks @dajiaohuang (#3043)
+- **実行履歴の可視化**：定期タスクの実行履歴ページを追加し、履歴一覧と各実行の結果詳細を確認できます。Thanks @mengluo04 (#3107)
+- **同時更新の修正**：タスクの同時更新で内容が失われる問題を修正しました（Thanks @Whxuan0701 #3062）。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/scheduler-create.png" width="800"/>
+</Frame>
+
+
+## 📊 コンテキスト使用量の可視化
+
+対話コンテキストの消費状況を可視化・制御できるようになり、トークンコストの管理が容易になりました：
+
+- **使用量ビュー**：従来の「コンテキストをクリア」ボタンをリングビューに置き換え、コンテキストの構成内訳を確認できます。
+- **コンテキスト操作**：リングビューの下から、スマート圧縮・コンテキストのクリア・最大コンテキストの設定などを行えます。
+- **使用量の算出**：構成比率はモデルが返す使用量から自動的に算出され、`agent_max_context_tokens` をユーザー設定のコスト上限として利用できます。
+
+Thanks @chimyves (#3087)、@sufan721 (#3079)
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/context-pie.png" width="700"/>
+</Frame>
+
+
+## 🤖 モデル機能
+
+- **新モデル追加**：`deepseek-flash`（DeepSeek V4.1 Flash）、フラッグシップモデル `gpt-6-astra`、`claude-fable-5-1`、`qwen3.8-flash`、`glm-5.3-flash`、`gemini-3.8-flash`、および視覚モデル `deepseek-v4-flash-vision-exp` に対応しました（Thanks @a1094174619 #3094）。
+- **モデルのフォールバック**：「モデル設定 - メインモデル」でフォールバックモデルを設定でき、メインモデルが失敗した際に自動で切り替わるため、単一プロバイダーの障害による中断を防げます。Thanks @alanyz106 (#3099)
+- **検索プロバイダーを 6 種追加**：
+  - **AnySearch**（匿名モードに対応）。Thanks @WangPan59 (#3083)
+  - **Serply**（Google/Bing SERP API）。Thanks @googio (#3071)
+  - **Parallel Search**。Thanks @georgeatparallel (#3116)
+  - **Tavily**（LLM 向けに最適化された検索 API）。Thanks @1printf (#3124)
+  - **SearXNG**（セルフホスト型の検索エンジン。インスタンス URL の設定のみで利用可能）。Thanks @1printf (#3124)
+  - **Keenable**（匿名モードに対応、API キー不要）。Thanks @ilya-bogin-keenable (#3122)
+
+## 📝 ワークスペースファイルの編集
+
+ワークスペースのファイル・長期メモリ文書・Skill 定義を、Web コンソールとデスクトップクライアントで直接編集して保存できるようになりました：
+
+- **オンライン編集**：ワークスペース・メモリ・Skill モジュール内のテキストファイル（Markdown、コード、CSV、HTML、プレーンテキストなど）を直接編集できます。`Ctrl+S` で保存、`Esc` で終了、`Tab` でインデントなどのショートカットに対応します。
+- **安全な保存**：保存時にファイルを開いた時点の更新時刻と照合して競合を検出します。その間に Agent がファイルを変更していた場合は、上書きせず先に確認します。パネルを閉じる、ファイルを切り替える、セッションを切り替える、ワークスペースを切り替えるといった操作の前には、未保存の変更について確認を求めます。
+
+Thanks @zkjqd (#3076)
+
+## 🛠 改善と修正
+
+- **Skill の修正**：
+  - tar アーカイブの展開を堅牢化しました（Thanks @Whxuan0701 #3063）
+  - Skill のインストール時に `main` を既定にせず、リポジトリのデフォルトブランチを解決するようにしました（Thanks @aniruddhaadak80 #3080）
+- **MCP の強化**：
+  - ツール名のプレフィックスに対応しました（Thanks @georgeatparallel #3116）
+  - 期限切れの Streamable HTTP セッションを復旧します（Thanks @yiheng-kkk ad1f686）
+  - 複数の Agent が同じ `mcp.json` を共有する場合にサブプロセスを再利用し、重複した読み込みログを削減しました
+- **画像生成**：
+  - ModelScope の `IMAGE_CREATE` がパラメータ不一致でエラーになる問題を修正しました（Thanks @Anai-Guo #3097）
+  - 空の base64 データを誤検知し、空の画像ファイルを生成してしまう問題を修正しました（Thanks @c020627 #3133、@justinguo7777 #3131）
+- **サブ Agent の修正**：サブ Agent が親セッションのフォールバック設定をクリアしてしまう問題を修正しました（Thanks @alanyz106 #3111）。
+- **構造化チャンク分割**：Markdown のメモリとナレッジ文書を見出し構造に沿ってチャンク分割し、チャンクのバージョンが古くなった際に再構築を促します。Thanks @alanyz106 (#3115)
+- **ストリーミングエラーの修正**：7 つのモデル bot がストリーミングエラー時に、既にクリアされた例外変数をジェネレータがクロージャで参照して `NameError` を送出し、本来の上流エラーを覆い隠してしまう問題を修正しました（Thanks @Anai-Guo #3128）。
+- **メモリインデックスの修正**：空のテキストチャンクによって埋め込み API がエラーになり、メモリインデックスの構築全体が失敗してキーワード検索に戻ってしまう問題を修正しました（Thanks @6vision #3121）。
+- **中断の判別**：`stop_reason` を Agent ループに伝搬し、モデルが自発的に終了したのか出力上限で打ち切られたのかを区別できるようにしました（Thanks @6vision #3074）。
+- **添付の判定**：キーワード添付の URL を解決後のパスで判定するようにしました（Thanks @Whxuan0701 #3061）。
+- **ゲートウェイの帰属情報**：OrcaRouter ゲートウェイのリクエストに送信元の帰属情報を付加しました（Thanks @Marc-oss-hub #3058）。
+- **プロキシ配下の表示**：`/chat` に Content-Type を設定し、nosniff を伴うリバースプロキシ配下でもコンソールが正しく表示されるようにしました（Thanks @alanyz106 #3110）。
+- **アバター処理**：アップロードしたアバターがテキストとしてデコードされて失敗する問題を修正し、生バイトとして読み込むようにしました（Thanks @mengluo04）。
+- **評価ツール**：最小構成の Agent トラジェクトリ評価フローを追加しました。Thanks @yanzhiliaoliao (#3100)
+- **DingTalk チャネル**：ストリーミング接続でプロキシを無効化し、再接続にバックオフを適用して、繰り返し発生するエラーを解消しました。
+- **Windows クライアント**：更新のインストールでショートカットが壊れる問題を修正しました。
+- **デスクトップクライアント**：Agent 設定の最大コンテキストトークンなどの数値フィールドが空にできない問題を修正しました（Thanks @zkjqd #3130）。
+- **バックアップと復元**：バックアップにすべての Agent ワークスペースを含めるようにし、マルチ Agent 構成での入れ子アーカイブ・復元レイアウト・バージョン互換性を修正しました。
+- **ドキュメント**：
+  - 日本語ドキュメントの言語スイッチャーに繁体字中国語の入口を追加しました（Thanks @c020627 #3072）
+  - Kimi 関連のリンクを補足しました（Thanks @oriengy #2885）
+
+## 📦 アップグレード方法
+
+- **ソースデプロイ**：`cow update` でワンクリック更新するか、最新コードを取得して再起動します。詳しくは[アップグレードガイド](https://docs.cowagent.ai/ja/guide/upgrade)を参照してください。
+- **デスクトップクライアント**：クライアント内で更新を確認してワンクリックで更新するか、[ダウンロードページ](https://cowagent.ai/download/)から最新版を入手できます。
+
+**リリース日**：2026.09.10 | [Full Changelog](https://github.com/zhayujie/CowAgent/compare/2.1.7...2.1.8)

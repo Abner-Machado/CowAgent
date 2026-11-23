@@ -1,6 +1,6 @@
 ---
 title: General Commands
-description: View status, manage config, and control context with commonly used commands
+description: "Reference for everyday CowAgent commands such as help, status, cancel, steer, config and context, usable with / in chat or cow in a terminal to check status, stop tasks and manage settings."
 ---
 
 The following commands can be used in chat with the `/` prefix or in the terminal with the `cow` prefix (some are chat-only).
@@ -19,7 +19,7 @@ Show help information for all available commands.
 
 ## status
 
-View current session and service status, including process info, model configuration, message count, and loaded skills.
+View current session and service status, including process info, model configuration, message count, loaded skills, and loaded MCP servers (ready/configured).
 
 ```text
 /status
@@ -62,17 +62,17 @@ View or modify runtime configuration. Changes take effect immediately without re
 **Modify a config item:**
 
 ```text
-/config model deepseek-v4-flash
+/config model deepseek-flash
 ```
 
 **Configurable items:**
 
 | Item | Description | Example |
 | --- | --- | --- |
-| `model` | AI model name | `deepseek-v4-flash` |
-| `agent_max_context_tokens` | Max context tokens | `40000` |
+| `model` | AI model name | `deepseek-flash` |
+| `agent_max_context_tokens` | Max context tokens | `200000` |
 | `agent_max_context_turns` | Max context memory turns | `30` |
-| `agent_max_steps` | Max decision steps per task | `15` |
+| `agent_max_steps` | Max decision steps per task | `100` |
 | `enable_thinking` | Enable deep thinking mode | `true` / `false` |
 
 <Note>

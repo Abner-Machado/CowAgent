@@ -17,17 +17,17 @@
   [<a href="../../README.md">English</a>] | [<a href="../zh/README.md">中文</a>] | [<a href="../zh/README-Hant.md">繁體中文</a>] | [日本語]
 </p>
 
-**CowAgent** は、自律的にタスクを計画し、コンピュータや外部リソースを操作し、Skill を作成・実行し、パーソナルナレッジベースと長期記憶を構築し、自己進化によってユーザーとともに成長するオープンソースのスーパー AI アシスタントです。エンドツーエンドの Agent Harness のリファレンス実装の一つでもあります。
+**CowAgent** は、自律的にタスクを計画し、コンピュータや外部リソースを操作し、Skill を作成・実行し、パーソナルナレッジベースと長期記憶を構築し、マルチエージェントチームを編成し、自己進化によってユーザーとともに成長するオープンソースのスーパー AI アシスタントです。エンドツーエンドの Agent Harness のリファレンス実装の一つでもあります。
 
 CowAgent は軽量でデプロイしやすく、拡張性に優れています。主要な LLM プロバイダーをそのまま組み込み、Web や主要な IM プラットフォーム上で動作。個人 PC やサーバー上で 24 時間 365 日稼働できます。
 
 <p align="center">
-  <a href="https://cowagent.ai/">🌐 ウェブサイト</a> &nbsp;·&nbsp;
+  <a href="https://cowagent.ai/?utm_source=github">🌐 ウェブサイト</a> &nbsp;·&nbsp;
   <a href="https://docs.cowagent.ai/ja/intro/index">📖 ドキュメント</a> &nbsp;·&nbsp;
   <a href="https://docs.cowagent.ai/ja/guide/quick-start">🚀 クイックスタート</a> &nbsp;·&nbsp;
   <a href="https://skills.cowagent.ai/">🧩 Skill Hub</a> &nbsp;·&nbsp;
   <a href="https://cowagent.ai/download/">💻 ダウンロード</a> &nbsp;·&nbsp;
-  <a href="https://link-ai.tech/cowagent/create">☁️ オンラインで試す</a>
+  <a href="https://link-ai.tech/cowagent/create?utm_source=cowagent&utm_medium=readme&utm_campaign=nav">☁️ オンラインで試す</a>
 </p>
 
 <br/>
@@ -37,7 +37,7 @@ CowAgent は軽量でデプロイしやすく、拡張性に優れています�
 <p align="center">
   <video src="https://github.com/user-attachments/assets/8625a19f-615c-4343-8be8-3707ce4d4d4e" controls muted playsinline width="720">
     このブラウザでは動画を再生できません。
-    <a href="https://cowagent.ai/">公式サイトでデモを見る →</a>
+    <a href="https://cowagent.ai/?utm_source=github">公式サイトでデモを見る →</a>
   </video>
 </p>
 
@@ -48,6 +48,7 @@ CowAgent は軽量でデプロイしやすく、拡張性に優れています�
 | 機能 | 説明 |
 | :--- | :--- |
 | [タスク計画](https://docs.cowagent.ai/ja/intro/architecture) | 複雑なタスクを分解し、目標達成までツールを繰り返し呼び出して段階的に実行 |
+| [マルチエージェントチーム](https://docs.cowagent.ai/ja/multi-agent/team) | 複数の Agent でチームを編成。各メンバーが独自の役割・モデル・スキル・知識を持ち、同一の会話内で分担して協働 |
 | [長期記憶](https://docs.cowagent.ai/ja/memory/index) | 三層構造（コンテキスト → デイリー → コア）、Deep Dream による自動蒸留、キーワードとベクトルのハイブリッド検索 |
 | [ナレッジベース](https://docs.cowagent.ai/ja/knowledge/index) | 構造化された知識を Markdown Wiki として自動整理し、進化し続けるナレッジグラフを可視化ブラウジング |
 | [自己進化](https://docs.cowagent.ai/ja/memory/self-evolution) | 会話を自動でレビューして Skill を改善し、未完了のタスクを引き継ぎ、記憶と知識を補完。日々の利用を通じて成長 |
@@ -62,7 +63,7 @@ CowAgent は軽量でデプロイしやすく、拡張性に優れています�
 
 ## 🏗️ アーキテクチャ
 
-<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.png" alt="CowAgent Architecture" width="750"/>
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.jpg" alt="CowAgent Architecture" width="750"/>
 
 CowAgent は完全な **Agent Harness** です：メッセージは各種**チャネル**から流入し、**Agent Core** が記憶・知識・利用可能なツール／Skill を組み合わせてタスクを計画・判断、**モデル**が応答を生成し、結果は元のチャネルに返されます。各レイヤーは疎結合で、独立して拡張可能です。
 
@@ -113,23 +114,33 @@ cow install-browser                # ブラウザツールのインストール
 
 <br/>
 
+## 👥 マルチエージェントチーム
+
+複数の Agent でチームを編成できます。各メンバーは独自の記憶・能力・知識・ワークスペースを持ち、それぞれの領域に集中することも、同一の会話で協働して複雑なタスクを解決することもできます。マルチエージェントチームは Web 端、デスクトップクライアント、IM チャネル接続で利用できます。
+
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/agent-team-overview.png" alt="CowAgent Multi-Agent Team" width="800"/>
+
+> 詳しくは [Agent チーム](https://docs.cowagent.ai/ja/multi-agent/team) を参照してください。
+
+<br/>
+
 ## 🤖 モデル
 
 CowAgent は主要な LLM プロバイダーすべてに対応しています。**チャット、画像認識、画像生成、ASR/TTS、埋め込み（Embedding）** の各機能はそれぞれ別のベンダーで設定可能です。
 
 | プロバイダー | 代表的なモデル | チャット | 画像認識 | 画像生成 | ASR | TTS | Embedding |
 | --- | --- | :-: | :-: | :-: | :-: | :-: | :-: |
-| [DeepSeek](https://docs.cowagent.ai/ja/models/deepseek) | deepseek-v4-flash / pro | ✅ | | | | | |
-| [Claude](https://docs.cowagent.ai/ja/models/claude) | claude-opus-5 / sonnet-5 | ✅ | ✅ | | | | |
-| [OpenAI](https://docs.cowagent.ai/ja/models/openai) | gpt-5.6 シリーズ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| [Gemini](https://docs.cowagent.ai/ja/models/gemini) | gemini-3.7-flash | ✅ | ✅ | ✅ | | | |
-| [MiniMax](https://docs.cowagent.ai/ja/models/minimax) | MiniMax-M3 | ✅ | ✅ | ✅ | | ✅ | |
-| [GLM](https://docs.cowagent.ai/ja/models/glm) | glm-5.3、glm-5v-turbo | ✅ | ✅ | | ✅ | | ✅ |
-| [Qwen](https://docs.cowagent.ai/ja/models/qwen) | qwen3.8-max | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| [Kimi](https://docs.cowagent.ai/ja/models/kimi) | kimi-k3 | ✅ | ✅ | | | | |
+| [DeepSeek](https://docs.cowagent.ai/ja/models/deepseek) | deepseek-flash (V4.1) / pro | ✅ | ✅ | | | | |
+| [Claude](https://docs.cowagent.ai/ja/models/claude) | claude-opus-5-5 / sonnet-5-5 | ✅ | ✅ | | | | |
+| [OpenAI](https://docs.cowagent.ai/ja/models/openai) | gpt-6.2-sol / gpt-6.2-astra | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Gemini](https://docs.cowagent.ai/ja/models/gemini) | gemini-4-argon | ✅ | ✅ | ✅ | | | |
+| [MiniMax](https://docs.cowagent.ai/ja/models/minimax) | MiniMax-M3.1-Flash / M3 | ✅ | ✅ | ✅ | | ✅ | |
+| [GLM](https://docs.cowagent.ai/ja/models/glm) | glm-5.3-flash、glm-5v-turbo | ✅ | ✅ | | ✅ | | ✅ |
+| [Qwen](https://docs.cowagent.ai/ja/models/qwen) | qwen3.8-flash | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| [Kimi](https://docs.cowagent.ai/ja/models/kimi) | kimi-k3.1-pro / kimi-k3 | ✅ | ✅ | | | | |
 | [Doubao](https://docs.cowagent.ai/ja/models/doubao) | doubao-seed-2.1 シリーズ | ✅ | ✅ | ✅ | | | ✅ |
 | [ERNIE](https://docs.cowagent.ai/ja/models/qianfan) | ernie-5.1 | ✅ | ✅ | | | | |
-| [MiMo](https://docs.cowagent.ai/ja/models/mimo) | mimo-v2.5-pro / v2.5 | ✅ | ✅ | | | ✅ | |
+| [MiMo](https://docs.cowagent.ai/ja/models/mimo) | mimo-v2.6-pro / v2.6-flash | ✅ | ✅ | | ✅ | ✅ | |
 | [LinkAI](https://docs.cowagent.ai/ja/models/linkai) | 1 つの Key で 100+ モデルに接続 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | [カスタム](https://docs.cowagent.ai/ja/models/custom) | ローカルモデル / サードパーティプロキシ | ✅ | | | | | |
 
@@ -215,6 +226,16 @@ CowAgent は主要な LLM プロバイダーすべてに対応しています。
 
 ## 🏷 更新履歴
 
+> **2026.10.30:** [v2.2.2](https://github.com/zhayujie/CowAgent/releases/tag/2.2.2) — ゲストページ（独立ページとウィンドウ埋め込み）の追加、カスタムテーマ対応、メインモデルのネイティブマルチモーダル入力、新モデルの追加、ツール・チャネル・セキュリティの改善。
+
+> **2026.10.14:** [v2.2.1](https://github.com/zhayujie/CowAgent/releases/tag/2.2.1) — 成果物センターとカスタムメニューの追加、Agent チャット API の公開、モデルキャッシュとコンテキストコストの最適化、ツール・チャネル・セキュリティの改善。
+
+> **2026.09.30:** [v2.2.0](https://github.com/zhayujie/CowAgent/releases/tag/2.2.0) — 機能センターの追加、マルチ Agent 協調の最適化、Web コンソールの再構築、モデルキャッシュヒット率の向上、安定性とセキュリティの全面強化。
+
+> **2026.09.14:** [v2.1.9](https://github.com/zhayujie/CowAgent/releases/tag/2.1.9) — マルチ Agent 協調体験の最適化、モデルリスト設定と複数フォールバックモデル、チャネル連携の修正、画像モデルの追加（gpt-image-2.5）、音声の修正。
+
+> **2026.09.10:** [v2.1.8](https://github.com/zhayujie/CowAgent/releases/tag/2.1.8) — マルチエージェントチーム、定時タスクの手動作成、コンテキスト使用量の可視化、新モデルと検索プロバイダーの追加、ワークスペースファイルの編集。
+
 > **2026.08.20:** [v2.1.7](https://github.com/zhayujie/CowAgent/releases/tag/2.1.7) — セッションごとに分離できる複数ワークスペース、セッション単位の権限モード、タスク通知、デスクトップの改善、新モデルの追加。
 
 > **2026.08.12:** [v2.1.6](https://github.com/zhayujie/CowAgent/releases/tag/2.1.6) — 独立タスクを並行実行するサブ Agent、推論強度の設定、差し替え可能なメモリのベクトルバックエンド、体験とセキュリティの改善。
@@ -243,7 +264,7 @@ CowAgent は主要な LLM プロバイダーすべてに対応しています。
 
 GitHub で [Issue を報告](https://github.com/zhayujie/CowAgent/issues) したり、下記 QR コードをスキャンして WeChat コミュニティに参加することもできます：
 
-<img width="130" src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/open-community.png" />
+<img width="130" src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/community/open-community.png" />
 
 <br/>
 
@@ -257,9 +278,9 @@ GitHub で [Issue を報告](https://github.com/zhayujie/CowAgent/issues) した
 
 ## 🏢 エンタープライズサービス
 
-[**LinkAI**](https://link-ai.tech/) は企業や開発者向けのワンストップ AI Agent プラットフォームで、CowAgent にマネージドホスティングとエンタープライズグレードのサポートを提供します：
+[**LinkAI**](https://link-ai.tech/?utm_source=cowagent&utm_medium=readme&utm_campaign=enterprise) は企業や開発者向けのワンストップ AI Agent プラットフォームで、CowAgent にマネージドホスティングとエンタープライズグレードのサポートを提供します：
 
-- **🚀 デプロイ不要のホスト型ランタイム** — [CowAgent オンラインアシスタント](https://link-ai.tech/cowagent/create) を 1 分以内に起動、サーバー不要
+- **🚀 デプロイ不要のホスト型ランタイム** — [CowAgent オンラインアシスタント](https://link-ai.tech/cowagent/create?utm_source=cowagent&utm_medium=readme&utm_campaign=enterprise) を 1 分以内に起動、サーバー不要
 - **🧠 Agent インフラ** — 主要 LLM・ナレッジベース・データベース・Skill・ワークフローへの統一アクセス。CowAgent の機能を拡張する、すぐに使えるビルディングブロック
 - **🏢 チーム & エンタープライズ機能** — ワークスペース、ロールベースのアクセス制御、監査ログ、本番運用向けプライベートデプロイ
 
@@ -269,7 +290,7 @@ GitHub で [Issue を報告](https://github.com/zhayujie/CowAgent/issues) した
 
 ## 🛠️ 開発とコントリビューション
 
-あらゆる形のコントリビューションを歓迎します —— 新機能、バグ修正、パフォーマンス改善、ドキュメント、あるいは [Skill Hub](https://skills.cowagent.ai/submit) への Skill の共有など。まずは [CONTRIBUTING.md](/CONTRIBUTING.md) をご覧いただき、Issue で相談するか、直接 PR を送ってください。
+あらゆる形のコントリビューションを歓迎します —— 新機能、バグ修正、パフォーマンス改善、ドキュメント、あるいは [Skill Hub](https://skills.cowagent.ai/submit) への Skill の共有など。まずは [CONTRIBUTING.md](../../CONTRIBUTING.md) をご覧いただき、Issue で相談するか、直接 PR を送ってください。
 
 ⭐ Star でプロジェクトを応援し、Watch → Custom → Releases で新バージョンの通知を受け取れます。PR や Issue の提出も歓迎します。
 
@@ -281,7 +302,7 @@ GitHub で [Issue を報告](https://github.com/zhayujie/CowAgent/issues) した
 
 ## ⚠️ 免責事項
 
-1. 本プロジェクトは [MIT License](/LICENSE) に基づき、技術研究と学習を目的としています。利用者は所在地の法令・規制を遵守する必要があり、本プロジェクトの利用に起因するいかなる結果についてもメンテナーは責任を負いません。
+1. 本プロジェクトは [MIT License](../../LICENSE) に基づき、技術研究と学習を目的としています。利用者は所在地の法令・規制を遵守する必要があり、本プロジェクトの利用に起因するいかなる結果についてもメンテナーは責任を負いません。
 2. **コストと安全性：** Agent モードは通常のチャットよりトークン消費が大幅に多いため、品質とコストのバランスを考慮してモデルを選択してください。Agent はローカル OS にアクセスできるため、信頼できる環境にのみデプロイしてください。
 3. CowAgent は純粋なオープンソースプロジェクトであり、暗号通貨の発行・参加・承認は一切行いません。
 

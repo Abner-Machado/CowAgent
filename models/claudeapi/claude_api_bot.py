@@ -1,8 +1,9 @@
 # encoding:utf-8
 
-import base64
 import json
 import re
+import socket
+import threading
 import time
 from typing import Optional
 
@@ -33,6 +34,7 @@ user_session = dict()
 # ``output_config.effort``) and reject ``enabled``; 4.5 and earlier only accept
 # ``enabled`` with an explicit ``budget_tokens`` and reject ``adaptive``.
 ADAPTIVE_THINKING_MODELS = (
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-mythos-5",
     "claude-mythos-preview",
@@ -42,6 +44,7 @@ ADAPTIVE_THINKING_MODELS = (
     "claude-opus-4-6",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
+    "claude-haiku-5",
 )
 
 # Models that only take the ``enabled`` + ``budget_tokens`` form. Checked after
@@ -56,6 +59,147 @@ BUDGET_THINKING_MODELS = (
 # Upper bound for the legacy budget so a large max_tokens does not license an
 # unbounded thinking pass.
 MAX_THINKING_BUDGET = 16000
+
+# Prompt caching uses explicit block-level breakpoints: the top-level
+# ``cache_control`` shorthand is not accepted by every Anthropic-compatible
+# endpoint. The API rejects a request carrying more than 4 breakpoints.
+CACHE_CONTROL = {"type": "ephemeral"}
+# A 1h entry must precede every 5m entry in the prompt.
+CACHE_TTL_1H = "1h"
+MAX_CACHE_BREAKPOINTS = 4
+UNCACHEABLE_BLOCK_TYPES = ("thinking", "redacted_thinking")
+
+# Without it the API buffers a tool argument until the whole value is complete,
+# so a large `write` streams nothing but a ping every 30s for minutes, and
+# networks that drop quiet connections throw the whole generation away.
+EAGER_INPUT_STREAMING = "eager_input_streaming"
+
+# With thinking summaries and eager tool input, a healthy stream is never quiet
+# for long. Some connections go silent mid-generation yet stay open for half an
+# hour, outliving the socket read timeout, so a stream with no event for this
+# long is cut and retried.
+STREAM_STALL_SECONDS = 90
+
+
+# While thinking the API may send nothing at all, so a long think looks exactly
+# like a dead connection, and some networks cut it at that point. Thinking less
+# is what makes the retry finish.
+_LOWER_EFFORT = {"max": "medium", "xhigh": "medium", "high": "medium", "medium": "low"}
+_MIN_THINKING_BUDGET = 1024
+
+# Thinking blocks must go back to the API unmodified and in their original
+# order, so the stream reports the response's block layout under this key.
+NATIVE_BLOCKS_KEY = "_claude_content_blocks"
+
+# Internal control tags the model occasionally writes into its visible text,
+# mostly on tool-heavy turns. Left in place they reach the user and, once in
+# the history, make later turns repeat them.
+_CONTROL_TAG_NAMES = ("thinking_mode", "reasoning_effort")
+_CONTROL_TAG_RE = re.compile(r"<(thinking_mode|reasoning_effort)>[^<>\n]{0,64}</\1>[ \t]*\n?")
+# An opening tag held longer than this without its closing tag is literal text.
+_CONTROL_TAG_MAX_LEN = 100
+
+
+def _strip_control_tags(text: str) -> str:
+    return _CONTROL_TAG_RE.sub("", text) if text and "<" in text else text
+
+
+class _ControlTagFilter:
+    """Strip control tags from streamed text, including tags split across deltas."""
+
+    def __init__(self):
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        buf = _strip_control_tags(self._pending + (text or ""))
+        cut = self._held_from(buf)
+        self._pending = buf[cut:]
+        return buf[:cut]
+
+    def flush(self) -> str:
+        out, self._pending = self._pending, ""
+        return out
+
+    @staticmethod
+    def _held_from(buf: str) -> int:
+        """Index where a possibly incomplete control tag starts, else len(buf)."""
+        cut = len(buf)
+        for name in _CONTROL_TAG_NAMES:
+            start = buf.rfind(f"<{name}>")
+            if start != -1 and len(buf) - start <= _CONTROL_TAG_MAX_LEN:
+                cut = min(cut, start)
+        start = buf.rfind("<")
+        if start != -1 and any(f"<{name}>".startswith(buf[start:]) for name in _CONTROL_TAG_NAMES):
+            cut = min(cut, start)
+        return cut
+
+
+def _lower_thinking(params: dict) -> Optional[dict]:
+    """Return params asking for less thinking, or None when it cannot go lower."""
+    thinking = params.get("thinking") or {}
+    if thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens") or 0
+        if budget <= _MIN_THINKING_BUDGET:
+            return None
+        return dict(params, thinking=dict(thinking, budget_tokens=max(_MIN_THINKING_BUDGET, budget // 2)))
+    if not thinking:
+        return None
+    output_config = params.get("output_config") or {}
+    lower = _LOWER_EFFORT.get(output_config.get("effort") or "high")
+    if not lower:
+        return None
+    return dict(params, output_config=dict(output_config, effort=lower))
+
+
+def _abort_response(response) -> None:
+    """Unblock a reader stuck in recv() on this response's socket."""
+    raw = getattr(response, "raw", None)
+    getters = (
+        lambda: raw._fp.fp.raw._sock,
+        lambda: raw._connection.sock,
+        lambda: raw.connection.sock,
+    )
+    for get_sock in getters:
+        try:
+            sock = get_sock()
+        except Exception:
+            continue
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            break
+    try:
+        response.close()
+    except Exception:
+        pass
+
+
+class _StallWatchdog:
+    """Cuts a streaming response that has received no event for ``limit`` seconds."""
+
+    def __init__(self, response, limit: Optional[float] = None):
+        self.response = response
+        self.limit = STREAM_STALL_SECONDS if limit is None else limit
+        self.interval = min(5.0, self.limit / 3)
+        self.tripped = False
+        self._last = time.monotonic()
+        self._stop = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def beat(self) -> None:
+        self._last = time.monotonic()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            if time.monotonic() - self._last > self.limit:
+                self.tripped = True
+                _abort_response(self.response)
+                return
 
 
 # OpenAI对话模型API (可用)
@@ -157,7 +301,8 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 f"{self.api_base}/messages",
                 headers=headers,
                 json=data,
-                proxies=proxies
+                proxies=proxies,
+                timeout=180
             )
 
             if response.status_code != 200:
@@ -242,21 +387,21 @@ class ClaudeAPIBot(Bot, OpenAIImage):
 
     def _get_max_tokens(self, model: str) -> int:
         """
-        Get max_tokens for the model.
-        Reference from pi-mono:
+        Get the request's max_tokens for the model.
+
+        Only the older Claude 3.x line has a small output cap; everything from
+        Claude 4 onward supports 64K. Default to 64K so a newly released model
+        (e.g. a future claude-*-6) does not silently regress to a tiny cap —
+        no code change needed per new model.
         - Claude 3.5/3.7: 8192
         - Claude 3 Opus: 4096
-        - Default: 8192
+        - Claude 4+ / default: 64000
         """
         if model and (model.startswith("claude-3-5") or model.startswith("claude-3-7")):
             return 8192
         elif model and model.startswith("claude-3") and "opus" in model:
             return 4096
-        elif model and (model.startswith("claude-sonnet-4") or model.startswith("claude-sonnet-5")
-                         or model.startswith("claude-opus-4") or model.startswith("claude-opus-5")
-                         or model.startswith("claude-fable")):
-            return 64000
-        return 8192
+        return 64000
 
     @staticmethod
     def _thinking_params(model: str, thinking: object, max_tokens: int) -> Optional[dict]:
@@ -276,10 +421,15 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         if not adaptive and not lowered.startswith(BUDGET_THINKING_MODELS):
             return None
 
+        if adaptive:
+            # Adaptive-only models reject ``thinking.type: disabled``. When the
+            # caller asks to disable thinking, omit the field entirely (the API
+            # then defaults to adaptive) rather than sending an unsupported value.
+            if thinking.get("type") == "disabled":
+                return None
+            return {"type": "adaptive", "display": "summarized"}
         if thinking.get("type") == "disabled":
             return {"type": "disabled"}
-        if adaptive:
-            return {"type": "adaptive", "display": "summarized"}
 
         # Legacy models need a budget of at least 1024 that stays below
         # max_tokens, since thinking tokens count towards the same limit.
@@ -298,6 +448,24 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             return m.group(1), m.group(2)
         return None, None
 
+    @classmethod
+    def _image_block(cls, image_url: str) -> Optional[dict]:
+        """Claude-native image block for a data URL or http(s) URL; None for a malformed data URL."""
+        if image_url.startswith("data:"):
+            media_type, b64_data = cls._parse_data_url(image_url)
+            if not b64_data:
+                return None
+            return {
+                "type": "image",
+                "source": {"type": "base64",
+                           "media_type": media_type or "image/jpeg",
+                           "data": b64_data},
+            }
+        return {
+            "type": "image",
+            "source": {"type": "url", "url": image_url},
+        }
+
     def call_vision(self, image_url: str, question: str,
                     model: Optional[str] = None,
                     max_tokens: int = 1000) -> dict:
@@ -305,22 +473,9 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         try:
             actual_model = model or self._model_mapping(conf().get("model"))
 
-            # Build Claude-native image content block
-            if image_url.startswith("data:"):
-                media_type, b64_data = self._parse_data_url(image_url)
-                if not b64_data:
-                    return {"error": True, "message": "Invalid base64 data URL"}
-                image_block = {
-                    "type": "image",
-                    "source": {"type": "base64",
-                               "media_type": media_type or "image/jpeg",
-                               "data": b64_data},
-                }
-            else:
-                image_block = {
-                    "type": "image",
-                    "source": {"type": "url", "url": image_url},
-                }
+            image_block = self._image_block(image_url)
+            if image_block is None:
+                return {"error": True, "message": "Invalid base64 data URL"}
 
             data = {
                 "model": actual_model,
@@ -341,7 +496,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             }
             proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
             resp = requests.post(f"{self.api_base}/messages",
-                                 headers=headers, json=data, proxies=proxies)
+                                 headers=headers, json=data, proxies=proxies, timeout=180)
 
             if resp.status_code != 200:
                 return {"error": True, "message": f"HTTP {resp.status_code}: {resp.text[:300]}"}
@@ -404,7 +559,17 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             request_params["system"] = system_prompt
 
         if tools:
+            if stream:
+                tools = [dict(t, **{EAGER_INPUT_STREAMING: True}) if isinstance(t, dict) and "input_schema" in t else t
+                         for t in tools]
             request_params["tools"] = tools
+            # Agent turns resend the same long prefix on every step of the tool
+            # loop, so cache it; one-off calls without tools are left alone.
+            system, request_params["messages"] = self._apply_prompt_cache(
+                request_params.get("system"), claude_messages, tools,
+                system_ttl=conf().get("claude_cache_ttl", CACHE_TTL_1H))
+            if system:
+                request_params["system"] = system
 
         # Claude exposes effort under output_config rather than the generic
         # reasoning_effort field used by OpenAI-compatible providers.
@@ -420,6 +585,11 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         )
         if thinking_params:
             request_params["thinking"] = thinking_params
+        elif stream and (actual_model or "").lower().startswith(ADAPTIVE_THINKING_MODELS):
+            # These models think even when the field is omitted, but then stream
+            # nothing until the thinking ends; summaries keep the connection busy
+            # so networks that cut idle streams do not drop the request.
+            request_params["thinking"] = {"type": "adaptive", "display": "summarized"}
 
         try:
             if stream:
@@ -427,13 +597,14 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             else:
                 return self._handle_sync_response(request_params)
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"Claude API call error: {e}")
             if stream:
                 # Return error generator for stream
                 def error_generator():
                     yield {
                         "error": True,
-                        "message": str(e),
+                        "message": error_msg,
                         "status_code": 500
                     }
 
@@ -447,18 +618,122 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 }
 
     @staticmethod
+    def _can_mark_cache(block) -> bool:
+        if not isinstance(block, dict) or block.get("cache_control"):
+            return False
+        if block.get("type") in UNCACHEABLE_BLOCK_TYPES:
+            return False
+        # An empty text block cannot carry cache_control.
+        return block.get("type") != "text" or bool(block.get("text"))
+
+    @staticmethod
+    def _count_cache_breakpoints(system, messages, tools) -> int:
+        blocks = list(tools or [])
+        if isinstance(system, list):
+            blocks.extend(system)
+        for msg in messages or []:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            blocks.extend(content)
+            for blk in content:
+                if isinstance(blk, dict) and isinstance(blk.get("content"), list):
+                    blocks.extend(blk["content"])
+        return sum(1 for blk in blocks if isinstance(blk, dict) and blk.get("cache_control"))
+
+    @staticmethod
+    def _system_cache_control(system, tools, system_ttl) -> dict:
+        """cache_control for the system breakpoint.
+
+        Tools + system are shared by every session and turn of an agent, and users
+        often come back after more than 5 minutes, so they get the 1h TTL by default.
+        It is skipped when an earlier block already carries a shorter-lived
+        breakpoint, since the API rejects a 1h entry placed after a 5m one.
+        """
+        if system_ttl != CACHE_TTL_1H:
+            return CACHE_CONTROL
+        earlier = list(tools or []) + (list(system) if isinstance(system, list) else [])
+        for blk in earlier:
+            cc = blk.get("cache_control") if isinstance(blk, dict) else None
+            if cc and cc.get("ttl") != CACHE_TTL_1H:
+                return CACHE_CONTROL
+        return dict(CACHE_CONTROL, ttl=CACHE_TTL_1H)
+
+    @classmethod
+    def _apply_prompt_cache(cls, system, messages: list, tools, system_ttl=None):
+        """Place cache breakpoints at the end of the system prompt and of the conversation.
+
+        Tools render before system, so the system breakpoint caches tools + system,
+        which stay identical across turns even when the history does not. The
+        message breakpoint follows the growing history; the next step of the tool
+        loop finds it through the API's 20-block lookback, so it keeps the cheaper
+        5m TTL. Breakpoints already present count against the limit of 4. Returns
+        new (system, messages) without mutating the inputs, which are shared with
+        the agent's history.
+        """
+        budget = MAX_CACHE_BREAKPOINTS - cls._count_cache_breakpoints(system, messages, tools)
+        if budget > 0 and system:
+            system_cc = cls._system_cache_control(system, tools, system_ttl)
+            blocks = [{"type": "text", "text": system}] if isinstance(system, str) else list(system)
+            if cls._can_mark_cache(blocks[-1]):
+                blocks[-1] = dict(blocks[-1], cache_control=system_cc)
+                system = blocks
+                budget -= 1
+        if budget > 0 and messages:
+            last = messages[-1]
+            content = last.get("content")
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            if isinstance(content, list) and content and cls._can_mark_cache(content[-1]):
+                content = content[:-1] + [dict(content[-1], cache_control=CACHE_CONTROL)]
+                messages = messages[:-1] + [dict(last, content=content)]
+        return system, messages
+
+    @staticmethod
+    def _build_usage(input_tokens, output_tokens, cache_write, cache_read) -> dict:
+        """OpenAI-shaped usage whose prompt_tokens is the whole prompt.
+
+        Anthropic's ``input_tokens`` excludes cached tokens, but the agent reads
+        prompt_tokens as everything the model saw this turn (context indicator,
+        trimming decisions), so cache writes and reads are added back. The cache
+        fields are passed through for the agent's hit-rate logging.
+        """
+        prompt_tokens = (input_tokens or 0) + (cache_write or 0) + (cache_read or 0)
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens or 0,
+            "total_tokens": prompt_tokens + (output_tokens or 0),
+            "cache_creation_input_tokens": cache_write or 0,
+            "cache_read_input_tokens": cache_read or 0,
+        }
+
+    @staticmethod
     def _sanitize_message(msg: dict) -> dict:
         """Strip thinking blocks without a ``signature`` from assistant messages.
 
         When the session switches from another model (e.g. MiniMax) to Claude,
         the in-memory history may contain thinking blocks that lack the
         ``signature`` field required by the Anthropic API, causing 400 errors.
+        OpenAI-style ``image_url`` blocks in user messages are converted to
+        Claude image blocks.
+
         We create a shallow copy so the original history is not mutated.
         """
-        if msg.get("role") != "assistant":
-            return msg
         content = msg.get("content")
         if not isinstance(content, list):
+            return msg
+        if msg.get("role") == "user":
+            if not any(isinstance(b, dict) and b.get("type") == "image_url" for b in content):
+                return msg
+            converted = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "image_url":
+                    url = (block.get("image_url") or {}).get("url") or ""
+                    block = ClaudeAPIBot._image_block(url) if url else None
+                if block is not None:
+                    converted.append(block)
+            return {**msg, "content": converted}
+        if msg.get("role") != "assistant":
             return msg
         cleaned = [
             block for block in content
@@ -469,6 +744,27 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         if len(cleaned) == len(content):
             return msg
         return {**msg, "content": cleaned}
+
+    @staticmethod
+    def _native_block_layout(native_blocks: dict) -> list:
+        """The response's blocks in order, or [] when it holds no signed thinking.
+
+        Thinking and redacted_thinking blocks are complete; text and tool_use
+        blocks carry only their type and mark where the agent's text and tool
+        calls go. Unsigned thinking cannot be sent back, so it is left out.
+        """
+        layout = []
+        signed = False
+        for index in sorted(native_blocks):
+            block = native_blocks[index]
+            if block.get("type") == "thinking":
+                if not block.get("signature"):
+                    continue
+                signed = True
+            elif block.get("type") == "redacted_thinking":
+                signed = True
+            layout.append(block)
+        return layout if signed else []
 
     def _handle_sync_response(self, request_params):
         """Handle synchronous Claude API response"""
@@ -485,7 +781,8 @@ class ClaudeAPIBot(Bot, OpenAIImage):
             f"{self.api_base}/messages",
             headers=headers,
             json=request_params,
-            proxies=proxies
+            proxies=proxies,
+            timeout=180
         )
 
         if response.status_code != 200:
@@ -517,7 +814,7 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         # Build message in OpenAI format
         message = {
             "role": "assistant",
-            "content": text_content
+            "content": _strip_control_tags(text_content)
         }
         if reasoning_content:
             message["reasoning_content"] = reasoning_content
@@ -538,16 +835,41 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                     "finish_reason": claude_response.get("stop_reason", "stop")
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            }
+            "usage": self._build_usage(
+                usage.get("input_tokens"), usage.get("output_tokens"),
+                usage.get("cache_creation_input_tokens"), usage.get("cache_read_input_tokens"))
         }
 
         return formatted_response
 
     def _handle_stream_response(self, request_params):
+        """Stream a response; if it stalls while the model is still thinking, retry with less effort.
+
+        A request that stalls during silent thinking stalls again when resent
+        unchanged, so the agent-level retry alone would fail the same way.
+        """
+        while True:
+            visible = False
+            stalled_chunk = None
+            for chunk in self._stream_once(request_params):
+                if chunk.get("error") and chunk.get("stalled") and not visible:
+                    stalled_chunk = chunk
+                    break
+                delta = ((chunk.get("choices") or [{}])[0] or {}).get("delta") or {}
+                if delta.get("content") or delta.get("tool_calls"):
+                    visible = True
+                yield chunk
+            if stalled_chunk is None:
+                return
+            lowered = _lower_thinking(request_params)
+            if lowered is None:
+                yield stalled_chunk
+                return
+            logger.warning(f"[Claude] Stream went silent while thinking; retrying with "
+                           f"{lowered.get('output_config', {}).get('effort') or lowered.get('thinking')}")
+            request_params = lowered
+
+    def _stream_once(self, request_params):
         """Handle streaming Claude API response using HTTP requests"""
         # Prepare headers
         headers = {
@@ -562,7 +884,27 @@ class ClaudeAPIBot(Bot, OpenAIImage):
         # Track tool use state
         tool_uses_map = {}  # {index: {id, name, input}}
         current_tool_use_index = -1
+        # Every content block by index: thinking blocks in full, others by type.
+        native_blocks = {}
+        text_filter = _ControlTagFilter()
         stop_reason = None  # Track stop reason from Claude
+        # Track token usage across the stream: Anthropic reports input_tokens on
+        # the message_start event and (cumulative) output_tokens on message_delta.
+        # Surfaced as a final usage chunk so the agent can show a real count.
+        usage_input_tokens = 0
+        usage_output_tokens = 0
+        usage_cache_write = 0
+        usage_cache_read = 0
+        watchdog = None
+
+        def text_chunk(content):
+            return {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request_params["model"],
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+            }
 
         try:
             # Make streaming HTTP request
@@ -572,8 +914,25 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 headers=headers,
                 json=request_params,
                 proxies=proxies,
-                stream=True
+                stream=True,
+                timeout=180
             )
+
+            if response.status_code == 400 and EAGER_INPUT_STREAMING in response.text:
+                # Some Anthropic-compatible gateways reject the field; drop it and resend.
+                logger.warning("[Claude] Endpoint rejected eager_input_streaming, retrying without it")
+                request_params["tools"] = [
+                    {k: v for k, v in t.items() if k != EAGER_INPUT_STREAMING} if isinstance(t, dict) else t
+                    for t in request_params.get("tools") or []
+                ]
+                response = requests.post(
+                    f"{self.api_base}/messages",
+                    headers=headers,
+                    json=request_params,
+                    proxies=proxies,
+                    stream=True,
+                    timeout=180
+                )
 
             if response.status_code != 200:
                 error_text = response.text
@@ -591,10 +950,12 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                 return
 
             # Process streaming response
+            watchdog = _StallWatchdog(response)
             for line in response.iter_lines():
                 if line:
                     line = line.decode('utf-8')
                     if line.startswith('data: '):
+                        watchdog.beat()
                         line = line[6:]  # Remove 'data: ' prefix
                         if line == '[DONE]':
                             break
@@ -602,10 +963,29 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                             event = json.loads(line)
                             event_type = event.get("type")
 
-                            if event_type == "content_block_start":
+                            if event_type == "message_start":
+                                # Anthropic reports the prompt token count here.
+                                msg_usage = (event.get("message", {}) or {}).get("usage", {}) or {}
+                                usage_input_tokens = msg_usage.get("input_tokens", 0) or 0
+                                usage_output_tokens = msg_usage.get("output_tokens", 0) or usage_output_tokens
+                                usage_cache_write = msg_usage.get("cache_creation_input_tokens", 0) or 0
+                                usage_cache_read = msg_usage.get("cache_read_input_tokens", 0) or 0
+
+                            elif event_type == "content_block_start":
                                 # New content block
                                 block = event.get("content_block", {})
-                                if block.get("type") == "tool_use":
+                                block_type = block.get("type")
+                                if block_type == "thinking":
+                                    native_blocks[event.get("index", 0)] = {
+                                        "type": "thinking",
+                                        "thinking": block.get("thinking", ""),
+                                        "signature": block.get("signature", ""),
+                                    }
+                                elif block_type == "redacted_thinking":
+                                    native_blocks[event.get("index", 0)] = dict(block)
+                                elif block_type:
+                                    native_blocks[event.get("index", 0)] = {"type": block_type}
+                                if block_type == "tool_use":
                                     current_tool_use_index = event.get("index", 0)
                                     tool_uses_map[current_tool_use_index] = {
                                         "id": block.get("id", ""),
@@ -617,8 +997,15 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                                 delta = event.get("delta", {})
                                 delta_type = delta.get("type")
 
-                                if delta_type == "thinking_delta":
+                                native = native_blocks.get(event.get("index", 0))
+                                if delta_type == "signature_delta":
+                                    if native and native.get("type") == "thinking":
+                                        native["signature"] += delta.get("signature", "")
+
+                                elif delta_type == "thinking_delta":
                                     thinking_text = delta.get("thinking", "")
+                                    if native and native.get("type") == "thinking":
+                                        native["thinking"] += thinking_text
                                     if thinking_text:
                                         yield {
                                             "choices": [{
@@ -632,30 +1019,40 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                                         }
 
                                 elif delta_type == "text_delta":
-                                    content = delta.get("text", "")
-                                    yield {
-                                        "id": event.get("id", ""),
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request_params["model"],
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": content},
-                                            "finish_reason": None
-                                        }]
-                                    }
+                                    content = text_filter.feed(delta.get("text", ""))
+                                    if content:
+                                        yield text_chunk(content)
 
                                 elif delta_type == "input_json_delta":
                                     # Tool input accumulation
                                     if current_tool_use_index >= 0:
                                         tool_uses_map[current_tool_use_index]["input"] += delta.get("partial_json", "")
 
+                            elif event_type == "content_block_stop":
+                                tail = text_filter.flush()
+                                if tail:
+                                    yield text_chunk(tail)
+
                             elif event_type == "message_delta":
+                                tail = text_filter.flush()
+                                if tail:
+                                    yield text_chunk(tail)
+                                layout = self._native_block_layout(native_blocks)
+                                if layout:
+                                    yield {"choices": [{"index": 0, "delta": {NATIVE_BLOCKS_KEY: layout},
+                                                        "finish_reason": None}]}
                                 # Extract stop_reason from delta
                                 delta = event.get("delta", {})
                                 if "stop_reason" in delta:
                                     stop_reason = delta.get("stop_reason")
                                     logger.info(f"[Claude] Stream stop_reason: {stop_reason}")
+                                # Anthropic reports the (cumulative) output token
+                                # count on message_delta.
+                                md_usage = event.get("usage", {}) or {}
+                                if md_usage.get("output_tokens"):
+                                    usage_output_tokens = md_usage.get("output_tokens")
+                                usage_cache_write = md_usage.get("cache_creation_input_tokens") or usage_cache_write
+                                usage_cache_read = md_usage.get("cache_read_input_tokens") or usage_cache_read
                                 
                                 # Message complete - yield tool calls if any
                                 if tool_uses_map:
@@ -683,24 +1080,66 @@ class ClaudeAPIBot(Bot, OpenAIImage):
                                             }]
                                         }
                             
+                            elif event_type == "error":
+                                # Anthropic can fail a stream after the 200
+                                # response has started (e.g. overloaded_error).
+                                # Surface it so the agent's retry/fallback logic
+                                # sees a real error instead of a truncated reply.
+                                err = event.get("error") or {}
+                                err_type = err.get("type", "")
+                                err_msg = err.get("message") or err_type or "Unknown stream error"
+                                logger.error(f"[Claude] Stream error event: {err_type}: {err_msg}")
+                                yield {
+                                    "error": True,
+                                    "message": f"{err_type}: {err_msg}" if err_type else err_msg,
+                                    "status_code": 529 if err_type == "overloaded_error" else 500,
+                                }
+                                return
+
                             elif event_type == "message_stop":
                                 # Final event - log completion
                                 logger.debug(f"[Claude] Stream completed with stop_reason: {stop_reason}")
+                                # Surface token usage as a trailing chunk (OpenAI
+                                # streaming shape) so the agent can record a real
+                                # prompt_tokens count for the context indicator.
+                                if usage_input_tokens or usage_output_tokens:
+                                    yield {
+                                        "id": event.get("id", ""),
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": request_params["model"],
+                                        "choices": [],
+                                        "usage": self._build_usage(
+                                            usage_input_tokens, usage_output_tokens,
+                                            usage_cache_write, usage_cache_read),
+                                    }
 
                         except json.JSONDecodeError:
                             continue
 
-        except requests.RequestException as e:
-            logger.error(f"Claude streaming request error: {e}")
-            yield {
-                "error": True,
-                "message": f"Connection error: {str(e)}",
-                "status_code": 0
-            }
+            if watchdog.tripped:
+                raise requests.ConnectionError("stream ended after the stall watchdog fired")
+
         except Exception as e:
-            logger.error(f"Claude streaming error: {e}")
+            stalled = watchdog is not None and watchdog.tripped
+            if stalled:
+                message = f"Connection error: stream stalled (no data for {STREAM_STALL_SECONDS}s), aborted for retry"
+                logger.error(f"Claude {message}")
+                status_code = 0
+            elif isinstance(e, requests.RequestException):
+                logger.error(f"Claude streaming request error: {e}")
+                message = f"Connection error: {str(e)}"
+                status_code = 0
+            else:
+                logger.error(f"Claude streaming error: {e}")
+                message = str(e)
+                status_code = 500
             yield {
                 "error": True,
-                "message": str(e),
-                "status_code": 500
+                "message": message,
+                "status_code": status_code,
+                "stalled": stalled,
             }
+        finally:
+            if watchdog is not None:
+                watchdog.stop()

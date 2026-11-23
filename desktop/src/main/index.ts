@@ -1,24 +1,157 @@
-import { app, BrowserWindow, session, shell, ipcMain, dialog, nativeImage, Notification, systemPreferences } from 'electron'
+import { app, BrowserWindow, screen, session, shell, ipcMain, dialog, nativeImage, Notification, systemPreferences, crashReporter, Menu, clipboard, net } from 'electron'
 import path from 'path'
 import fs from 'fs'
+import os from 'os'
 import http from 'http'
 import { PythonBackend, BackendError } from './python-manager'
 import { buildAppMenu } from './menu'
 import { createTray, destroyTray, getTray } from './tray'
-import { initUpdater, checkForUpdates, startDownload, quitAndInstall, setUpdateLanguage } from './updater'
+import { setupUnreadBadgeIPC } from './badge'
+import { initUpdater, checkForUpdates, startDownload, quitAndInstall, setUpdateLanguage, setUpdateFeedQuery } from './updater'
 import { setupThemeIPC, loadAppConfig } from './themes'
 import { setupHttpRelayIPC } from './http-relay'
-import { setupAppIconIPC, applyCachedAppIcon, getRuntimeAppIcon } from './app-icon'
+import {
+  setupAppIconIPC,
+  applyCachedAppIcon,
+  applyCachedAppName,
+  repairWindowsShortcuts,
+  getRuntimeAppIcon,
+} from './app-icon'
+
+// Where the packaged backend keeps its writable data (config.json, run.log).
+// Kept in sync with COW_DATA_DIR in python-manager.ts so the desktop shell
+// writes its own diagnostics into the SAME run.log the "open log folder" button
+// reveals and the in-app Logs page tails — one place to look for both layers.
+const COW_DATA_DIR = path.join(os.homedir(), '.cow')
+
+// Mirror the main process's console output and any uncaught crash to run.log.
+// Packaged builds have no terminal, so every console.log/error and every
+// Electron-layer crash (renderer/GPU gone, main-process exception) used to
+// vanish: the backend's run.log covered Python failures, but a white screen or
+// a silent app quit left nothing behind. This closes that gap without a crash
+// server — the evidence lands locally where the user can already find it.
+function initDesktopLogging(): void {
+  let stream: fs.WriteStream | null = null
+  try {
+    fs.mkdirSync(COW_DATA_DIR, { recursive: true })
+    // Append so we never clobber the backend's own run.log history; both sides
+    // are line-based, so interleaving is fine.
+    stream = fs.createWriteStream(path.join(COW_DATA_DIR, 'run.log'), { flags: 'a' })
+    stream.on('error', () => { stream = null })
+  } catch {
+    stream = null
+  }
+
+  const write = (level: string, args: unknown[]) => {
+    if (!stream) return
+    const text = args
+      .map((a) => (typeof a === 'string' ? a : a instanceof Error ? a.stack || a.message : JSON.stringify(a)))
+      .join(' ')
+    try {
+      stream.write(`[MAIN][${new Date().toISOString()}] [${level}] ${text}\n`)
+    } catch {
+      // logging must never break the app
+    }
+  }
+
+  // When the app is launched with stdout/stderr attached to a pipe whose reader
+  // later exits (a terminal or launcher), every write fails asynchronously with
+  // EPIPE. A try/catch can't see that: it arrives as an 'error' event, and with
+  // no listener it becomes an uncaughtException — whose handler logs through
+  // console again, looping forever and filling run.log. Console output is
+  // best-effort, so swallow stream errors here.
+  for (const s of [process.stdout, process.stderr]) {
+    s?.on?.('error', () => {})
+  }
+
+  // Wrap console so existing console.* calls throughout main also persist,
+  // while still printing to stdout for `npm run dev`.
+  const patch = (name: 'log' | 'warn' | 'error') => {
+    const original = console[name].bind(console)
+    console[name] = (...args: unknown[]) => {
+      write(name.toUpperCase(), args)
+      try {
+        original(...args)
+      } catch {
+        // stdout/stderr unavailable
+      }
+    }
+  }
+  patch('log')
+  patch('warn')
+  patch('error')
+
+  // Native minidumps for hard crashes (segfaults in Electron/Chromium). Stored
+  // locally under userData/Crashpad; no upload server is configured.
+  try {
+    crashReporter.start({ uploadToServer: false })
+  } catch {
+    // crashReporter is best-effort; never let it block startup
+  }
+
+  // Rate-limit crash logging so an error that keeps recurring (e.g. thrown from
+  // a timer) can't grow run.log without bound.
+  const CRASH_WINDOW_MS = 5000
+  const CRASH_MAX_PER_WINDOW = 20
+  let crashWindowStart = 0
+  let crashCount = 0
+  const logCrash = (...args: unknown[]) => {
+    const now = Date.now()
+    if (now - crashWindowStart > CRASH_WINDOW_MS) {
+      crashWindowStart = now
+      crashCount = 0
+    }
+    crashCount++
+    if (crashCount <= CRASH_MAX_PER_WINDOW) {
+      console.error(...args)
+    } else if (crashCount === CRASH_MAX_PER_WINDOW + 1) {
+      console.error(`[crash] too many errors, suppressing further output for ${CRASH_WINDOW_MS / 1000}s`)
+    }
+  }
+
+  // Main-process JS errors that would otherwise kill the app silently.
+  process.on('uncaughtException', (err) => {
+    logCrash('[crash] uncaughtException:', err?.stack || err)
+  })
+  process.on('unhandledRejection', (reason) => {
+    logCrash('[crash] unhandledRejection:', reason instanceof Error ? reason.stack : reason)
+  })
+
+  // Renderer/GPU/utility process crashes. These are the "white screen" and
+  // "window vanished" cases the user sees but that leave no trace by default.
+  app.on('render-process-gone', (_e, _wc, details) => {
+    console.error(`[crash] render-process-gone: reason=${details.reason} exitCode=${details.exitCode}`)
+  })
+  app.on('child-process-gone', (_e, details) => {
+    console.error(`[crash] child-process-gone: type=${details.type} reason=${details.reason} exitCode=${details.exitCode}`)
+  })
+
+  app.on('before-quit', () => {
+    try {
+      stream?.end()
+    } catch {
+      // ignore
+    }
+  })
+}
+
+// Set up main-process logging + crash capture before anything else runs, so the
+// earliest console output and any startup crash are already being persisted.
+initDesktopLogging()
 
 // Force the product name so the Dock/menu shows the app name even in dev mode,
 // where the default Electron binary would otherwise report "Electron". The name
 // can be overridden by the bundled app-config (appName); defaults to CowAgent.
 app.setName(loadAppConfig()?.appName || 'CowAgent')
+  // The web layer may have overridden the name at runtime. Re-apply it here,
+  // before app.getPath('userData') is read anywhere, since setName moves it.
+applyCachedAppName()
 
 // Windows shows notifications only when an AppUserModelID is set; without it
 // they are silently dropped. Harmless on macOS/Linux.
 if (process.platform === 'win32') {
-  app.setAppUserModelId('com.cowagent.desktop')
+  // Must match the installer's appId, which stamps it on the shortcuts.
+  app.setAppUserModelId(loadAppConfig()?.appUserModelId || 'com.cowagent.desktop')
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -27,7 +160,10 @@ let pythonBackend: PythonBackend | null = null
 let isQuitting = false
 
 const isDev = !app.isPackaged
-const VITE_DEV_PORTS = [5173, 5174, 5175, 5176]
+// Must match `server.port` in vite.config.ts. A single port, not a range:
+// strictPort there means our server never drifts, so a neighbouring port can
+// only ever belong to somebody else.
+const VITE_DEV_PORTS = [5173]
 
 // Launched by the OS at login (Windows passes --hidden; macOS reports it via
 // getLoginItemSettings().wasOpenedAsHidden). Start minimized to the tray so
@@ -41,10 +177,34 @@ function launchedHidden(): boolean {
   }
 }
 
-function probePort(port: number): Promise<boolean> {
+// The renderer's entry module, as it appears in the index.html Vite serves.
+// Used to tell our own dev server apart from an unrelated one holding the port
+// (another project's Vite, a static file server). Answering the probe is not
+// enough of a test: loading a stranger's page into the window looks exactly
+// like the app being broken.
+const RENDERER_MARKER = 'src/main.tsx'
+
+function probeViteDevServer(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const req = http.get(`http://localhost:${port}`, (res) => {
-      resolve(res.statusCode !== undefined)
+      if (res.statusCode !== 200) {
+        res.resume()
+        resolve(false)
+        return
+      }
+      let body = ''
+      res.setEncoding('utf8')
+      res.on('data', (chunk) => {
+        body += chunk
+        // The document we're after is a few KB. Anything much larger isn't it,
+        // so stop reading rather than buffering an unrelated response.
+        if (body.length > 64 * 1024) {
+          req.destroy()
+          resolve(false)
+        }
+      })
+      res.on('end', () => resolve(body.includes(RENDERER_MARKER)))
+      res.on('error', () => resolve(false))
     })
     req.on('error', () => resolve(false))
     req.setTimeout(500, () => { req.destroy(); resolve(false) })
@@ -53,7 +213,7 @@ function probePort(port: number): Promise<boolean> {
 
 async function findViteDevServer(): Promise<string | null> {
   for (const port of VITE_DEV_PORTS) {
-    if (await probePort(port)) {
+    if (await probeViteDevServer(port)) {
       return `http://localhost:${port}`
     }
   }
@@ -75,11 +235,57 @@ const isWin = process.platform === 'win32'
 // Persisted window bounds
 const windowStateFile = () => path.join(app.getPath('userData'), 'window-state.json')
 
-function loadWindowState(): { width: number; height: number; x?: number; y?: number } {
+type WindowBounds = { width: number; height: number; x?: number; y?: number }
+
+// How much of the window must overlap a display's work area for the user to
+// still see it and drag it back.
+const MIN_VISIBLE_PX = 100
+
+// A disconnected monitor, a resolution/DPI change, Windows' minimized
+// (-32000, -32000), or a third-party tool parking the window far away can all
+// leave saved bounds off every display: the window is shown (the taskbar
+// previews it) yet clicking it reveals nothing.
+function isOnSomeDisplay(b: { x: number; y: number; width: number; height: number }): boolean {
+  return screen.getAllDisplays().some(({ workArea: wa }) => {
+    const w = Math.min(b.x + b.width, wa.x + wa.width) - Math.max(b.x, wa.x)
+    const h = Math.min(b.y + b.height, wa.y + wa.height) - Math.max(b.y, wa.y)
+    return w >= MIN_VISIBLE_PX && h >= MIN_VISIBLE_PX
+  })
+}
+
+// Clamp the size to the primary work area and drop an off-screen position so
+// Electron centers the window instead.
+function sanitizeWindowState(s: WindowBounds): WindowBounds {
+  const wa = screen.getPrimaryDisplay().workArea
+  const width = Math.min(Math.max(s.width, 900), wa.width)
+  const height = Math.min(Math.max(s.height, 600), wa.height)
+  if (typeof s.x !== 'number' || typeof s.y !== 'number') return { width, height }
+  if (!isOnSomeDisplay({ x: s.x, y: s.y, width, height })) return { width, height }
+  return { width, height, x: s.x, y: s.y }
+}
+
+// Pull a window that ended up off-screen (e.g. its monitor was unplugged while
+// running) back to the center of the primary display.
+function ensureWindowOnScreen(win: BrowserWindow) {
+  if (win.isDestroyed() || win.isMinimized() || win.isFullScreen()) return
+  const b = win.getBounds()
+  if (isOnSomeDisplay(b)) return
+  const wa = screen.getPrimaryDisplay().workArea
+  const width = Math.min(b.width, wa.width)
+  const height = Math.min(b.height, wa.height)
+  win.setBounds({
+    x: Math.round(wa.x + (wa.width - width) / 2),
+    y: Math.round(wa.y + (wa.height - height) / 2),
+    width,
+    height,
+  })
+}
+
+function loadWindowState(): WindowBounds {
   try {
     const raw = fs.readFileSync(windowStateFile(), 'utf-8')
     const s = JSON.parse(raw)
-    if (typeof s.width === 'number' && typeof s.height === 'number') return s
+    if (typeof s.width === 'number' && typeof s.height === 'number') return sanitizeWindowState(s)
   } catch {
     /* first run or unreadable */
   }
@@ -89,11 +295,114 @@ function loadWindowState(): { width: number; height: number; x?: number; y?: num
 function saveWindowState() {
   if (!mainWindow || mainWindow.isDestroyed()) return
   if (mainWindow.isMinimized() || mainWindow.isFullScreen()) return
-  const b = mainWindow.getBounds()
+  // Keep the restore size while maximized, and never persist an off-screen
+  // position, or the next launch would open there again.
+  const b = mainWindow.isMaximized() ? mainWindow.getNormalBounds() : mainWindow.getBounds()
+  if (!isOnSomeDisplay(b)) return
   try {
     fs.writeFileSync(windowStateFile(), JSON.stringify(b))
   } catch {
     /* ignore */
+  }
+}
+
+function isZhLocale(): boolean {
+  try {
+    return /^zh/i.test(app.getLocale() || '')
+  } catch {
+    return false
+  }
+}
+
+// Read an image's bytes regardless of scheme: http(s) backend URLs go through
+// Electron's `net` (honours the app session, so the auth token in the query is
+// enough), while data: URLs are decoded inline.
+async function fetchImageBuffer(srcURL: string): Promise<Uint8Array> {
+  if (srcURL.startsWith('data:')) {
+    const comma = srcURL.indexOf(',')
+    const meta = srcURL.slice(5, comma)
+    const data = srcURL.slice(comma + 1)
+    const buf = meta.includes('base64')
+      ? Buffer.from(decodeURIComponent(data.replace(/\s/g, '')), 'base64')
+      : Buffer.from(decodeURIComponent(data))
+    return new Uint8Array(buf)
+  }
+  // net.fetch lands in Electron 28; the Win7 legacy build (Electron 22) lacks
+  // it, so fall back to a raw http(s) request there. Access it through a loose
+  // type: the Win7 build compiles against Electron 22's typings where `Net` has
+  // no `fetch`, and a hard reference would fail `tsc` even though the runtime
+  // guard below already keeps it off that build.
+  type NetFetchResponse = {
+    ok: boolean
+    status: number
+    arrayBuffer: () => Promise<ArrayBuffer>
+  }
+  const netFetch = (net as unknown as { fetch?: (url: string) => Promise<NetFetchResponse> })
+    ?.fetch
+  if (typeof netFetch === 'function') {
+    const res = await netFetch(srcURL)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    return new Uint8Array(await res.arrayBuffer())
+  }
+  return await new Promise<Uint8Array>((resolve, reject) => {
+    const client = srcURL.startsWith('https:') ? require('https') : http
+    client
+      .get(srcURL, (res: http.IncomingMessage) => {
+        if (!res.statusCode || res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}`))
+          res.resume()
+          return
+        }
+        const chunks: Buffer[] = []
+        res.on('data', (c: Buffer) => chunks.push(c))
+        res.on('end', () => resolve(new Uint8Array(Buffer.concat(chunks))))
+        res.on('error', reject)
+      })
+      .on('error', reject)
+  })
+}
+
+// Pick a sensible download filename: the `path=` query the backend file
+// endpoint uses names the real file, otherwise fall back to the URL tail.
+function imageFileName(srcURL: string): string {
+  try {
+    const u = new URL(srcURL)
+    const p = u.searchParams.get('path')
+    const raw = p ? p.split(/[\\/]/).pop() : u.pathname.split('/').pop()
+    const name = (raw || '').split('?')[0]
+    if (name && /\.[a-z0-9]+$/i.test(name)) return name
+  } catch {
+    /* not a parseable URL (e.g. data:) */
+  }
+  return `image-${Date.now()}.png`
+}
+
+async function saveImageFromUrl(srcURL: string): Promise<void> {
+  try {
+    const buf = await fetchImageBuffer(srcURL)
+    const opts = { defaultPath: path.join(app.getPath('downloads'), imageFileName(srcURL)) }
+    const result = mainWindow
+      ? await dialog.showSaveDialog(mainWindow, opts)
+      : await dialog.showSaveDialog(opts)
+    if (result.canceled || !result.filePath) return
+    fs.writeFileSync(result.filePath, buf)
+  } catch (err) {
+    console.error('[Electron] Save image failed:', err)
+    dialog.showErrorBox(
+      isZhLocale() ? '保存失败' : 'Save failed',
+      isZhLocale() ? '无法保存该图片。' : 'Could not save the image.'
+    )
+  }
+}
+
+async function copyImageFromUrl(srcURL: string): Promise<void> {
+  try {
+    const buf = await fetchImageBuffer(srcURL)
+    const img = nativeImage.createFromBuffer(Buffer.from(buf))
+    if (img.isEmpty()) throw new Error('decode failed')
+    clipboard.writeImage(img)
+  } catch (err) {
+    console.error('[Electron] Copy image failed:', err)
   }
 }
 
@@ -114,6 +423,7 @@ function createWindow() {
     frame: isMac ? undefined : false,
     backgroundColor: '#0e0e10',
     icon: getIconPath(),
+    title: app.name,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -122,11 +432,25 @@ function createWindow() {
     },
   })
 
+  // The window title follows the app name, not the renderer's static <title>.
+  mainWindow.on('page-title-updated', (e) => e.preventDefault())
   const persist = () => saveWindowState()
   mainWindow.on('resize', persist)
   mainWindow.on('move', persist)
   mainWindow.on('maximize', emitMaximizeState)
   mainWindow.on('unmaximize', emitMaximizeState)
+  // Every way of bringing the window up (tray, taskbar, second-instance,
+  // notification click) ends in a show event.
+  mainWindow.on('show', () => mainWindow && ensureWindowOnScreen(mainWindow))
+  const recheck = () => {
+    if (mainWindow?.isVisible()) ensureWindowOnScreen(mainWindow)
+  }
+  screen.on('display-removed', recheck)
+  screen.on('display-metrics-changed', recheck)
+  mainWindow.on('closed', () => {
+    screen.removeListener('display-removed', recheck)
+    screen.removeListener('display-metrics-changed', recheck)
+  })
 
   const rendererHtml = path.join(__dirname, '../renderer/index.html')
 
@@ -187,6 +511,27 @@ function createWindow() {
       console.warn(`[Electron] Blocked navigation to dropped file: ${url}`)
       e.preventDefault()
     }
+  })
+
+  // Native right-click menu for images. The renderer runs from file:// (or the
+  // dev server), so Chromium's built-in "Save image as…" resolves the src
+  // against the wrong origin and does nothing. Provide our own Save / Copy that
+  // fetch the bytes ourselves — this is what makes chat images (inline and in
+  // the lightbox) downloadable on desktop, matching the browser console.
+  mainWindow.webContents.on('context-menu', (_e, params) => {
+    if (params.mediaType !== 'image' || !params.srcURL) return
+    const zh = isZhLocale()
+    const menu = Menu.buildFromTemplate([
+      {
+        label: zh ? '图片另存为…' : 'Save Image As…',
+        click: () => void saveImageFromUrl(params.srcURL),
+      },
+      {
+        label: zh ? '复制图片' : 'Copy Image',
+        click: () => void copyImageFromUrl(params.srcURL),
+      },
+    ])
+    menu.popup({ window: mainWindow ?? undefined })
   })
 
   // Close-to-tray: hide the window instead of destroying it, so the tray's
@@ -272,11 +617,42 @@ async function startBackend() {
   })
 
   pythonBackend.on('log', (line: string) => {
-    console.log(`[backend] ${line}`)
+    // Write straight to stdout instead of console.log: initDesktopLogging()
+    // patches console.* to also append to run.log, and the backend already
+    // writes these same lines to run.log via Python's FileHandler. Routing this
+    // mirror through console.log would persist a second (`[MAIN] [backend] ...`)
+    // copy of every line. stdout keeps them visible for `npm run dev` without
+    // the duplicate on disk. Shell-side diagnostics (crash/exit) are persisted
+    // separately by python-manager's own [SHELL] writes.
+    process.stdout.write(`[backend] ${line}\n`)
     mainWindow?.webContents.send('backend-log', line)
   })
 
   await pythonBackend.start()
+}
+
+// Interfaces VPNs, containers and VMs create; their addresses are not on the
+// network the user's other devices share.
+const VIRTUAL_IFACE_RE = /^(utun|tun|tap|wg|zt|tailscale|docker|br-|veth|vmnet|vboxnet|bridge|llw|awdl|vEthernet)/i
+
+/** This machine's IPv4 addresses on private networks, home ranges first. */
+function listLanAddresses(): string[] {
+  const rank = (ip: string): number => {
+    if (ip.startsWith('192.168.')) return 0
+    if (ip.startsWith('10.')) return 1
+    const m = /^172\.(\d+)\./.exec(ip)
+    return m && Number(m[1]) >= 16 && Number(m[1]) <= 31 ? 2 : -1
+  }
+  const out: string[] = []
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (VIRTUAL_IFACE_RE.test(name)) continue
+    for (const a of addrs ?? []) {
+      if (a.family === 'IPv4' && !a.internal && rank(a.address) >= 0 && !out.includes(a.address)) {
+        out.push(a.address)
+      }
+    }
+  }
+  return out.sort((a, b) => rank(a) - rank(b))
 }
 
 function setupIPC() {
@@ -303,6 +679,16 @@ function setupIPC() {
   ipcMain.handle('get-data-dir', () => {
     return pythonBackend?.getDataDir() ?? ''
   })
+
+  // Secret shared with the spawned backend; lets the renderer prove a request
+  // comes from this desktop shell (see COW_DESKTOP_TOKEN in python-manager).
+  ipcMain.handle('get-desktop-token', () => {
+    return pythonBackend?.getDesktopToken() ?? ''
+  })
+
+  ipcMain.handle('get-lan-addresses', () => listLanAddresses())
+
+  ipcMain.handle('get-host-name', () => os.hostname().replace(/\.(local|lan|home)$/i, ''))
 
   ipcMain.handle('restart-backend', async () => {
     await pythonBackend?.restart()
@@ -331,6 +717,10 @@ function setupIPC() {
     const err = await shell.openPath(targetPath)
     if (err) shell.showItemInFolder(targetPath)
     return err
+  })
+
+  ipcMain.handle('reveal-path', (_event, targetPath: string) => {
+    if (targetPath) shell.showItemInFolder(targetPath)
   })
 
   // Custom window controls (used by Windows frameless titlebar)
@@ -404,6 +794,9 @@ function setupIPC() {
     setUpdateLanguage(lang)
     startDownload()
   })
+  ipcMain.handle('update-feed-query', (_event, params: unknown) => {
+    setUpdateFeedQuery(params)
+  })
   ipcMain.handle('update-install', () => {
     // Let the window actually close so the app can fully quit — otherwise the
     // close-to-tray handler preventDefault()s it, the process stays alive, and
@@ -434,11 +827,13 @@ function setupIPC() {
   // Show a native OS notification (e.g. a scheduler reminder or a finished
   // task). Clicking it brings the window forward and asks the renderer to open
   // the given session.
-  ipcMain.handle('notify', (_event, payload: { title?: string; body?: string; sessionId?: string; silent?: boolean }) => {
+  ipcMain.handle('notify', (_event, payload: { title?: string; body?: string; sessionId?: string; silent?: boolean; force?: boolean }) => {
     if (!Notification.isSupported() || !payload?.body) return false
     // Skip when the window is focused: the user is already watching, so a
     // notification (and sound) would just be noise, especially for short tasks.
-    if (mainWindow?.isFocused()) return false
+    // Exception: a scheduled task (force) may fire into a session the user
+    // isn't viewing even while the window is focused, so they must be told.
+    if (!payload.force && mainWindow?.isFocused()) return false
     // Use the runtime app icon if one was set (via set-app-icon), so the
     // notification matches the current window/Dock icon. Falls back to the
     // packaged icon.
@@ -508,19 +903,23 @@ app.whenReady().then(async () => {
 
   // On macOS the Chromium-layer handler above isn't enough: getUserMedia also
   // needs system-level (TCC) microphone authorization, which only the native
-  // askForMediaAccess prompt can grant. Request it up front so the first mic
-  // click surfaces the system dialog instead of failing with a denied error.
-  if (process.platform === 'darwin') {
-    const micStatus = systemPreferences.getMediaAccessStatus('microphone')
-    if (micStatus === 'not-determined') {
-      systemPreferences.askForMediaAccess('microphone').catch(() => {})
+  // askForMediaAccess prompt can grant. The renderer asks for it right before
+  // the first recording, so the system dialog only appears when mic is used.
+  ipcMain.handle('mic-request-access', async () => {
+    if (process.platform !== 'darwin') return true
+    try {
+      if (systemPreferences.getMediaAccessStatus('microphone') === 'granted') return true
+      return await systemPreferences.askForMediaAccess('microphone')
+    } catch {
+      return false
     }
-  }
+  })
 
   setupIPC()
-  setupThemeIPC()
+  setupThemeIPC(() => pythonBackend?.getDataDir() ?? '')
   setupHttpRelayIPC()
   setupAppIconIPC({ getWindow: () => mainWindow, getTray })
+  setupUnreadBadgeIPC({ getWindow: () => mainWindow })
   createWindow()
   buildAppMenu(() => mainWindow)
   // No menu-bar tray on macOS — the Dock + window controls are enough there.
@@ -537,6 +936,12 @@ app.whenReady().then(async () => {
   }
   // Re-apply a previously set icon/title before the page loads.
   applyCachedAppIcon()
+  // Undo any damage the last update did to this app's shortcuts.
+  try {
+    repairWindowsShortcuts()
+  } catch (e) {
+    console.warn('[app-icon] shortcut repair failed:', (e as Error).message)
+  }
   await startBackend()
 
   // Wire auto-update: a first silent check a few seconds after launch (so it

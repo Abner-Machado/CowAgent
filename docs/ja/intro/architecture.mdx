@@ -1,15 +1,15 @@
 ---
 title: アーキテクチャ
-description: CowAgent 2.0 のシステムアーキテクチャとコア設計
+description: "CowAgent のシステム構成とコア設計。チャネル、Agent コア、モデル、ツール、スキル、記憶、ナレッジの連携と、メッセージ受信から計画・ツール実行・応答までの流れを解説。"
 ---
 
-CowAgent 2.0 は、シンプルなチャットボットから、自律的な思考、タスク計画、長期記憶、Skill の拡張性を備えた Agent アーキテクチャのスーパーインテリジェントアシスタントへと進化しました。
+CowAgent はすぐに使えるスーパー AI アシスタントであり、完全な Agent harness フレームワークでもあります。複雑なタスク計画、長期記憶、Skill の拡張性、自己進化、マルチエージェント協働などの能力を備えています。
 
 ## システムアーキテクチャ
 
 CowAgent のアーキテクチャは以下のコアモジュールで構成されています：
 
-<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.png" alt="CowAgent Architecture" />
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.jpg" alt="CowAgent Architecture" />
 
 | モジュール | 説明 |
 | --- | --- |
@@ -17,6 +17,7 @@ CowAgent のアーキテクチャは以下のコアモジュールで構成さ�
 | **Memory** | 重要な情報をコアメモリとデイリーメモリとして自動永続化し、キーワードとベクトルのハイブリッド検索でセッション間の連続性を実現 |
 | **Knowledge** | トピック別に構造化された知識を整理。Agent が価値ある情報を Markdown ページとして自律的に整理し、インデックスと相互参照で成長するナレッジネットワークを構築 |
 | **Evolution** | 会話がアイドルになった後、隔離環境で自動レビューを実行。Skill を改善し、未完了のタスクを引き継ぎ、記憶と知識を補完して、日々の利用を通じて Agent を成長させる |
+| **Multi-agent** | 複数の Agent がチームを構成し、それぞれ独立した役割・モデル・ワークスペースを持つ。グループチャット協働、タスク委譲、サブ Agent に対応し、チャネルには単一の Agent またはチーム全体をバインドして対外サービスを提供できる |
 | **Tools** | Agent が OS リソースにアクセスするための中核能力。ファイル読み書き、ターミナル、ブラウザ、スケジューラ、記憶検索、Web 検索など 10 以上の組み込みツール |
 | **Skills** | Skill の読み込み・管理。Skill Hub や GitHub からのワンクリックインストール、または会話を通じたカスタム Skill の作成をサポート |
 | **Models** | モデル層。OpenAI、Claude、Gemini、DeepSeek、MiniMax、GLM、Qwen など主要 LLM への統一アクセスを提供 |
@@ -50,9 +51,12 @@ Agent のシステムワークスペースはデフォルトで `~/cow` にあ�
 ├── knowledge/         # パーソナルナレッジベース
 │   ├── index.md       # ナレッジインデックス
 │   └── <category>/    # トピック別ページ
-└── skills/            # カスタム Skill
-    ├── skill-1/
-    └── skill-2/
+├── skills/            # カスタム Skill
+│   ├── skill-1/
+│   └── skill-2/
+└── agents/            # マルチエージェントチーム
+    ├── team.json      # チーム名簿とチャネルのバインド
+    └── <agent-id>/    # 非デフォルト Agent 専用のワークスペース
 ```
 
 シークレットキーはセキュリティのため `~/.cow` ディレクトリに別途保存されます：
@@ -65,6 +69,16 @@ Agent のシステムワークスペースはデフォルトで `~/cow` にあ�
 ### プロジェクトワークスペース {#project-workspace}
 
 デフォルトのワークスペースに加えて、各セッションに専用の**プロジェクトディレクトリ**を紐づけできます。Agent のファイル読み書きとコマンド実行はそのディレクトリ内で行われ、マルチプロジェクトの分離が実現します。記憶や Skill などは引き続きデフォルトのワークスペースに保存されます。複数のプロジェクトを使用している場合、Web／デスクトップの履歴一覧は自動的にプロジェクトごとにグループ化されます。
+
+### マルチエージェントワークスペース {#multi-agent-workspace}
+
+[Agent チーム](/ja/multi-agent/team) を構成すると、各 Agent はそれぞれ完全なワークスペースを持ちます。デフォルト Agent はインスタンスのルート `~/cow` を使用し、その他のメンバーは `~/cow/agents/<agent-id>/` 以下に配置されます。これによりストレージは「システム共有」「メンバーごとに分離」「共有／分離を選択可能」の 3 種類に分かれます：
+
+- **システム共有**：シークレットファイル（`~/.cow/.env`）とチーム設定（`~/cow/agents/team.json`）はインスタンス全体で共有されます。
+- **メンバーごとに分離**：各 Agent のコアファイル（`SYSTEM.md`、`USER.md`、`AGENT.md`、`RULE.md`）、記憶（`MEMORY.md`、`memory/`）、生成ファイルはそれぞれのワークスペース内にあり、メンバー間で互いに見えません。
+- **共有／分離を選択可能**：Skill とナレッジベースはチームで共有することも、特定のメンバー専用にすることもでき、両モードはいつでも切り替えられます。
+
+> サブ Agent はメイン Agent が一時的に立ち上げる実行ユニットで、メイン Agent とワークスペースを共有し、独自の記憶は持ちません。一方チームメンバーは常駐する正式な Agent で、ワークスペースと記憶が完全に独立しています。詳細は [サブ Agent](/ja/multi-agent/subagent) を参照してください。
 
 ### セッション単位のモデルと権限 {#session-settings}
 
@@ -81,9 +95,9 @@ Agent のシステムワークスペースはデフォルトで `~/cow` にあ�
 {
   "agent": true,
   "agent_workspace": "~/cow",
-  "agent_max_context_tokens": 40000,
+  "agent_max_context_tokens": 200000,
   "agent_max_context_turns": 30,
-  "agent_max_steps": 15,
+  "agent_max_steps": 100,
   "agent_permission_mode": "full-access",
   "cow_lang": "auto"
 }
@@ -93,9 +107,9 @@ Agent のシステムワークスペースはデフォルトで `~/cow` にあ�
 | --- | --- | --- |
 | `agent` | Agent モードの有効化 | `true` |
 | `agent_workspace` | ワークスペースのパス | `~/cow` |
-| `agent_max_context_tokens` | 最大コンテキストトークン数 | `40000` |
+| `agent_max_context_tokens` | 最大コンテキストトークン数 | `200000` |
 | `agent_max_context_turns` | 最大コンテキストターン数 | `30` |
-| `agent_max_steps` | タスクあたりの最大判断ステップ数 | `15` |
+| `agent_max_steps` | タスクあたりの最大判断ステップ数 | `100` |
 | `agent_permission_mode` | 新規セッションが引き継ぐグローバルのデフォルト権限：`read-only` / `workspace-write` / `full-access` | `full-access` |
 | `knowledge` | パーソナルナレッジベースの有効化 | `true` |
 | `self_evolution_enabled` | 自己進化の有効化（新規インストールではデフォルト有効） | `false` |

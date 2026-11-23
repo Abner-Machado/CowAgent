@@ -1,6 +1,6 @@
 ---
 title: 更新升级
-description: CowAgent 的升级方式说明
+description: "升级 CowAgent 到最新版本：使用 cow update 一条命令完成拉取代码、更新依赖、重装 CLI 并重启服务，也可以在 Web 控制台中检查更新并一键升级，了解各种安装方式对应的升级步骤。"
 ---
 
 ## 命令升级（推荐）
@@ -22,6 +22,33 @@ cow update
 <Note>
   如果未安装 Cow CLI，也可以使用 `./run.sh update` 完成相同操作。
 </Note>
+
+
+## 控制台一键更新
+
+源码安装也可以直接在 Web 控制台升级，不必再开终端。
+
+1. 点击左侧栏底部的版本号，弹出上拉菜单。打开菜单时**不会**访问 GitHub。
+2. 点击 **检查更新**，才会拉取版本信息。这是唯一的网络请求；若有新版本，同一项会变成 **立即更新** 并带一个红点提示。
+3. 点击 **立即更新**。控制台复用 `cow update` 的同一条路径（`git pull`、安装依赖、重装 CLI），然后重启服务。菜单里的 **版本说明** 则会打开 GitHub releases 页面查看完整变更。
+
+更新只操作 git 代码目录：用户数据在仓库之外（`agent_workspace`，默认 `~/cow`），`config.json` 也被 gitignore，所以 `git pull` 不会覆盖它们，无需备份。更新前会记录当前 git 提交，如果新代码无法 import，会重置回该提交，且不杀死正在运行的进程。
+
+更新成功后，控制台会自动重连并显示新版本号。
+
+<Note>
+  Docker 镜像和桌面客户端不能用这个按钮。Docker 仍使用 `docker compose pull`；桌面客户端继续走内置更新。Windows 上请在终端执行 `cow update`，Web 控制台无法从进程内部完成重启。
+</Note>
+
+### 回滚
+
+如果更新成功但新版本工作异常，回退到上一个提交即可：
+
+```bash
+cow stop
+git reset --hard <previous-commit>   # tmp/web-update-status.json 中会记录
+cow start
+```
 
 ## 手动升级
 
@@ -57,11 +84,11 @@ sudo docker compose up -d
 ```
 
 <Tip>
-  升级前建议备份 `config.json` 配置文件。Docker 环境下如需保留数据，可通过 volume 挂载持久化工作空间目录。
+  升级前建议备份 `config.json` 配置文件。配置和渠道登录信息保存在挂载的 `./cow-data` 目录，工作空间保存在 `./cow` 目录，重建容器不会丢失。`docker-compose.yml` 中填写了值的环境变量会在每次启动时覆盖控制台里的同名配置。
 </Tip>
 
 ## 客户端升级
 
 [桌面客户端](/zh/guide/desktop)内置自动更新能力，有新版本时会自动检查并提示，一键即可下载并重启完成升级。
 
-你也可以随时前往[下载页](https://cowagent.ai/zh/download/)手动下载最新版本安装。
+你也可以随时前往[下载页](https://cowagent.cn/zh/download/)手动下载最新版本安装。

@@ -16,18 +16,27 @@ Implementation note:
 """
 
 import asyncio
+import concurrent.futures
+import copy
 import os
 import re
 import threading
+from urllib.parse import urlparse
 
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel, check_prefix
 from channel.discord.discord_message import DiscordMessage
+from common import state_dir
 from common.expired_dict import ExpiredDict
 from common.log import logger
+from common.markdown_fence import split_markdown
+from common.media_download import MAX_FILE_BYTES, MAX_IMAGE_BYTES, download_to_file, remove_download
 from common.singleton import singleton
 from config import conf
+
+# send() runs on the shared reply thread; a stalled download must not block it.
+_MAX_REMOTE_FILE_SECONDS = 300
 
 # Discord caps a single message at 2000 chars; split conservatively below.
 DISCORD_MSG_LIMIT = 1900
@@ -59,7 +68,7 @@ class DiscordChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.bot_token = conf().get("discord_token", "")
+        self.bot_token = self.cfg("discord_token", "")
         if not self.bot_token:
             err = "[Discord] discord_token is required"
             logger.error(err)
@@ -185,7 +194,7 @@ class DiscordChannel(ChatChannel):
 
             # Guild trigger gate (silently drop if not triggered)
             if is_group and not self._should_reply_in_guild(message):
-                logger.debug(f"[Discord] guild message not triggered (need @mention or reply), skip")
+                logger.debug("[Discord] guild message not triggered (need @mention or reply), skip")
                 return
 
             # Parse message type + download attachments if needed.
@@ -263,6 +272,8 @@ class DiscordChannel(ChatChannel):
                 context["receiver"] = str(message.channel.id)
                 context["discord_channel_id"] = message.channel.id
                 context["discord_reply_to_msg_id"] = message.id if is_group else None
+                from agent.team_addressing import stamp_speaker_from_channel
+                stamp_speaker_from_channel(self, context, dc_msg.content)
                 self.produce(context)
             logger.debug(f"[Discord] received: type={ctype}, content={str(dc_msg.content)[:80]}")
 
@@ -275,10 +286,8 @@ class DiscordChannel(ChatChannel):
             from agent.protocol import get_cancel_registry
             from bridge.bridge import Bridge
             agent_bridge = Bridge().get_agent_bridge()
-            receiver = str(message.channel.id)
             agent_id = agent_bridge.agent_router.resolve(
-                channel_type=self.channel_type,
-                conversation_ids=(session_id, receiver),
+                explicit_agent_id=getattr(self, "bound_agent_id", "") or None,
             )
             scoped_session_id = agent_bridge._cancel_key(
                 agent_id, session_id, agent_bridge.agent_registry.default_agent_id
@@ -304,12 +313,18 @@ class DiscordChannel(ChatChannel):
             att = attachments[0]
             content_type = (att.content_type or "").lower()
             name = att.filename or str(att.id)
-            path = await self._download_attachment(att, name)
-            if not path:
-                return (None, None, "")
             is_image = content_type.startswith("image/") or name.lower().endswith(
                 (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
             )
+            # attachment.save() buffers the whole body, so check the reported size first.
+            limit = MAX_IMAGE_BYTES if is_image else MAX_FILE_BYTES
+            size = getattr(att, "size", None)
+            if isinstance(size, int) and size > limit:
+                logger.warning(f"[Discord] attachment {name} is {size} bytes, over the {limit} limit; skipped")
+                return (None, None, "")
+            path = await self._download_attachment(att, name)
+            if not path:
+                return (None, None, "")
             if is_image:
                 return (ContextType.IMAGE, path, text)
             return (ContextType.FILE, path, text)
@@ -388,6 +403,7 @@ class DiscordChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 
@@ -434,77 +450,86 @@ class DiscordChannel(ChatChannel):
             logger.warning("[Discord] no discord_channel_id in context, drop reply")
             return
 
-        coro = self._async_send(reply, channel_id)
+        progress = {"sent": False}
+        downloaded = None
         try:
-            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            if reply.type in (ReplyType.VOICE, ReplyType.FILE, ReplyType.VIDEO) \
+                    and isinstance(reply.content, str) \
+                    and reply.content.startswith(("http://", "https://")):
+                reply, downloaded = self._download_file_reply(reply)
+            future = asyncio.run_coroutine_threadsafe(
+                self._async_send(reply, channel_id, progress), self._loop
+            )
             future.result(timeout=180)
+        except concurrent.futures.TimeoutError:
+            # The send may still finish on the loop, so a retry could post it twice.
+            logger.error(f"[Discord] send timed out, not retrying (channel={channel_id})")
         except Exception as e:
-            logger.error(f"[Discord] send failed: {e}")
+            logger.error(f"[Discord] send failed: {e}", exc_info=True)
+            # chat_channel._send retries the whole reply: only worth it when nothing went out.
+            if not progress["sent"]:
+                raise
+        finally:
+            remove_download(downloaded)
 
-    async def _async_send(self, reply: Reply, channel_id):
-        try:
-            import discord
+    def _download_file_reply(self, reply: Reply):
+        """Fetch a remote file reply so it can be uploaded like a local one.
 
-            channel = self._client.get_channel(channel_id)
-            if channel is None:
-                # Not in cache (e.g. DM channel); fetch it explicitly
-                channel = await self._client.fetch_channel(channel_id)
+        A file reply may carry an http(s) URL instead of a local path.
+        Returns ``(local_reply, temp_path)``.
+        """
+        url_path = urlparse(reply.content).path
+        path = state_dir.tmp_file("discord_file", os.path.splitext(url_path)[1] or ".bin")
+        download_to_file(reply.content, path, MAX_FILE_BYTES, timeout=60,
+                         max_seconds=_MAX_REMOTE_FILE_SECONDS, guarded=True)
+        local = copy.copy(reply)
+        local.content = "file://" + path
+        # The published URL's last segment is a random hash, not the user's file name.
+        local.file_name = getattr(reply, "file_name", "") or os.path.basename(url_path)
+        return local, path
 
-            rtype = reply.type
-            content = reply.content
+    async def _async_send(self, reply: Reply, channel_id, progress: dict = None):
+        import discord
 
-            if rtype in (ReplyType.TEXT, ReplyType.INFO, ReplyType.ERROR):
-                text = str(content) if content is not None else ""
-                if not text:
-                    return
-                for chunk in _split_text(text, DISCORD_MSG_LIMIT):
-                    await channel.send(chunk)
+        progress = {} if progress is None else progress
+        channel = self._client.get_channel(channel_id)
+        if channel is None:
+            # Not in cache (e.g. DM channel); fetch it explicitly
+            channel = await self._client.fetch_channel(channel_id)
 
-            elif rtype == ReplyType.IMAGE:
-                # Already a local BytesIO; send it directly
-                content.seek(0)
-                await channel.send(file=discord.File(content, filename="image.png"))
+        rtype = reply.type
+        content = reply.content
 
-            elif rtype == ReplyType.IMAGE_URL:
-                url = str(content)
-                if url.startswith("file://"):
-                    local = url[7:]
-                    await channel.send(file=discord.File(local))
-                else:
-                    # Post the URL as text; Discord will unfurl it as an image preview
-                    await channel.send(url)
+        if rtype in (ReplyType.TEXT, ReplyType.INFO, ReplyType.ERROR):
+            text = str(content) if content is not None else ""
+            if not text:
+                return
+            for chunk in split_markdown(text, DISCORD_MSG_LIMIT):
+                await channel.send(chunk)
+                progress["sent"] = True
 
-            elif rtype in (ReplyType.VOICE, ReplyType.FILE):
-                local = content[7:] if isinstance(content, str) and content.startswith("file://") else content
-                caption = getattr(reply, "text_content", None) or None
-                await channel.send(content=caption, file=discord.File(local))
+        elif rtype == ReplyType.IMAGE:
+            # Already a local BytesIO; send it directly
+            content.seek(0)
+            await channel.send(file=discord.File(content, filename="image.png"))
 
+        elif rtype == ReplyType.IMAGE_URL:
+            url = str(content)
+            if url.startswith("file://"):
+                local = url[7:]
+                await channel.send(file=discord.File(local))
             else:
-                # Fallback: send as plain text
-                await channel.send(str(content))
+                # Post the URL as text; Discord will unfurl it as an image preview
+                await channel.send(url)
 
-            logger.info(f"[Discord] sent reply (type={rtype}, channel={channel_id})")
+        elif rtype in (ReplyType.VOICE, ReplyType.FILE, ReplyType.VIDEO):
+            local = content[7:] if isinstance(content, str) and content.startswith("file://") else content
+            caption = getattr(reply, "text_content", None) or None
+            file_name = getattr(reply, "file_name", None) or None
+            await channel.send(content=caption, file=discord.File(local, filename=file_name))
 
-        except Exception as e:
-            logger.error(f"[Discord] _async_send error: {e}", exc_info=True)
+        else:
+            # Fallback: send as plain text
+            await channel.send(str(content))
 
-
-def _split_text(text: str, limit: int):
-    """Split long text preferring line breaks to keep markdown structure intact."""
-    if len(text) <= limit:
-        yield text
-        return
-    buf = []
-    size = 0
-    for line in text.splitlines(keepends=True):
-        if size + len(line) > limit and buf:
-            yield "".join(buf)
-            buf, size = [], 0
-        # Hard-split single lines that exceed the limit
-        while len(line) > limit:
-            yield line[:limit]
-            line = line[limit:]
-        buf.append(line)
-        size += len(line)
-    if buf:
-        yield "".join(buf)
+        logger.info(f"[Discord] sent reply (type={rtype}, channel={channel_id})")

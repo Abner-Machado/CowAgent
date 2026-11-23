@@ -318,6 +318,15 @@ class _StubPage:
         return f"text of page {self.number}"
 
 
+try:
+    import pypdf as _pypdf  # noqa: F401
+
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+
+
+@unittest.skipUnless(HAS_PYPDF, "pypdf is an optional dependency")
 class TestPdfReadingWindow(_Case):
     """Only the requested pages should be parsed - the point of the pages arg."""
 

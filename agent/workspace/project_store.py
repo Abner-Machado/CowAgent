@@ -27,6 +27,7 @@ import threading
 import time
 from typing import Dict, List, Optional
 
+from common.atomic_write import write_json_atomic
 from common.log import logger
 
 # Recents cap: enough to be useful in the picker, small enough that the file
@@ -65,22 +66,21 @@ _lock = threading.Lock()
 
 def _load() -> Dict:
     path = _store_file()
+    empty = {"sessions": {}, "recents": [], "meta": {}, "order": []}
     if not os.path.isfile(path):
-        return {"sessions": {}, "recents": [], "meta": {}, "order": []}
+        return empty
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f) or {}
     except Exception as e:
         logger.warning(f"[ProjectStore] Could not read {path}: {e}")
-        return {"sessions": {}, "recents": [], "meta": {}, "order": []}
-    data.setdefault("sessions", {})
-    data.setdefault("recents", [])
-    # ``meta``: path -> {"display_name": str}. A rename lives here, never on
-    # disk, so the folder keeps its name and existing bindings stay valid.
-    data.setdefault("meta", {})
-    # ``order``: user-chosen sidebar order of spaces (project paths and the
-    # DEFAULT_SPACE_KEY sentinel). Absent entries fall back to recency order.
-    data.setdefault("order", [])
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    # A hand-edited file may hold the wrong type under a key; reset just that key.
+    for key, shape in (("sessions", dict), ("recents", list), ("meta", dict), ("order", list)):
+        if not isinstance(data.get(key), shape):
+            data[key] = shape()
     return data
 
 
@@ -88,17 +88,17 @@ def _save(data: Dict) -> None:
     path = _store_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        write_json_atomic(path, data, indent=2)
     except Exception as e:
         logger.warning(f"[ProjectStore] Could not write {path}: {e}")
+        # Mutating callers and HTTP handlers must not acknowledge an update
+        # that cannot be loaded again after a restart.
+        raise
 
 
 def _normalize(path: str) -> str:
     from common.utils import expand_path
-    return os.path.realpath(expand_path((path or "").strip()))
+    return os.path.realpath(expand_path(path or ""))
 
 
 def _session_key(session_id: str, agent_id: Optional[str]) -> str:
@@ -161,6 +161,33 @@ def forget_session(session_id: str, agent_id: Optional[str] = None) -> None:
         data = _load()
         if data["sessions"].pop(key, None) is not None:
             _save(data)
+
+
+def forget_agent(agent_id: str) -> None:
+    """Erase every trace of a deleted Agent from the project store.
+
+    A deleted Agent's sessions go away with its workspace, so the bindings they
+    left behind under ``{agent_id}::*`` can never be read again — they only sit
+    in ``projects.json`` forever, and an Agent later created with the same id
+    inherits them. Same sweep as :func:`session_prefs.forget_agent`, for the
+    sibling store.
+
+    ``recents``/``meta``/``order`` are deliberately left alone: a project is a
+    directory on the user's disk, not something the Agent owned, so it stays
+    reachable from the picker after the Agent is gone.
+    """
+    if not agent_id:
+        return
+    prefix = f"{agent_id}::"
+    with _lock:
+        data = _load()
+        sessions = data.get("sessions") or {}
+        stale = [key for key in sessions if str(key).startswith(prefix)]
+        if not stale:
+            return
+        for key in stale:
+            sessions.pop(key, None)
+        _save(data)
 
 
 def set_project_dir(
@@ -303,7 +330,7 @@ def set_order(order: List[str]) -> List[str]:
     for key in order or []:
         if not isinstance(key, str):
             continue
-        k = key.strip()
+        k = key
         if not k or k in seen:
             continue
         # Real project paths are normalized; the default sentinel is kept as-is.

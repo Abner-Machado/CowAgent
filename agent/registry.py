@@ -11,12 +11,17 @@ import re
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from common.utils import expand_path
+from common.deployment import is_app_bundled
 
 
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+# Id of the built-in single agent, and the reserved alias by which the default
+# agent can always be addressed (see AgentRegistry.get_addressed).
+DEFAULT_AGENT_ALIAS = "default"
 
 
 class AgentRegistryError(ValueError):
@@ -30,9 +35,19 @@ class AgentProfile:
     id: str
     name: str
     workspace: str
+    #: What this Agent is for, in one line. Read by teammates: a name alone is
+    #: enough to address someone but not to decide whose work something is.
+    description: Optional[str] = None
     enabled: bool = True
     model: Optional[str] = None
     bot_type: Optional[str] = None
+    avatar: Optional[str] = None
+    # Which shared assets this Agent draws on. ``None`` means "all of them",
+    # which is what every existing config means and what a new Agent gets;
+    # an empty tuple is a real answer that differs from it, so the two cannot
+    # collapse into one falsy case.
+    skills: Optional[Tuple[str, ...]] = None
+    knowledge: Optional[Tuple[str, ...]] = None
 
     @property
     def workspace_path(self) -> Path:
@@ -45,10 +60,18 @@ class AgentProfile:
             "workspace": self.workspace,
             "enabled": self.enabled,
         }
+        if self.description:
+            data["description"] = self.description
         if self.model:
             data["model"] = self.model
         if self.bot_type:
             data["bot_type"] = self.bot_type
+        if self.avatar:
+            data["avatar"] = self.avatar
+        if self.skills is not None:
+            data["skills"] = list(self.skills)
+        if self.knowledge is not None:
+            data["knowledge"] = list(self.knowledge)
         return data
 
 
@@ -56,6 +79,30 @@ def _normalise_workspace(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AgentRegistryError("agent workspace must be a non-empty string")
     return str(Path(expand_path(value.strip())).resolve(strict=False))
+
+
+def _asset_selection(
+    raw: Mapping[str, Any], agent_id: str, key: str
+) -> Optional[Tuple[str, ...]]:
+    """Parse an "only these shared assets" list, keeping absent distinct from empty.
+
+    Absent means this Agent draws on everything, which is what every config
+    written before the field existed means. A list, including an empty one,
+    means the selection is deliberate.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise AgentRegistryError(
+            f"agent '{agent_id}' {key} must be a list of strings when set"
+        )
+    seen = []
+    for name in value:
+        name = name.strip()
+        if name and name not in seen:
+            seen.append(name)
+    return tuple(seen)
 
 
 def _profile_from_mapping(
@@ -85,6 +132,10 @@ def _profile_from_mapping(
     if not isinstance(enabled, bool):
         raise AgentRegistryError(f"agent '{agent_id}' enabled must be a boolean")
 
+    description = raw.get("description")
+    if description is not None and not isinstance(description, str):
+        raise AgentRegistryError(f"agent '{agent_id}' description must be a string")
+
     model = raw.get("model")
     bot_type = raw.get("bot_type")
     for key, value in (("model", model), ("bot_type", bot_type)):
@@ -97,13 +148,21 @@ def _profile_from_mapping(
     if workspace is None:
         workspace = default_workspace
 
+    avatar = raw.get("avatar")
+    if avatar is not None and not isinstance(avatar, str):
+        raise AgentRegistryError(f"agent '{agent_id}' avatar must be a string")
+
     return AgentProfile(
         id=agent_id,
         name=name.strip(),
         workspace=_normalise_workspace(workspace),
+        description=(description.strip() or None) if description else None,
         enabled=enabled,
         model=model.strip() if isinstance(model, str) else None,
         bot_type=bot_type.strip() if isinstance(bot_type, str) else None,
+        avatar=avatar.strip() if isinstance(avatar, str) and avatar.strip() else None,
+        skills=_asset_selection(raw, agent_id, "skills"),
+        knowledge=_asset_selection(raw, agent_id, "knowledge"),
     )
 
 
@@ -138,8 +197,27 @@ class AgentRegistry:
 
         raw_agents = settings.get("agents")
         if raw_agents is None or raw_agents == []:
-            profile = AgentProfile(id="default", name="Default", workspace=instance_root)
-            return cls([profile], "default")
+            # Single-agent install: the sole agent owns the instance root. Its id
+            # is normally the built-in "default", but a provisioner may inject one
+            # so the id is stable and meaningful from first boot; an invalid or
+            # absent value falls back to "default" and never breaks startup.
+            builtin_id = settings.get("default_agent_id")
+            # A value injected via env may arrive as a non-string (e.g. an
+            # all-digit id parsed as int), so coerce before validating.
+            builtin_id = str(builtin_id).strip() if builtin_id is not None else ""
+            if not builtin_id or not _AGENT_ID_RE.match(builtin_id):
+                builtin_id = DEFAULT_AGENT_ALIAS
+            builtin_name = settings.get("default_agent_name")
+            builtin_name = str(builtin_name).strip() if builtin_name is not None else ""
+            builtin_desc = settings.get("default_agent_description")
+            builtin_desc = str(builtin_desc).strip() if builtin_desc is not None else ""
+            profile = AgentProfile(
+                id=builtin_id,
+                name=builtin_name or "CowAgent",
+                description=builtin_desc,
+                workspace=instance_root,
+            )
+            return cls([profile], builtin_id)
 
         if not isinstance(raw_agents, list):
             raise AgentRegistryError("agents must be a list")
@@ -207,6 +285,20 @@ class AgentRegistry:
                 raise AgentRegistryError(f"agent '{resolved_id}' is disabled")
             return profile
 
+    def get_addressed(self, agent_id: Optional[str], require_enabled: bool = True) -> AgentProfile:
+        """The agent an inbound request addresses by id.
+
+        Like ``get``, except that the reserved id ``"default"`` always means
+        the default agent, whatever id it was actually given. Remote callers
+        can therefore address the default agent without knowing its real id.
+        Any other unknown id still raises, so a request is never silently
+        answered by a different agent.
+        """
+        requested = (agent_id or "").strip()
+        if requested == DEFAULT_AGENT_ALIAS:
+            requested = ""
+        return self.get(requested or None, require_enabled=require_enabled)
+
     def get_or_default(self, agent_id: Optional[str]) -> AgentProfile:
         with self._lock:
             profile = self._profiles.get(agent_id) if agent_id else None
@@ -263,11 +355,9 @@ _registry_lock = threading.Lock()
 
 
 def _config_signature(settings: Mapping[str, Any]) -> tuple:
-    return (
-        repr(settings.get("agents") or []),
-        settings.get("default_agent_id") or "",
-        settings.get("agent_workspace") or "",
-    )
+    from agent import team
+
+    return (team.stamp(settings), settings.get("agent_workspace") or "")
 
 
 def get_agent_registry() -> AgentRegistry:
@@ -280,8 +370,7 @@ def get_agent_registry() -> AgentRegistry:
     """
 
     global _registry_instance, _registry_signature
-    import os
-
+    from agent import team
     from config import conf
 
     settings = conf()
@@ -290,17 +379,20 @@ def get_agent_registry() -> AgentRegistry:
         if _registry_pinned and _registry_instance is not None:
             return _registry_instance
         if _registry_instance is None or _registry_signature != signature:
+            # The roster is its own file; config.json only still holds it on an
+            # install that has not written one yet. `resolve` hides which.
+            settings = team.resolve(settings)
             try:
                 _registry_instance = AgentRegistry.from_config(settings)
             except AgentRegistryError:
                 # An invalid `agents`/`default_agent_id` block would otherwise
                 # bubble all the way up through load_config() and take the whole
                 # process down before the web console can bind — leaving a
-                # desktop user with no UI to fix the very config that is broken.
+                # desktop or mobile user with no UI to fix the very config that is broken.
                 # Fall back to the default single agent so the app still starts;
                 # the console can then edit the bad block. Source deployments
                 # keep failing loudly so the developer sees the error at once.
-                if os.environ.get("COW_DESKTOP") != "1":
+                if not is_app_bundled():
                     raise
                 from common.log import logger
 

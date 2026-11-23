@@ -1,15 +1,15 @@
 ---
 title: Architecture
-description: CowAgent 2.0 system architecture and core design
+description: "How CowAgent is built: the channel, agent core, model, tool, skill, memory and knowledge modules, and the agent loop from receiving a message to planning, calling tools, updating memory and replying."
 ---
 
-CowAgent 2.0 has evolved from a simple chatbot into a super intelligent assistant with Agent architecture, featuring autonomous thinking, task planning, long-term memory, and skill extensibility.
+CowAgent is an out-of-the-box super AI assistant and a complete Agent harness framework, featuring complex task planning, long-term memory, skill extensibility, self-evolution, and multi-agent collaboration.
 
 ## System Architecture
 
 CowAgent's architecture consists of the following core modules:
 
-<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.png" alt="CowAgent Architecture" />
+<img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/architecture/en/architecture.jpg" alt="CowAgent Architecture" />
 
 | Module | Description |
 | --- | --- |
@@ -17,6 +17,7 @@ CowAgent's architecture consists of the following core modules:
 | **Memory** | Automatically persists important information as core memory and daily memory, with hybrid keyword and vector retrieval for cross-session context continuity |
 | **Knowledge** | Organizes structured knowledge by topic. The Agent autonomously distills valuable information into Markdown pages, maintaining indexes and cross-references to build a growing knowledge network |
 | **Evolution** | Reviews a conversation in an isolated environment after it goes idle, improving skills, following up on unfinished tasks, and backfilling memory and knowledge so the Agent keeps growing through everyday use |
+| **Multi-agent** | Multiple Agents form a team, each with its own responsibilities, model, and workspace. Supports group-chat collaboration, task delegation, and sub-Agents; a channel can bind a single Agent or the whole team to serve externally |
 | **Tools** | Core capability for Agent to access OS resources. 10+ built-in tools including file read/write, terminal, browser, scheduler, memory search, web search, and more |
 | **Skills** | Loads and manages Skills. Supports one-click installation from Skill Hub, GitHub, and more, or custom skill creation through conversation |
 | **Models** | Model layer with unified access to OpenAI, Claude, Gemini, DeepSeek, MiniMax, GLM, Qwen, and other mainstream LLMs |
@@ -50,9 +51,12 @@ The Agent's system workspace is located at `~/cow` by default and stores system 
 ├── knowledge/         # Personal knowledge base
 │   ├── index.md       # Knowledge index
 │   └── <category>/    # Topic-based pages
-└── skills/            # Custom skills
-    ├── skill-1/
-    └── skill-2/
+├── skills/            # Custom skills
+│   ├── skill-1/
+│   └── skill-2/
+└── agents/            # Multi-agent team
+    ├── team.json      # Team roster & channel bindings
+    └── <agent-id>/    # Non-default agent's own workspace
 ```
 
 Secret keys are stored separately in `~/.cow` directory for security:
@@ -65,6 +69,16 @@ Secret keys are stored separately in `~/.cow` directory for security:
 ### Project Workspace {#project-workspace}
 
 Besides the default workspace, each session can be bound to its own **project directory**. The Agent's file reads/writes and command execution happen inside that directory, giving you multi-project isolation; memory, skills, and the like still live in the default workspace. When more than one project is in use, the Web/desktop history list automatically groups sessions by project.
+
+### Multi-Agent Workspace {#multi-agent-workspace}
+
+Once you build an [Agent team](/multi-agent/team), each Agent has a complete workspace of its own. The default Agent uses the instance root `~/cow`, while every other member lives under `~/cow/agents/<agent-id>/`. This splits storage into three categories — system-shared, per-member isolated, and optionally shared:
+
+- **System-shared**: the secrets file (`~/.cow/.env`) and the team config (`~/cow/agents/team.json`) are shared across the whole instance.
+- **Per-member isolated**: each Agent's core files (`SYSTEM.md`, `USER.md`, `AGENT.md`, `RULE.md`), memory (`MEMORY.md`, `memory/`), and output files live inside its own workspace and are not visible to other members.
+- **Optionally shared**: skills and the knowledge base can either be shared with the team or dedicated to a specific member, and the two modes can be switched at any time.
+
+> A sub-Agent is a temporary execution unit spun up by the lead Agent; it shares the lead Agent's workspace and has no memory of its own. A team member is a persistent, full Agent with a completely independent workspace and memory. See [Sub-Agents](/multi-agent/subagent) for details.
 
 ### Per-Session Model & Permission {#session-settings}
 
@@ -81,9 +95,9 @@ Configure Agent mode parameters in `config.json`:
 {
   "agent": true,
   "agent_workspace": "~/cow",
-  "agent_max_context_tokens": 50000,
-  "agent_max_context_turns": 20,
-  "agent_max_steps": 20,
+  "agent_max_context_tokens": 200000,
+  "agent_max_context_turns": 30,
+  "agent_max_steps": 100,
   "agent_permission_mode": "full-access",
   "enable_thinking": false,
   "cow_lang": "auto"
@@ -94,9 +108,9 @@ Configure Agent mode parameters in `config.json`:
 | --- | --- | --- |
 | `agent` | Enable Agent mode | `true` |
 | `agent_workspace` | Workspace path | `~/cow` |
-| `agent_max_context_tokens` | Max context tokens | `50000` |
-| `agent_max_context_turns` | Max context turns | `20` |
-| `agent_max_steps` | Max decision steps per task | `20` |
+| `agent_max_context_tokens` | Max context tokens | `200000` |
+| `agent_max_context_turns` | Max context turns | `30` |
+| `agent_max_steps` | Max decision steps per task | `100` |
 | `agent_permission_mode` | Global default permission inherited by new sessions: `read-only` / `workspace-write` / `full-access` | `full-access` |
 | `enable_thinking` | Enable deep-thinking mode | `false` |
 | `knowledge` | Enable personal knowledge base | `true` |

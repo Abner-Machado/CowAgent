@@ -1,12 +1,12 @@
 import os
 import re
 import base64
-import requests
 
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 from common.log import logger
 from common import state_dir
+from common.media_download import MAX_FILE_BYTES, download_bytes
 from Crypto.Cipher import AES
 
 
@@ -57,27 +57,57 @@ def _decrypt_media(url: str, aeskey: str) -> bytes:
     Download and decrypt AES-256-CBC encrypted media from wecom bot.
     Returns decrypted bytes.
     """
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    encrypted = resp.content
-
     key = base64.b64decode(aeskey + "=" * (-len(aeskey) % 4))
     if len(key) != 32:
         raise ValueError(f"Invalid AES key length: {len(key)}, expected 32")
+
+    encrypted = download_bytes(url, MAX_FILE_BYTES, timeout=(5, 30))
+    if not encrypted or len(encrypted) % AES.block_size:
+        raise ValueError("Invalid encrypted media length")
 
     iv = key[:16]
     cipher = AES.new(key, AES.MODE_CBC, iv)
     decrypted = cipher.decrypt(encrypted)
 
     pad_len = decrypted[-1]
-    if pad_len > 32:
-        raise ValueError(f"Invalid PKCS7 padding length: {pad_len}")
+    if not 1 <= pad_len <= 32 or decrypted[-pad_len:] != bytes([pad_len]) * pad_len:
+        raise ValueError("Invalid PKCS7 padding")
     return decrypted[:-pad_len]
 
 
 def _get_tmp_dir() -> str:
     """Return the workspace tmp directory (absolute path), creating it if needed."""
     return str(state_dir.tmp_dir())
+
+
+# An "@name" that opens a group message's text, or one that ends it and follows
+# whitespace (unlike the end of an e-mail address or a link), with the
+# whitespace around it.
+_LEADING_MENTION_RE = re.compile(r"^\s*@\S+\s*")
+_TRAILING_MENTION_RE = re.compile(r"(?:^|\s)@\S+\s*$")
+
+
+def _strip_bot_mention(texts: list) -> list:
+    """Remove the bot's @-mention from the text of a group message.
+
+    ``texts`` are the pieces of the message's text, in order: the content of a
+    text message, or the text items of a mixed one. Each comes back trimmed.
+
+    WeCom only pushes a group message to the bot when the bot is @-mentioned in
+    it, and its receive-message docs show the mention as plain text at the
+    start of the message ("@RobotA hello robot"); the message carries no
+    mention list or bot name. So the "@name" that opens the text is taken as
+    the bot's or, when none does, one that ends it, as in a command typed
+    before the mention ("/cancel @RobotA"). Any other "@" (an e-mail address,
+    a link, another member's mention, a decorator) is part of what the user
+    wrote and stays.
+    """
+    texts = list(texts)
+    if texts:
+        texts[0], found = _LEADING_MENTION_RE.subn("", texts[0], count=1)
+        if not found:
+            texts[-1] = _TRAILING_MENTION_RE.sub("", texts[-1], count=1)
+    return [text.strip() for text in texts]
 
 
 class WecomBotMessage(ChatMessage):
@@ -101,7 +131,7 @@ class WecomBotMessage(ChatMessage):
             self.ctype = ContextType.TEXT
             content = msg_body.get("text", {}).get("content", "")
             if is_group:
-                content = re.sub(r"@\S+\s*", "", content).strip()
+                content = _strip_bot_mention([content])[0]
             self.content = content
 
         elif msg_type == "voice":
@@ -138,11 +168,7 @@ class WecomBotMessage(ChatMessage):
             for idx, item in enumerate(mixed_items):
                 item_type = item.get("msgtype")
                 if item_type == "text":
-                    txt = item.get("text", {}).get("content", "")
-                    if is_group:
-                        txt = re.sub(r"@\S+\s*", "", txt).strip()
-                    if txt:
-                        text_parts.append(txt)
+                    text_parts.append(item.get("text", {}).get("content", ""))
                 elif item_type == "image":
                     img_info = item.get("image", {})
                     img_url = img_info.get("url", "")
@@ -156,7 +182,10 @@ class WecomBotMessage(ChatMessage):
                     except Exception as e:
                         logger.error(f"[WecomBot] Failed to download mixed image: {e}")
 
-            content_parts = text_parts[:]
+            if is_group:
+                # The mention can open the first text item or end the last one.
+                text_parts = _strip_bot_mention(text_parts)
+            content_parts = [txt for txt in text_parts if txt]
             for p in image_paths:
                 content_parts.append(f"[图片: {p}]")
             self.content = "\n".join(content_parts) if content_parts else "[Mixed message]"
@@ -210,6 +239,13 @@ class WecomBotMessage(ChatMessage):
             self.other_user_id = chat_id
             self.actual_user_id = from_userid
             self.actual_user_nickname = from_userid
+            # WeCom only pushes a group message once the bot has been addressed in
+            # it, and the "@" was already stripped from the text above. So this is
+            # the same "reached here in a group means we were mentioned" case that
+            # dingtalk / discord / slack / telegram record as is_at. Without it
+            # ChatChannel's group gate finds neither a configured prefix nor an
+            # @-mention and returns None, so the message never reached the agent.
+            self.is_at = True
         else:
             self.other_user_id = from_userid
             self.actual_user_id = from_userid

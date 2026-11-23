@@ -6,6 +6,7 @@ and config.json is the source of intent. The two functions below are the
 only things needing on-disk awareness:
 
   detect_index_dim         : read the dim of stored vectors (display-only)
+  detect_chunker_version   : read the chunker version that produced the index
   cleanup_legacy_state_file: remove old embedding_state.json from earlier
                              versions; safe no-op when absent.
 """
@@ -38,6 +39,28 @@ def detect_index_dim(storage) -> Optional[int]:
         emb = json.loads(raw)
         return len(emb) if isinstance(emb, list) else None
     except (json.JSONDecodeError, TypeError, Exception):
+        return None
+
+
+def detect_chunker_version(storage) -> Optional[int]:
+    """Return the chunker version recorded for the index, or None when the
+    index carries no record at all.
+
+    `None` means the index predates chunker-version tracking (or was built by
+    an unknown strategy), i.e. its chunk boundaries may not match the current
+    algorithm — /memory status uses this to suggest a rebuild. Chunked files
+    are only re-split when their content hash changes, so a chunker change
+    alone would otherwise never refresh existing boundaries.
+    """
+    try:
+        raw = storage.get_meta("chunker_version")
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
         return None
 
 

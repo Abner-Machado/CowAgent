@@ -8,6 +8,15 @@ from typing import Dict, Any, Optional, List
 from agent.skills.types import SkillMetadata, SkillInstallSpec
 
 
+FRONTMATTER_RE = re.compile(r'^\ufeff?---\s*\n(.*?)\n---\s*\n', re.DOTALL)
+
+
+def strip_frontmatter(content: str) -> str:
+    """The markdown body after the frontmatter block, or all of it when there is none."""
+    match = FRONTMATTER_RE.match(content)
+    return content[match.end():] if match else content
+
+
 def parse_frontmatter(content: str) -> Dict[str, Any]:
     """
     Parse YAML-style frontmatter from markdown content.
@@ -16,8 +25,7 @@ def parse_frontmatter(content: str) -> Dict[str, Any]:
     """
     frontmatter = {}
     
-    # Match frontmatter block between --- markers
-    match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    match = FRONTMATTER_RE.match(content)
     if not match:
         return frontmatter
     
@@ -98,7 +106,7 @@ def parse_metadata(frontmatter: Dict[str, Any]) -> Optional[SkillMetadata]:
             if not isinstance(spec_raw, dict):
                 continue
             
-            kind = spec_raw.get('kind', spec_raw.get('type', '')).lower()
+            kind = _normalize_kind(spec_raw.get('kind', spec_raw.get('type')))
             if not kind:
                 continue
             
@@ -113,7 +121,7 @@ def parse_metadata(frontmatter: Dict[str, Any]) -> Optional[SkillMetadata]:
                 module=spec_raw.get('module'),
                 url=spec_raw.get('url'),
                 archive=spec_raw.get('archive'),
-                extract=spec_raw.get('extract', False),
+                extract=parse_boolean_value(spec_raw.get('extract'), default=False),
                 strip_components=spec_raw.get('stripComponents'),
                 target_dir=spec_raw.get('targetDir'),
             )
@@ -127,8 +135,8 @@ def parse_metadata(frontmatter: Dict[str, Any]) -> Optional[SkillMetadata]:
             requires[key] = _normalize_string_list(value)
     
     return SkillMetadata(
-        always=meta_obj.get('always', False),
-        default_enabled=meta_obj.get('default_enabled', True),
+        always=parse_boolean_value(meta_obj.get('always'), default=False),
+        default_enabled=parse_boolean_value(meta_obj.get('default_enabled'), default=True),
         skill_key=meta_obj.get('skillKey'),
         primary_env=meta_obj.get('primaryEnv'),
         emoji=meta_obj.get('emoji'),
@@ -158,6 +166,13 @@ def _unwrap_metadata_namespace(metadata_raw: Dict[str, Any]) -> Dict[str, Any]:
     return metadata_raw
 
 
+def _normalize_kind(value: Any) -> str:
+    """Lower-cased kind string; "" for a missing or non-string YAML value."""
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
 def _normalize_string_list(value: Any) -> List[str]:
     """Normalize a value to a list of strings."""
     if not value:
@@ -179,7 +194,10 @@ def parse_boolean_value(value: Optional[str], default: bool = False) -> bool:
     
     if isinstance(value, bool):
         return value
-    
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
     if isinstance(value, str):
         return value.lower() in ('true', '1', 'yes', 'on')
     

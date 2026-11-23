@@ -17,19 +17,28 @@ Implementation note:
 """
 
 import asyncio
+import copy
 import os
 import re
 import threading
+from urllib.parse import urlparse
 
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel, check_prefix
+from channel.chat_message import safe_filename
 from channel.telegram.telegram_markdown import CAPTION_LIMIT, to_telegram_html
 from channel.telegram.telegram_message import TelegramMessage
+from common import state_dir
 from common.expired_dict import ExpiredDict
 from common.log import logger
+from common.markdown_fence import split_markdown
+from common.media_download import MAX_FILE_BYTES, download_to_file, remove_download
 from common.singleton import singleton
 from config import conf
+
+# send() runs on the shared reply thread; a stalled download must not block it.
+_MAX_REMOTE_FILE_SECONDS = 300
 
 # Bot command menu, aligned with Web slash commands.
 # Top-level commands only; sub-commands are entered with a space (e.g. "/skill list").
@@ -75,7 +84,7 @@ class TelegramChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.bot_token = conf().get("telegram_token", "")
+        self.bot_token = self.cfg("telegram_token", "")
         if not self.bot_token:
             err = "[Telegram] telegram_token is required"
             logger.error(err)
@@ -264,8 +273,7 @@ class TelegramChannel(ChatChannel):
             from bridge.bridge import Bridge
             agent_bridge = Bridge().get_agent_bridge()
             agent_id = agent_bridge.agent_router.resolve(
-                channel_type=self.channel_type,
-                conversation_ids=(session_id, str(update.effective_chat.id)),
+                explicit_agent_id=getattr(self, "bound_agent_id", "") or None,
             )
             scoped_session_id = agent_bridge._cancel_key(
                 agent_id, session_id, agent_bridge.agent_registry.default_agent_id
@@ -385,6 +393,8 @@ class TelegramChannel(ChatChannel):
                 context["receiver"] = str(chat.id)
                 context["telegram_chat_id"] = chat.id
                 context["telegram_reply_to_msg_id"] = message.message_id if is_group else None
+                from agent.team_addressing import stamp_speaker_from_channel
+                stamp_speaker_from_channel(self, context, tg_msg.content)
                 self.produce(context)
             logger.debug(f"[Telegram] received: type={ctype}, content={str(tg_msg.content)[:80]}")
 
@@ -441,6 +451,13 @@ class TelegramChannel(ChatChannel):
         try:
             f = await self._bot.get_file(file_id)
             tmp_dir = TelegramMessage.get_tmp_dir()
+            # The sender picks the document name, so it can carry a path
+            # separator ("sub/dir/x.pdf") and stop being one path component;
+            # reduce it first, like slack, discord and weixin do.
+            original_name = safe_filename(original_name)
+            # The suffix is cut from the same sender-controlled name.
+            ext = safe_filename((suffix or "").lstrip("."))
+            suffix = f".{ext}" if ext else ""
             base = original_name or f"{file_id}{suffix or ''}"
             # Prefix with file_id to avoid name collisions / weird chars
             safe_name = f"{file_id}_{base}" if original_name else base
@@ -483,10 +500,12 @@ class TelegramChannel(ChatChannel):
         """Check whether entities/caption_entities contain a @mention of the bot."""
         bot_at = "@" + bot_username.lower()
         text = (message.text or message.caption or "").lower()
-        if bot_at in text:
+        if re.search(re.escape(bot_at) + r"(?![A-Za-z0-9_])", text):
             return True
         # Also check entities strictly to support text_mention (no-username @)
-        for ent in (message.entities or []) + (message.caption_entities or []):
+        # PTB 22.x: entities is a tuple, caption_entities a list (or None) —
+        # concatenating them raises TypeError and aborts the whole handler.
+        for ent in list(message.entities or []) + list(message.caption_entities or []):
             if ent.type == "mention":
                 src = message.text or message.caption or ""
                 if src[ent.offset: ent.offset + ent.length].lower() == bot_at:
@@ -497,7 +516,7 @@ class TelegramChannel(ChatChannel):
         """Strip @bot_username from group text (case-insensitive)."""
         if not content or not self.bot_username:
             return content
-        pattern = re.compile(r"@" + re.escape(self.bot_username), re.IGNORECASE)
+        pattern = re.compile(r"@" + re.escape(self.bot_username) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
         return pattern.sub("", content).strip()
 
     @staticmethod
@@ -522,6 +541,7 @@ class TelegramChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 
@@ -569,6 +589,13 @@ class TelegramChannel(ChatChannel):
             logger.warning("[Telegram] no telegram_chat_id in context, drop reply")
             return
 
+        downloaded = None
+        if reply.type in (ReplyType.FILE, ReplyType.VIDEO) and isinstance(reply.content, str) \
+                and reply.content.startswith(("http://", "https://")):
+            reply, downloaded = self._download_file_reply(reply)
+            if reply is None:
+                return
+
         coro = self._async_send(reply, chat_id, reply_to)
         try:
             future = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -576,6 +603,30 @@ class TelegramChannel(ChatChannel):
             future.result(timeout=180)
         except Exception as e:
             logger.error(f"[Telegram] send failed: {e}")
+        finally:
+            remove_download(downloaded)
+
+    def _download_file_reply(self, reply: Reply):
+        """Fetch a remote file reply so it can be uploaded like a local one.
+
+        A file reply may carry an http(s) URL instead of a local path. Returns
+        ``(local_reply, temp_path)``, or ``(None, None)`` if the download failed.
+        """
+        url = reply.content
+        url_path = urlparse(url).path
+        path = state_dir.tmp_file("telegram_file", os.path.splitext(url_path)[1] or ".bin")
+        try:
+            download_to_file(url, path, MAX_FILE_BYTES, timeout=60,
+                             max_seconds=_MAX_REMOTE_FILE_SECONDS, guarded=True)
+        except Exception as e:
+            logger.error(f"[Telegram] failed to fetch remote file: {type(e).__name__}")
+            remove_download(path)
+            return None, None
+        local = copy.copy(reply)
+        local.content = "file://" + path
+        # The published URL's last segment is a random hash, not the user's file name.
+        local.file_name = getattr(reply, "file_name", "") or os.path.basename(url_path)
+        return local, path
 
     # Number of retries for transient network errors (proxy hiccups etc.)
     _SEND_RETRIES = 2
@@ -613,7 +664,7 @@ class TelegramChannel(ChatChannel):
         from telegram.constants import ParseMode
         from telegram.error import BadRequest
 
-        for chunk in _split_text(text, 4000):
+        for chunk in split_markdown(text, 4000):
             rendered = to_telegram_html(chunk)
             if not rendered:
                 continue
@@ -699,14 +750,14 @@ class TelegramChannel(ChatChannel):
                         )
                 await self._send_with_retry(_send_voice, label="send_voice")
 
-            elif rtype == ReplyType.FILE:
+            elif rtype in (ReplyType.FILE, ReplyType.VIDEO):
                 # Videos go through send_video, everything else through send_document
                 local = content[7:] if isinstance(content, str) and content.startswith("file://") else content
                 # File replies may carry an accompanying text caption
                 caption = getattr(reply, "text_content", None) or None
-                is_video = isinstance(local, str) and local.lower().endswith(
+                is_video = rtype == ReplyType.VIDEO or (isinstance(local, str) and local.lower().endswith(
                     (".mp4", ".mov", ".avi", ".mkv", ".webm")
-                )
+                ))
 
                 # Captions are capped far below a message, and an oversized one
                 # fails the upload itself. Anything too long follows separately.
@@ -717,16 +768,20 @@ class TelegramChannel(ChatChannel):
                 from telegram.constants import ParseMode
                 from telegram.error import BadRequest
 
+                file_name = getattr(reply, "file_name", None) or None
+
                 async def _send_file(cap, mode):
                     with open(local, "rb") as f:
                         if is_video:
                             return await self._bot.send_video(
                                 chat_id=chat_id, video=f, caption=cap, parse_mode=mode,
+                                filename=file_name,
                                 reply_to_message_id=reply_to_msg_id,
                                 allow_sending_without_reply=True,
                             )
                         return await self._bot.send_document(
                             chat_id=chat_id, document=f, caption=cap, parse_mode=mode,
+                            filename=file_name,
                             reply_to_message_id=reply_to_msg_id,
                             allow_sending_without_reply=True,
                         )
@@ -759,24 +814,3 @@ class TelegramChannel(ChatChannel):
 
         except Exception as e:
             logger.error(f"[Telegram] _async_send error: {e}", exc_info=True)
-
-
-def _split_text(text: str, limit: int):
-    """Split long text preferring line breaks to keep markdown structure intact."""
-    if len(text) <= limit:
-        yield text
-        return
-    buf = []
-    size = 0
-    for line in text.splitlines(keepends=True):
-        if size + len(line) > limit and buf:
-            yield "".join(buf)
-            buf, size = [], 0
-        # Hard-split single lines that exceed the limit
-        while len(line) > limit:
-            yield line[:limit]
-            line = line[limit:]
-        buf.append(line)
-        size += len(line)
-    if buf:
-        yield "".join(buf)

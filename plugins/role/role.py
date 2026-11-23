@@ -71,15 +71,15 @@ class Role(Plugin):
                         del self.tags[tag]
 
             if len(self.roles) == 0:
-                raise Exception("no role found")
+                raise ValueError("no role found")
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
             self.roleplays = {}
             logger.debug("[Role] inited")
         except Exception as e:
             if isinstance(e, FileNotFoundError):
-                logger.warn(f"[Role] init failed, {config_path} not found, ignore or see https://github.com/zhayujie/chatgpt-on-wechat/tree/master/plugins/role .")
+                logger.warn(f"[Role] init failed, {config_path} not found, ignore or see https://github.com/zhayujie/CowAgent/tree/master/plugins/role .")
             else:
-                logger.warn("[Role] init failed, ignore or see https://github.com/zhayujie/chatgpt-on-wechat/tree/master/plugins/role .")
+                logger.warn("[Role] init failed, ignore or see https://github.com/zhayujie/CowAgent/tree/master/plugins/role .")
             raise e
 
     def _load_role_file(self, filepath):
@@ -87,12 +87,16 @@ class Role(Plugin):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
                 role = json.load(f)
+            tags = role.get("tags", [])
+            if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+                raise ValueError("role tags must be a list of strings")
             title_lower = role["title"].lower()
             if title_lower in self.roles:
                 old_tags = self.roles[title_lower].get("tags", [])
                 for tag in old_tags:
                     if tag in self.tags:
-                        self.tags[tag][1] = [r for r in self.tags[tag][1] if r["title"].lower() != title_lower]
+                        description, members = self.tags[tag]
+                        self.tags[tag] = (description, [r for r in members if r["title"].lower() != title_lower])
                 logger.info(f"[Role] overridden: {role['title']}")
             self.roles[title_lower] = role
             for tag in role.get("tags", []):
@@ -133,6 +137,8 @@ class Role(Plugin):
             return
         bot = Bridge().get_bot("chat")
         content = e_context["context"].content[:]
+        if not content.strip():
+            return
         clist = e_context["context"].content.split(maxsplit=1)
         desckey = None
         customize = False
@@ -167,11 +173,11 @@ class Role(Plugin):
                     for role in self.tags[tag][1]:
                         help_text += f"{role['title']}: {role['remark']}\n"
                 else:
-                    help_text = f"未知角色类型。\n"
+                    help_text = "未知角色类型。\n"
                     help_text += "目前的角色类型有: \n"
                     help_text += "，".join([self.tags[tag][0] for tag in self.tags]) + "\n"
             else:
-                help_text = f"请输入角色类型。\n"
+                help_text = "请输入角色类型。\n"
                 help_text += "目前的角色类型有: \n"
                 help_text += "，".join([self.tags[tag][0] for tag in self.tags]) + "\n"
             reply = Reply(ReplyType.INFO, help_text)
@@ -204,6 +210,15 @@ class Role(Plugin):
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
         elif customize == True:
+            # The description is the whole point of this command, so an empty
+            # one is answered the way "$角色" answers a missing name (above).
+            # Reading clist[1] here would raise IndexError out of the handler,
+            # which the worker only logs, and the user would get no reply.
+            if len(clist) == 1:
+                reply = Reply(ReplyType.INFO, self.get_help_text(verbose=True))
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
             self.roleplays[sessionid] = RolePlay(bot, sessionid, clist[1], "%s")
             reply = Reply(ReplyType.INFO, f"角色设定为:\n{clist[1]}")
             e_context["reply"] = reply

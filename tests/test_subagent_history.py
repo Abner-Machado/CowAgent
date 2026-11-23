@@ -9,7 +9,7 @@ thing that is stored — the spawn call's result.
 
 import json
 
-from channel.web import web_channel
+from channel.web.api import sessions as sessions_api
 
 
 def _subagent_step(results, is_error=False):
@@ -29,7 +29,7 @@ def test_a_file_written_by_a_sub_agent_is_found_in_history(tmp_path, monkeypatch
         "agent.protocol.artifact.get_workspace_root", lambda: str(tmp_path)
     )
 
-    artifacts = web_channel._artifacts_from_steps([
+    artifacts = sessions_api._artifacts_from_steps([
         _subagent_step([{
             "task_index": 0,
             "subagent_type": "general-purpose",
@@ -49,7 +49,7 @@ def test_write_steps_still_produce_their_cards(tmp_path, monkeypatch):
         "agent.protocol.artifact.get_workspace_root", lambda: str(tmp_path)
     )
 
-    artifacts = web_channel._artifacts_from_steps([
+    artifacts = sessions_api._artifacts_from_steps([
         {"type": "tool", "name": "write", "arguments": {"path": str(note)}, "is_error": False}
     ])
 
@@ -57,7 +57,7 @@ def test_write_steps_still_produce_their_cards(tmp_path, monkeypatch):
 
 
 def test_a_failed_spawn_contributes_no_files(tmp_path):
-    artifacts = web_channel._artifacts_from_steps([
+    artifacts = sessions_api._artifacts_from_steps([
         _subagent_step([{"task_index": 0, "files": [str(tmp_path / "x.md")]}], is_error=True)
     ])
 
@@ -71,8 +71,8 @@ def test_a_step_whose_result_is_not_the_expected_shape_is_skipped():
         {"type": "tool", "name": "subagent"},
     ]
 
-    assert web_channel._artifacts_from_steps(steps) == []
-    web_channel._add_subagent_displays(steps)
+    assert sessions_api._artifacts_from_steps(steps) == []
+    sessions_api._add_subagent_displays(steps)
     assert all("display" not in step for step in steps)
 
 
@@ -85,7 +85,7 @@ def test_a_reloaded_page_shows_the_report_rather_than_the_json():
         "duration_seconds": 125.88,
     }])]
 
-    web_channel._add_subagent_displays(steps)
+    sessions_api._add_subagent_displays(steps)
 
     assert steps[0]["display"].startswith("### explore · 2m 6s")
     assert "Genspark raised $645M." in steps[0]["display"]
@@ -104,14 +104,14 @@ def test_a_session_recorded_before_files_were_listed_still_loads():
         "duration_seconds": 12.0,
     }])]
 
-    assert web_channel._artifacts_from_steps(steps) == []
-    web_channel._add_subagent_displays(steps)
+    assert sessions_api._artifacts_from_steps(steps) == []
+    sessions_api._add_subagent_displays(steps)
     assert "old news" in steps[0]["display"]
 
 
 def test_other_tools_are_left_alone():
     steps = [{"type": "tool", "name": "web_search", "result": json.dumps({"results": [1, 2]})}]
 
-    web_channel._add_subagent_displays(steps)
+    sessions_api._add_subagent_displays(steps)
 
     assert "display" not in steps[0]

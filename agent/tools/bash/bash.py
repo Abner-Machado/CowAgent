@@ -18,6 +18,7 @@ from agent.tools.bash.decode import decode_output
 from agent.tools.utils.truncate import truncate_tail, format_size, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES
 from common.log import logger
 from common.utils import expand_path
+from common.deployment import is_desktop
 
 
 class _Cancelled(Exception):
@@ -63,7 +64,7 @@ SAFETY:
             },
             "run_in_background": {
                 "type": "boolean",
-                "description": "Start the command and return immediately with a bash_id instead of waiting. For a process meant to keep running, such as a server or a watcher. A command that is merely slow should raise timeout instead, so you still get its output. No need to add '&' yourself. Background jobs keep running after the task ends unless you kill them."
+                "description": "Start the command and return immediately with a bash_id instead of waiting. Use this ONLY for a long-lived process that is meant to keep running, such as a server or a watcher. A command that is only slow should use a larger timeout rather than set this parameter, so its output comes back in the same call. No need to add '&' yourself. Background jobs keep running after the task ends unless you kill them."
             },
             "bash_id": {
                 "type": "string",
@@ -88,16 +89,105 @@ SAFETY:
         self.safety_mode = self.config.get("safety_mode", True)
         # Keep the template with the {cwd} placeholder so the description can be
         # re-rendered when the working directory changes (e.g. opening a project).
-        self._description_template = self.description
+        self.windows_shell = self.config.get("windows_shell", "cmd")
+        if self.windows_shell not in ("cmd", "pwsh"):
+            logger.warning(
+                "Invalid windows_shell %r; falling back to cmd", self.windows_shell
+            )
+            self.windows_shell = "cmd"
+            self.config["windows_shell"] = "cmd"
+        self._shell_changed = False
+        self._description_template = type(self).description
+        self._render_shell_description()
         # Desktop runs on the user's own machine (often non-technical users),
         # so require explicit confirmation for destructive ops outside the workspace.
-        if os.environ.get("COW_DESKTOP") == "1":
+        if is_desktop():
             self._description_template = self._description_template.replace(
                 "- For destructive commands out of workspace ({cwd}), explain and confirm first",
                 "- For delete or destructive operations on files out of workspace ({cwd}), "
                 "be cautious and confirm with the user before executing, unless the user explicitly requested it",
             )
         # Show the concrete workspace path so the model knows what "the workspace" is
+        self.description = self._description_template.replace("{cwd}", self.cwd)
+
+    def _render_shell_description(self):
+        if not self._IS_WIN:
+            return
+
+        if self.windows_shell == "pwsh":
+            platform = (
+                "PLATFORM: Windows (PowerShell 7 / pwsh). Use PowerShell syntax: "
+                "$env:NAME for environment variables, single or double quoted strings, "
+                "$null for redirection, and Select-String for text search. Do not use "
+                "cmd %VAR%, >nul, or Unix-only commands. Commands run without a profile, "
+                "with UTF-8 output and $ErrorActionPreference='Stop'; cmdlet errors stop "
+                "execution and return a nonzero exit code. Native process failures return "
+                "their exit code.\n"
+            )
+            self._description_template = self._description_template.replace(
+                "Use $VAR_NAME directly.", "Use $env:VAR_NAME."
+            )
+        else:
+            platform = (
+                "PLATFORM: Windows (cmd.exe), not Bash, WSL, PowerShell, or Windows Terminal. "
+                "Use cmd.exe syntax: double quotes (single quotes are literal), `>nul 2>&1` "
+                "instead of `/dev/null`, `&&` instead of `;`, and `findstr /I \"pattern\"` "
+                "without grep-style `-i`/`-e` flags. Do not invoke `bash script.sh` or use "
+                "Unix-only commands such as grep, head, tail, sed, or awk. Use the "
+                "search_files tool for file/content search and Python for portable scripting.\n"
+            )
+
+        if re.search(r"PLATFORM: Windows.*?\n", self._description_template):
+            self._description_template = re.sub(
+                r"PLATFORM: Windows.*?\n", lambda _match: platform,
+                self._description_template,
+            )
+        else:
+            self._description_template = self._description_template.replace(
+                "ENVIRONMENT:", platform + "ENVIRONMENT:", 1
+            )
+        self._description_template = self._description_template.replace(
+            "Execute a bash command", "Execute a command"
+        )
+
+    def runtime_shell_notice(self):
+        """Return a notice for PowerShell or a shell change, not default CMD."""
+        if not self._IS_WIN:
+            return ""
+        changed = self._shell_changed
+        self._shell_changed = False
+        if self.windows_shell == "cmd" and not changed:
+            return ""
+        if self.windows_shell == "pwsh":
+            notice = ("CURRENT COMMAND ENVIRONMENT: bash executes PowerShell 7 (pwsh). "
+                      "Use $env:NAME for environment variables, never %NAME%.")
+            if changed:
+                notice += (" Earlier CMD commands in this conversation belong to an old setting; "
+                           "generate all new commands using PowerShell syntax.")
+            return notice
+        return ("CURRENT COMMAND ENVIRONMENT: bash executes Windows cmd.exe. "
+                "Use %NAME% for environment variables, never $env:NAME. "
+                "Earlier PowerShell commands in this conversation belong to an old setting; "
+                "generate all new commands using CMD syntax.")
+
+    def refresh_runtime_config(self):
+        """Refresh at schema construction, so syntax and execution change together."""
+        from config import conf
+        selected = conf().get("tools", {}).get("bash", {}).get("windows_shell", "cmd")
+        if selected not in ("cmd", "pwsh"):
+            selected = "cmd"
+        if selected == self.windows_shell:
+            return
+        self._shell_changed = True
+        self.windows_shell = selected
+        self.config["windows_shell"] = selected
+        self._description_template = type(self).description
+        self._render_shell_description()
+        if is_desktop():
+            self._description_template = self._description_template.replace(
+                "- For destructive commands out of workspace ({cwd}), explain and confirm first",
+                "- For delete or destructive operations on files out of workspace ({cwd}), be cautious and confirm with the user before executing, unless the user explicitly requested it",
+            )
         self.description = self._description_template.replace("{cwd}", self.cwd)
 
     def set_cwd(self, cwd: str) -> None:
@@ -166,6 +256,12 @@ SAFETY:
             # Prepare environment with .env file variables
             env = os.environ.copy()
 
+            # The console connection belongs to this process. A child inheriting
+            # these would, if it started another instance, log in as the same
+            # client and take the connection over.
+            for _name in ("CLOUD_DEPLOYMENT_ID", "CLOUD_CLIENT_ID"):
+                env.pop(_name, None)
+
             # Anchor artifact outputs to the workspace/project dir regardless of
             # any `cd` inside the command, so tools (e.g. image-generation) can
             # resolve a stable output dir instead of relying on the live cwd.
@@ -196,7 +292,7 @@ SAFETY:
             if os.path.exists(env_file):
                 try:
                     from dotenv import dotenv_values
-                    dotenv_vars = dotenv_values(env_file)
+                    dotenv_vars = {key: value for key, value in dotenv_values(env_file).items() if value is not None}
                     env.update(dotenv_vars)
                     logger.debug(f"[Bash] Loaded {len(dotenv_vars)} variables from {env_file}")
                 except ImportError:
@@ -215,21 +311,40 @@ SAFETY:
             temp_script_path = None
 
             # On Windows, convert $VAR references to %VAR% for cmd.exe
+            user_command = command
             if self._IS_WIN:
                 env["PYTHONIOENCODING"] = "utf-8"
-                command = self._convert_env_vars_for_windows(command, dotenv_vars)
-                # cmd.exe has an ~8191 char command line limit. Long
-                # `python -c "..."` commands silently fail, so spill the inline
-                # code into a temp .py file and run that instead.
-                if len(command) > self._WIN_CMD_SAFE_LEN:
-                    command, temp_script_path = self._rewrite_long_python_c(command)
-                if command and not command.strip().lower().startswith("chcp"):
-                    command = f"chcp 65001 >nul 2>&1 && {command}"
+                if self.windows_shell == "pwsh":
+                    from agent.tools.bash.shell import prepare_pwsh
+                    # Convert only known injected shorthand, not PowerShell locals.
+                    for name in sorted(dotenv_vars, key=len, reverse=True):
+                        command = re.sub(r'\$' + re.escape(name) + r'\b', lambda m, n=name: '$env:' + n, command)
+                    user_command = command
+                    command, temp_script_path = prepare_pwsh(command)
+                else:
+                    command = self._convert_env_vars_for_windows(command, dotenv_vars)
+                    user_command = command
+                # cmd.exe stops at the first line feed and at ~8191 chars, so
+                # multi-line or long `python -c "..."` code is silently cut off.
+                # Spill the inline code into a temp .py file instead.
+                if self.windows_shell == "cmd" and (len(command) > self._WIN_CMD_SAFE_LEN or "\n" in command or "\r" in command):
+                    command, temp_script_path = self._rewrite_python_c(command)
+                if self.windows_shell == "cmd" and command and not command.strip().lower().startswith("chcp"):
+                    command = f"chcp 65001 >nul 2>&1 & {command}"
 
             if run_in_background:
                 # Ownership of temp_script_path passes to the registry - the
                 # process is still reading it, so it can only go once the job does.
-                job_id = background.start(command, self.cwd, env, temp_script_path)
+                try:
+                    job_id = background.start(command, self.cwd, env, temp_script_path)
+                except Exception:
+                    # The registry owns the spill only after a successful start.
+                    if temp_script_path:
+                        try:
+                            os.remove(temp_script_path)
+                        except OSError:
+                            pass
+                    raise
                 return ToolResult.success({
                     "output": (
                         f"Started in background (bash_id: {job_id}). "
@@ -239,6 +354,7 @@ SAFETY:
                     "bash_id": job_id,
                 })
 
+            files_before = self._snapshot_files(user_command)
             try:
                 result = self._run_streaming(
                     command,
@@ -258,8 +374,8 @@ SAFETY:
             logger.debug(f"[Bash] Stderr length: {len(result.stderr)}")
             
             # Workaround for exit code 126 with no output
-            if result.returncode == 126 and not result.stdout and not result.stderr:
-                logger.warning(f"[Bash] Exit 126 with no output - trying alternative execution method")
+            if isinstance(command, str) and result.returncode == 126 and not result.stdout and not result.stderr:
+                logger.warning("[Bash] Exit 126 with no output - trying alternative execution method")
                 # Try using argument list instead of shell=True
                 import shlex
                 try:
@@ -295,7 +411,7 @@ SAFETY:
                                     stdout='{"error": "图片无法解析", "reason": "该图片格式可能不受支持，或图片文件存在问题", "suggestion": "请尝试其他图片"}',
                                     stderr=''
                                 )
-                                logger.info(f"[Bash] Converted exit 126 to user-friendly image error message for vision skill")
+                                logger.info("[Bash] Converted exit 126 to user-friendly image error message for vision skill")
                 except Exception as retry_err:
                     logger.warning(f"[Bash] Retry failed: {retry_err}")
 
@@ -312,20 +428,20 @@ SAFETY:
 
             # Check if we need to save full output to temp file
             temp_file_path = None
-            total_bytes = len(output.encode('utf-8'))
+            truncation = truncate_tail(output)
 
-            if total_bytes > DEFAULT_MAX_BYTES:
+            if truncation.truncated:
                 # Save full output to temp file. encoding='utf-8' is required:
                 # the default text-mode encoding is the platform locale (e.g.
                 # cp936/GBK on Chinese Windows), which raises UnicodeEncodeError
                 # for output containing emoji or other non-locale characters and
                 # would discard an otherwise successful command result.
-                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log', prefix='bash-', encoding='utf-8') as f:
+                # newline='' writes the line breaks as the command printed
+                # them; on Windows, text mode turns each CRLF into CR CR LF.
+                with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.log', prefix='bash-', encoding='utf-8', newline='') as f:
                     f.write(output)
                     temp_file_path = f.name
 
-            # Apply tail truncation
-            truncation = truncate_tail(output)
             output_text = truncation.content or "(no output)"
 
             # Build result
@@ -351,10 +467,12 @@ SAFETY:
                     output_text += f"\n\n[Showing lines {start_line}-{end_line} of {truncation.total_lines} ({format_size(DEFAULT_MAX_BYTES)} limit). Full output: {temp_file_path}]"
 
             # Check exit code
-            is_error, note = exit_codes.interpret(command, result.returncode)
+            is_error, note = ((result.returncode != 0, None) if self._IS_WIN and self.windows_shell == "pwsh"
+                              else exit_codes.interpret(user_command, result.returncode))
             if is_error:
                 output_text += f"\n\nCommand exited with code {result.returncode}"
-                hint = self._windows_failure_hint(command)
+                hint = ("PowerShell 7 syntax: use $env:NAME, $null, and Select-String; cmdlet errors stop execution."
+                        if self._IS_WIN and self.windows_shell == "pwsh" else self._windows_failure_hint(user_command))
                 if hint:
                     output_text += f"\n\n{hint}"
                 return ToolResult.fail({
@@ -365,11 +483,16 @@ SAFETY:
             if note:
                 output_text += f"\n\n[Exit code {result.returncode}: {note}]"
 
-            return ToolResult.success({
+            payload = {}
+            files = self._files_written(user_command, files_before)
+            if files:
+                payload["files_written"] = files
+            payload.update({
                 "output": output_text,
                 "exit_code": result.returncode,
                 "details": details if details else None
             })
+            return ToolResult.success(payload)
 
         except _Cancelled:
             return ToolResult.fail("Command was stopped because the user cancelled the run.")
@@ -377,6 +500,27 @@ SAFETY:
             return ToolResult.fail(f"Error: Command timed out after {timeout} seconds")
         except Exception as e:
             return ToolResult.fail(f"Error executing command: {str(e)}")
+
+    def _snapshot_files(self, command: str) -> dict:
+        if not self.cwd:
+            return {}
+        try:
+            from agent.protocol.artifact import snapshot_command_files
+            return snapshot_command_files(command, self.cwd)
+        except Exception as e:
+            logger.debug(f"[Bash] file snapshot skipped: {e}")
+            return {}
+
+    def _files_written(self, command: str, before: dict) -> list:
+        """User-facing files the command created or changed, so they surface as outputs."""
+        if not self.cwd:
+            return []
+        try:
+            from agent.protocol.artifact import files_changed_by_command
+            return files_changed_by_command(command, self.cwd, before)
+        except Exception as e:
+            logger.debug(f"[Bash] changed-file scan skipped: {e}")
+            return []
 
     def _background_followup(self, bash_id: str, want_kill: bool) -> ToolResult:
         """Read from, or kill, an already-running background command."""
@@ -422,7 +566,7 @@ SAFETY:
     def _run_streaming(self, command: str, timeout: int, env: dict, dotenv_vars: dict):
         process = subprocess.Popen(
             command,
-            shell=True,
+            shell=isinstance(command, str),
             cwd=self.cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -538,15 +682,23 @@ SAFETY:
         for i, tok in enumerate(tokens):
             if tok != "rm":
                 continue
-            has_rf = False
+            has_r = False
+            has_f = False
             for j in range(i + 1, len(tokens)):
                 t = tokens[j]
-                if t.startswith("-") and "r" in t and "f" in t:
-                    has_rf = True
-                elif t in ("--recursive", "--force"):
+                if t in ("--recursive",):
+                    has_r = True
+                elif t in ("--force",):
+                    has_f = True
+                elif t.startswith("--"):
                     continue
+                elif t.startswith("-"):
+                    if "r" in t:
+                        has_r = True
+                    if "f" in t:
+                        has_f = True
                 elif t in ("/", "/*"):
-                    if has_rf:
+                    if has_r and has_f:
                         return "This command will delete the entire filesystem"
                     break
                 else:
@@ -557,7 +709,7 @@ SAFETY:
             return "This command can destroy disk data"
 
         # Power control - match only as a standalone word (\b enforces word boundary)
-        if re.search(r'\b(shutdown|reboot|halt|poweroff)\b', command.lower()):
+        if re.search(r'\b(shutdown|reboot|halt|poweroff|stop-computer|restart-computer)\b', command.lower()):
             return "This command will shut down or restart the system"
 
         return ""
@@ -612,42 +764,83 @@ SAFETY:
 
         return re.sub(r'\$\{(\w+)\}|\$(\w+)', replace_match, command)
 
-    @staticmethod
-    def _rewrite_long_python_c(command: str):
+    # [path\]<python|python3|py>[.exe] [interpreter flags] -c, followed by a
+    # quote, at the start of the command or right after an operator, so
+    # `tool.py -c "..."` and `echo python -c "..."` are left alone.
+    _PY_C_RE = re.compile(
+        r'(?:^|[&|(])\s*(?:"[^"\r\n]*[\\/]|"|[^\s"&|<>()]*[\\/])?'
+        r'(?:python3?|py)(?:\.exe)?"?'
+        r'(?:\s+(?:-[XW]\s*\S+|-(?!c\b)\S+))*\s+-c\s+(?=["\'])',
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _rewrite_python_c(cls, command: str):
         """
-        Rewrite `python -c "<code>"` into `python <tempfile>` to bypass the
-        cmd.exe command line length limit on Windows.
+        Move the code of `python -c "<code>"` into a temp .py file.
+
+        The file is loaded back through exec() under -c rather than run as a
+        script, so sys.path[0], sys.argv[0], the missing __file__ and the
+        `<string>` traceback filename all stay as with the original -c.
 
         Returns (new_command, temp_file_path). On any parse failure the original
         command and None are returned, so behavior is unchanged when unmatched.
         """
-        # Match: <python|python3|py> [flags] -c "<code>" (single or double quoted)
-        m = re.search(
-            r'^(?P<prefix>.*?\b(?:python3?|py)\b[^\n]*?\s-c\s+)'
-            r'(?P<quote>["\'])(?P<code>.*)(?P=quote)\s*(?P<suffix>.*)$',
-            command,
-            re.DOTALL,
-        )
+        m = cls._PY_C_RE.search(command)
         if not m:
             return command, None
 
-        quote = m.group("quote")
-        code = m.group("code")
-        # Reverse common shell-level escaping of the quote char inside the code.
-        code = code.replace("\\" + quote, quote)
+        quote = command[m.end()]
+        body_start = m.end() + 1
+        end = cls._closing_quote(command, body_start, quote)
+        if end < 0:
+            return command, None
+        code = command[body_start:end]
+        if quote == '"':
+            # Windows CRT argument parsing: a run of backslashes before a quote
+            # or the closing delimiter contributes half as many literal ones.
+            code = re.sub(r'(\\+)(?="|\Z)', lambda r: "\\" * (len(r.group(1)) // 2), code)
+        else:
+            code = code.replace("\\'", "'")
+        suffix = command[end + 1:].strip()
 
         try:
             fd, path = tempfile.mkstemp(suffix=".py", prefix="bash-pyc-")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
                 f.write(code)
         except OSError:
             return command, None
 
-        prefix = m.group("prefix")
-        # Drop the trailing "-c " from the prefix, keep the interpreter + flags.
-        interp = re.sub(r'\s-c\s+$', ' ', prefix).rstrip()
-        suffix = m.group("suffix").strip()
-        new_command = f'{interp} "{path}"'
+        # Hex keeps quote- and shell-sensitive path characters out of the loader.
+        path_hex = path.encode("utf-8").hex()
+        loader = (
+            "exec(compile((lambda f:(f.read(),f.close())[0])"
+            f"(open(bytes.fromhex('{path_hex}').decode('utf-8'),"
+            "encoding='utf-8')),'<string>','exec'))"
+        )
+        new_command = f'{command[:m.end()]}"{loader}"'
         if suffix:
             new_command += f' {suffix}'
         return new_command, path
+
+    @staticmethod
+    def _closing_quote(command: str, start: int, quote: str) -> int:
+        """Index of the quote that closes the -c code, or -1.
+
+        Take the first unescaped quote followed by whitespace, an operator or
+        the end of the command, so script arguments and a trailing
+        `&& echo "done"` stay outside the code. Fall back to the last unescaped
+        quote, which tolerates unescaped quotes inside the code.
+        """
+        last = -1
+        index = command.find(quote, start)
+        while index >= 0:
+            backslashes = 0
+            while index - backslashes - 1 >= start and command[index - backslashes - 1] == "\\":
+                backslashes += 1
+            if backslashes % 2 == 0:
+                if re.match(r'(?:\s|$|[&|<>])', command[index + 1:]):
+                    return index
+                last = index
+            index = command.find(quote, index + 1)
+        return last

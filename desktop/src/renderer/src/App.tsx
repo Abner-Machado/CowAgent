@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react'
 import { Routes, Route, useLocation, useNavigate } from 'react-router-dom'
-import { History, FolderTree } from 'lucide-react'
+import { History, FolderTree, Layers } from 'lucide-react'
 import NavRail from './layout/NavRail'
 import SessionList from './layout/SessionList'
 import WindowControls from './layout/WindowControls'
@@ -9,14 +9,20 @@ import LoginGate from './components/LoginGate'
 import { useBackend } from './hooks/useBackend'
 import { usePlatform } from './hooks/usePlatform'
 import { usePushPoll } from './hooks/usePushPoll'
+import { useSchedulerNotifyPoll } from './hooks/useSchedulerNotifyPoll'
 import { useUIStore } from './store/uiStore'
 import { useSessionStore } from './store/sessionStore'
 import { useWorkspaceStore } from './store/workspaceStore'
+import { guardDocEditors } from './store/docEditorStore'
 import WorkspacePanel from './components/WorkspacePanel'
 import Lightbox from './components/Lightbox'
+import ConfirmDialog from './components/ConfirmDialog'
 import { initUpdateListener } from './store/updateStore'
 import { useOnboardingStore } from './store/onboardingStore'
 import OnboardingWizard from './components/OnboardingWizard'
+import AddInstanceDialog from './components/instances/AddInstanceDialog'
+import RemoteProblem, { type RemoteProblemReason } from './components/instances/RemoteProblem'
+import { checkRemote, useInstanceStore } from './store/instanceStore'
 import apiClient from './api/client'
 import { t } from './i18n'
 import ChatPage from './pages/ChatPage'
@@ -27,6 +33,12 @@ import MemoryPage from './pages/MemoryPage'
 import ChannelsPage from './pages/ChannelsPage'
 import TasksPage from './pages/TasksPage'
 import LogsPage from './pages/LogsPage'
+import AgentsPage from './pages/AgentsPage'
+import ArtifactsPage from './pages/ArtifactsPage'
+import CustomPage, { CustomPageActions } from './pages/CustomPage'
+import MenuEditor from './components/MenuEditor'
+import { useAgentStore } from './store/agentStore'
+import { useMenuStore } from './store/menuStore'
 import { product } from '@product'
 
 const App: React.FC = () => {
@@ -49,6 +61,13 @@ const App: React.FC = () => {
   // whole build, so calling its hook conditionally is stable across renders.
   // eslint-disable-next-line react-hooks/rules-of-hooks
   const productRequiresAuth = product.auth ? product.auth.useRequiresAuth() : false
+  // Another computer or server this window drives; its own backend keeps
+  // running underneath but isn't waited for.
+  const instance = apiClient.getInstance()
+  const ready = !!instance || backend.status === 'ready'
+  const baseUrl = instance ? instance.url : backend.baseUrl
+  const [remoteProblem, setRemoteProblem] = useState<RemoteProblemReason | null>(null)
+  const [authAttempt, setAuthAttempt] = useState(0)
 
   useEffect(() => {
     if (backend.status === 'ready') apiClient.setBaseUrl(backend.baseUrl)
@@ -72,11 +91,23 @@ const App: React.FC = () => {
   // Once the backend is ready, check whether a web_password is set. If so and
   // this session isn't authenticated, show the login gate before the app.
   useEffect(() => {
-    if (backend.status !== 'ready') {
+    if (!ready) {
       setAuthState('checking')
       return
     }
     let cancelled = false
+    if (instance) {
+      setAuthState('checking')
+      setRemoteProblem(null)
+      void checkRemote(instance).then((problem) => {
+        if (cancelled) return
+        setRemoteProblem(problem)
+        if (!problem) setAuthState('ok')
+      })
+      return () => {
+        cancelled = true
+      }
+    }
     apiClient
       .authCheck()
       .then((res) => {
@@ -92,15 +123,67 @@ const App: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [backend.status, backend.baseUrl])
+  }, [ready, baseUrl, instance, authAttempt])
+
+  // A token can stop working while the app is open (the password was changed
+  // in a browser, or it expired). Confirm with the backend before showing the
+  // login screen: a request sent just before this client changed the password
+  // fails with the old token even though the new one is already in place.
+  useEffect(() => {
+    if (authState !== 'ok') return
+    let checking = false
+    apiClient.onUnauthorized(() => {
+      if (checking) return
+      checking = true
+      apiClient
+        .authCheck()
+        .then((res) => {
+          if (!(res.auth_required && !res.authenticated)) return
+          if (instance) {
+            apiClient.setAuthToken(null)
+            setRemoteProblem('auth_lost')
+            // Stops the pollers, which would keep hitting 401 behind the overlay.
+            setAuthState('checking')
+          } else setAuthState('need_login')
+        })
+        .catch(() => {})
+        .finally(() => {
+          checking = false
+        })
+    })
+    return () => apiClient.onUnauthorized(null)
+  }, [authState, instance])
+
+  // The address of the device driven from here now answers as another one:
+  // its token has been held back, and the app steps aside.
+  useEffect(() => {
+    if (!instance || authState !== 'ok') return
+    apiClient.onWrongDevice(() => {
+      setRemoteProblem('wrong_device')
+      setAuthState('checking')
+    })
+    return () => apiClient.onWrongDevice(null)
+  }, [authState, instance])
+
+  // The name the device in use goes by, for the switcher.
+  const noteDevice = useInstanceStore((s) => s.noteDevice)
+  useEffect(() => {
+    if (!ready || authState !== 'ok') return
+    apiClient
+      .getConfig()
+      .then((data) => noteDevice(data.device))
+      .catch(() => {})
+  }, [ready, authState, baseUrl, noteDevice])
 
   // First-run check: once the backend is ready, decide whether to show the
   // onboarding wizard. It's config-driven — shown whenever the chat model isn't
   // configured (and not dismissed earlier this session); no persisted flag.
   useEffect(() => {
-    if (backend.status !== 'ready' || authState !== 'ok') return
+    if (!ready || authState !== 'ok') return
     // An extension may opt out of the built-in setup wizard.
     if (product.onboarding?.enabled === false) return
+    // First-run setup is for this computer, not one driven from here.
+    if (instance) return
     let cancelled = false
     apiClient
       .getModels()
@@ -124,10 +207,29 @@ const App: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [backend.status, authState, maybeOpenOnboarding])
+  }, [ready, authState, instance, maybeOpenOnboarding])
+
+  // Load the team roster once the backend and auth are settled. This is
+  // best-effort: the store swallows every error and degrades to single-Agent,
+  // so a legacy backend (no /api/agents) or a transient failure never blocks
+  // the app — the team affordances simply stay hidden.
+  const refreshRoster = useAgentStore((s) => s.refresh)
+  useEffect(() => {
+    if (ready && authState === 'ok') void refreshRoster()
+  }, [ready, authState, baseUrl, refreshRoster])
+
+  // The menu the user arranged, shared with the web console. Until it answers
+  // the rail draws the last copy seen, or the built-in menu.
+  const loadMenu = useMenuStore((s) => s.load)
+  useEffect(() => {
+    if (ready && authState === 'ok') void loadMenu()
+  }, [ready, authState, baseUrl, loadMenu])
 
   // Poll for scheduler/push messages once the backend and auth are settled.
-  usePushPoll(backend.status === 'ready' && authState === 'ok')
+  usePushPoll(ready && authState === 'ok')
+  // Independently watch the global runs ledger so a scheduled task firing into a
+  // non-active session still notifies (usePushPoll only sees the open session).
+  useSchedulerNotifyPoll(ready && authState === 'ok')
 
   // A clicked OS notification asks us to open its session.
   useEffect(() => {
@@ -143,8 +245,11 @@ const App: React.FC = () => {
 
   // Handle app-menu / shortcut actions forwarded from the main process.
   useEffect(() => {
-    const off = window.electronAPI?.onMenuAction?.((action) => {
+    const off = window.electronAPI?.onMenuAction?.(async (action) => {
+      // Each of these leaves the current page, taking any open editor with it.
+      if (!(await guardDocEditors())) return
       if (action === 'new-chat') {
+        if (!(await useWorkspaceStore.getState().guardUnsavedEdit())) return
         useSessionStore.getState().newSession()
         navigate('/')
       } else if (action === 'open-settings') {
@@ -158,10 +263,23 @@ const App: React.FC = () => {
 
   const handleLangChange = useCallback(() => forceUpdate((n) => n + 1), [])
 
-  if (backend.status !== 'ready') {
+  if (instance && remoteProblem) {
+    return (
+      <>
+        <RemoteProblem
+          instance={instance}
+          reason={remoteProblem}
+          onRetry={() => setAuthAttempt((n) => n + 1)}
+        />
+        <AddInstanceDialog />
+      </>
+    )
+  }
+
+  if (!ready) {
     return (
       <StatusScreen
-        status={backend.status}
+        status={backend.status === 'error' ? 'error' : 'connecting'}
         error={backend.error}
         code={backend.code}
         path={backend.path}
@@ -188,12 +306,24 @@ const App: React.FC = () => {
   const showProductGate = !!(ProductGate && productRequiresAuth && !productAuthed)
 
   const isChat = location.pathname === '/'
+  const isArtifacts = location.pathname === '/artifacts'
   const showSessions = isChat && !sessionsCollapsed && !showProductGate
+  const titlebarButton = (active: boolean) =>
+    `titlebar-no-drag inline-flex items-center justify-center w-7 h-7 rounded-btn cursor-pointer transition-colors ${
+      active ? 'text-accent bg-accent-soft' : 'text-content-tertiary hover:text-content hover:bg-surface-2'
+    } ${isMac ? 'mt-1' : ''}`
+  const toggleArtifacts = async () => {
+    if (!(await guardDocEditors())) return
+    navigate(isArtifacts ? '/' : '/artifacts')
+  }
 
   return (
     <div className="flex h-screen overflow-hidden bg-base text-content">
       {onboardingOpen && <OnboardingWizard onDone={handleLangChange} />}
       <Lightbox />
+      <ConfirmDialog />
+      <AddInstanceDialog />
+      <MenuEditor />
       <NavRail onLangChange={handleLangChange} />
 
       {showSessions && <SessionList />}
@@ -214,16 +344,18 @@ const App: React.FC = () => {
             </button>
           )}
           <div className="flex-1 min-w-0" />
+          {!showProductGate && (
+            <div className={isMac ? 'mt-1' : ''}>
+              <CustomPageActions />
+            </div>
+          )}
+          {(isChat || isArtifacts) && !showProductGate && (
+            <button onClick={toggleArtifacts} title={t('menu_artifacts')} className={titlebarButton(isArtifacts)}>
+              <Layers size={16} />
+            </button>
+          )}
           {isChat && !showProductGate && (
-            <button
-              onClick={toggleWorkspace}
-              title={t('ws_toggle')}
-              className={`titlebar-no-drag inline-flex items-center justify-center w-7 h-7 rounded-btn cursor-pointer transition-colors ${
-                workspaceOpen
-                  ? 'text-accent bg-accent-soft'
-                  : 'text-content-tertiary hover:text-content hover:bg-surface-2'
-              } ${isMac ? 'mt-1' : ''}`}
-            >
+            <button onClick={toggleWorkspace} title={t('ws_toggle')} className={titlebarButton(workspaceOpen)}>
               <FolderTree size={16} />
             </button>
           )}
@@ -242,16 +374,19 @@ const App: React.FC = () => {
             <ProductGate onAuthenticated={() => setProductAuthed(true)} />
           ) : (
           <Routes>
-            <Route path="/" element={<ChatPage baseUrl={backend.baseUrl} />} />
-            <Route path="/knowledge" element={<KnowledgePage baseUrl={backend.baseUrl} />} />
-            <Route path="/memory" element={<MemoryPage baseUrl={backend.baseUrl} />} />
-            <Route path="/skills" element={<SkillsPage baseUrl={backend.baseUrl} />} />
-            <Route path="/channels" element={<ChannelsPage baseUrl={backend.baseUrl} />} />
-            <Route path="/tasks" element={<TasksPage baseUrl={backend.baseUrl} />} />
-            <Route path="/settings" element={<SettingsPage baseUrl={backend.baseUrl} onLangChange={handleLangChange} />} />
+            <Route path="/" element={<ChatPage baseUrl={baseUrl} />} />
+            <Route path="/artifacts" element={<ArtifactsPage />} />
+            <Route path="/knowledge" element={<KnowledgePage baseUrl={baseUrl} />} />
+            <Route path="/memory" element={<MemoryPage baseUrl={baseUrl} />} />
+            <Route path="/skills" element={<SkillsPage baseUrl={baseUrl} />} />
+            <Route path="/channels" element={<ChannelsPage baseUrl={baseUrl} />} />
+            <Route path="/agents" element={<AgentsPage baseUrl={baseUrl} />} />
+            <Route path="/tasks" element={<TasksPage baseUrl={baseUrl} />} />
+            <Route path="/settings" element={<SettingsPage baseUrl={baseUrl} onLangChange={handleLangChange} />} />
             {/* Legacy /models route now lives as a tab inside settings */}
-            <Route path="/models" element={<SettingsPage baseUrl={backend.baseUrl} onLangChange={handleLangChange} />} />
-            <Route path="/logs" element={<LogsPage baseUrl={backend.baseUrl} />} />
+            <Route path="/models" element={<SettingsPage baseUrl={baseUrl} onLangChange={handleLangChange} />} />
+            <Route path="/logs" element={<LogsPage baseUrl={baseUrl} />} />
+            <Route path="/m/:id" element={<CustomPage />} />
             {product.routes?.map((r) => (
               <Route key={r.path} path={r.path} element={r.element} />
             ))}

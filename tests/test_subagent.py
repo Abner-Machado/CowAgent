@@ -6,6 +6,7 @@ what a model happens to reply.
 """
 
 import json
+import os
 import shutil
 import threading
 import time
@@ -38,6 +39,10 @@ class _FakeParent:
     def __init__(self, tools, workspace_dir):
         self.tools = tools
         self.workspace_dir = workspace_dir
+        # The runner copies both onto the child so a sub agent cannot widen
+        # the session's reach. Unset here, as on a fresh Agent.
+        self.project_dir = None
+        self.permission_mode = None
         self.model = object()
         self.max_steps = 7
         self.max_context_tokens = 1234
@@ -86,7 +91,7 @@ def _capture_children(monkeypatch, reply="done"):
             self.extra_system_suffix = None
             built.append(self)
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             self.goal = goal
             self.clear_history = clear_history
             self.depth_seen = current_depth()
@@ -130,6 +135,88 @@ def test_user_template_can_replace_a_builtin(workspace):
     assert load_templates(str(workspace))["explore"].description == "Mine."
 
 
+@pytest.mark.parametrize("tools_header", ["tools: []\n", ""])
+def test_empty_tools_list_disables_tools_while_omission_inherits(tools_header):
+    template = parse_template(
+        "---\nname: text-only\ndescription: Answer without tools\n"
+        + tools_header
+        + "---\nAnswer the question.\n",
+        "fallback",
+        "test",
+    )
+    available = [_Tool("bash"), _Tool("write")]
+    inherits = not tools_header
+
+    assert template is not None
+    assert template.tools == (["*"] if inherits else [])
+    assert template.allows_all_tools() is inherits
+    assert template.inherits_skills() is inherits
+    assert template.select_tools(available) == (available if inherits else [])
+
+
+def test_bad_template_encoding_does_not_disable_valid_subagents(
+    spawn_tool, enabled, workspace, monkeypatch
+):
+    directory = workspace / "subagents"
+    directory.mkdir(parents=True)
+    invalid = directory / "00-broken.md"
+    invalid.write_bytes(b"---\nname: broken\ndescription: Bad encoding.\n---\n\xff\n")
+    (directory / "auditor.md").write_text(
+        "---\nname: auditor\ndescription: Review defects.\n---\nAudit carefully.\n",
+        encoding="utf-8",
+    )
+    built = _capture_children(monkeypatch)
+
+    # The description and execution both reload the entire directory. One
+    # undecodable file must not remove the valid types from either surface.
+    result = spawn_tool.execute({
+        "tasks": [
+            {"goal": "review", "subagent_type": "auditor"},
+            {"goal": "investigate", "subagent_type": "explore"},
+        ]
+    })
+    outcomes = json.loads(result.result)["results"]
+    assert result.success
+    assert "auditor: Review defects." in spawn_tool.description
+    assert "general-purpose:" in spawn_tool.description
+    assert [item["status"] for item in outcomes] == ["completed", "completed"]
+    assert {child.kwargs["description"] for child in built} == {
+        "sub agent (auditor)", "sub agent (explore)"
+    }
+    assert "broken" not in load_templates(str(workspace))
+    assert invalid.read_bytes().endswith(b"\xff\n")
+
+
+def test_an_unlistable_templates_dir_does_not_disable_subagents(
+    spawn_tool, enabled, workspace, monkeypatch
+):
+    """The sibling read is guarded (an undecodable file must not disable valid
+    types); the listdir that feeds it was not, so a directory that cannot be
+    listed -- permissions changed, a race with a delete -- raised out of
+    load_templates and out of execute, while the description degraded."""
+    directory = workspace / "subagents"
+    directory.mkdir(parents=True)
+    (directory / "auditor.md").write_text(
+        "---\nname: auditor\ndescription: Review defects.\n---\nAudit carefully.\n",
+        encoding="utf-8",
+    )
+
+    real_listdir = os.listdir
+
+    def unlistable(path):
+        if str(path) == str(directory):
+            raise PermissionError(13, "Permission denied")
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", unlistable)
+    _capture_children(monkeypatch)
+
+    result = spawn_tool.execute({"goal": "review", "subagent_type": "general-purpose"})
+
+    assert result.success
+    assert set(load_templates(str(workspace))) == {"general-purpose", "explore"}
+
+
 def test_the_shipped_guide_is_not_offered_as_a_type(workspace):
     """README.md sits in the same directory as real templates. Loading it would
     put a bogus type in front of the Agent on every turn."""
@@ -158,7 +245,12 @@ def test_the_repo_ships_a_guide_that_documents_the_real_format():
 
 @pytest.mark.parametrize(
     "language, marker",
-    [("en", "Independent work"), ("zh", "能整块交出去的独立工作")],
+    [
+        # Wording the tool listing does not also carry, or this would still
+        # pass with the rule itself deleted.
+        ("en", "needs deep research or broad information gathering"),
+        ("zh", "大范围信息采集的独立任务"),
+    ],
 )
 def test_the_prompt_tells_the_agent_when_to_delegate(language, marker):
     """Left to the tool description alone the model competes it against ~30
@@ -192,15 +284,16 @@ def test_the_tool_is_pitched_at_independent_work_not_at_a_step_count(workspace):
     handover of a whole task stopped research being delegated at all; a
     "more than N reads" trigger fires on ordinary work, and every firing costs
     a full model run the user waits through. The criterion is whether the work
-    is independent and self-contained."""
+    is self-contained and substantial enough to be worth handing over."""
     from agent.tools.subagent import SubagentTool
 
     description = SubagentTool(config={"cwd": str(workspace)}).description
     assert "whole task unchanged" not in description
     assert "three searches" not in description
     assert "self-contained" in description
-    assert "independent" in description.lower()
-    assert "normal work, not grounds to delegate" in description
+    assert "substantial research" in description
+    # Ordinary work stays with the caller; that has to be said, not implied.
+    assert "finish yourself directly" in description
 
 
 def test_the_shipped_example_is_inert_until_renamed(workspace):
@@ -397,20 +490,42 @@ def test_unknown_type_names_what_is_available(spawn_tool, enabled):
     assert "nope" in result.result and "general-purpose" in result.result
 
 
+@pytest.mark.parametrize("bad_type", [123, True, ["a"]], ids=["int", "bool", "list"])
+@pytest.mark.parametrize("as_tasks", [False, True], ids=["single", "tasks"])
+def test_a_non_string_type_is_reported_as_unknown_not_a_crash(spawn_tool, enabled, bad_type, as_tasks):
+    """The model quotes scalars the way _coerce_integer_args exists for.
+    goal/context are coerced in _collect_tasks; subagent_type was not, so a
+    non-string reached the unknown-type report and crashed it with a raw
+    TypeError -- sorted() across mixed types, then join() -- instead of
+    naming what was wrong and what the available types are."""
+    params = {"tasks": [{"goal": "go", "subagent_type": bad_type}]} if as_tasks \
+        else {"goal": "go", "subagent_type": bad_type}
+
+    result = spawn_tool.execute(params)
+
+    assert result.status == "error"
+    assert "general-purpose" in result.result
+    assert str(bad_type) in result.result
+
+
 def test_missing_goal_is_refused(spawn_tool, enabled):
     assert spawn_tool.execute({}).status == "error"
     assert spawn_tool.execute({"tasks": []}).status == "error"
 
 
 def test_a_task_that_overruns_its_budget_is_reported_not_dropped(parent, workspace, monkeypatch):
-    settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=0.2)
+    # A budget generous enough that a loaded CI runner still schedules the
+    # worker thread before it expires: the task never completes on its own
+    # (it waits on the cancel), so the timeout path is exercised regardless of
+    # the exact value — only too-small a budget makes `started` a flaky race.
+    settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=2.0)
     started = threading.Event()
 
     class _Hanging:
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             started.set()
             # Honour the cancel the runner sets on timeout, as a real run would.
             cancel_event.wait(timeout=5)
@@ -426,26 +541,64 @@ def test_a_task_that_overruns_its_budget_is_reported_not_dropped(parent, workspa
     assert "timeout_seconds" in results[0]["error"]
 
 
+def test_a_task_near_its_budget_is_asked_to_wrap_up(parent, workspace, monkeypatch):
+    """Work done before the deadline should come back as a report, not be
+    discarded with the timeout."""
+    settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=2.0)
+
+    class _Researching:
+        def __init__(self, **kwargs):
+            self.extra_system_suffix = None
+
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
+            while not cancel_event.is_set():
+                if steer_inbox.drain():
+                    return "partial findings"
+                time.sleep(0.01)
+            return ""
+
+    monkeypatch.setattr("agent.protocol.agent.Agent", _Researching)
+
+    results = run_tasks(parent, [SubagentTask(goal="research")], load_templates(str(workspace)), settings)
+
+    assert results[0]["status"] == "completed"
+    assert results[0]["summary"] == "partial findings"
+
+
 def test_a_timed_out_call_returns_without_waiting_for_the_worker(parent, workspace, monkeypatch):
     """Joining the abandoned thread would make the call overrun the very budget
     the timeout exists to enforce."""
     settings = SubagentSettings(enabled=True, max_depth=1, max_concurrent=2, timeout_seconds=0.2)
     release = threading.Event()
+    worker_finished = threading.Event()
+
+    def on_state(_index, state):
+        if state.get("status") in ("cancelled", "completed", "failed"):
+            worker_finished.set()
 
     class _Stuck:
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             release.wait(timeout=10)  # ignores the cancel, as a wedged run would
             return ""
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Stuck)
 
     started = time.time()
-    results = run_tasks(parent, [SubagentTask(goal="stuck")], load_templates(str(workspace)), settings)
+    results = run_tasks(
+        parent,
+        [SubagentTask(goal="stuck")],
+        load_templates(str(workspace)),
+        settings,
+        on_state=on_state,
+    )
     elapsed = time.time() - started
     release.set()
+    # run_tasks must return without joining, but the test must not leak its
+    # abandoned worker into the next test after monkeypatch restores Agent.
+    assert worker_finished.wait(timeout=5)
 
     assert results[0]["status"] == "timeout"
     assert elapsed < 5, f"run_tasks blocked for {elapsed:.1f}s waiting on the abandoned worker"
@@ -461,7 +614,7 @@ def test_siblings_do_not_share_tool_instances(parent, workspace, enabled, monkey
             self.tools = kwargs["tools"]
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             # Keep the objects alive, not their ids: a freed copy's address can
             # be handed straight back to the next allocation.
             seen.append({t.name: t for t in self.tools})
@@ -493,7 +646,7 @@ def test_a_sub_agent_gets_half_the_parents_step_budget(parent, workspace, enable
             seen.append(kwargs["max_steps"])
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             return "ok"
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Recording)
@@ -513,7 +666,7 @@ def test_a_failing_task_is_reported_as_failed(parent, workspace, enabled, monkey
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             raise RuntimeError("model unavailable")
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Exploding)
@@ -531,7 +684,7 @@ def test_all_tasks_failing_surfaces_as_a_tool_error(spawn_tool, enabled, monkeyp
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             raise RuntimeError("nope")
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Exploding)
@@ -624,7 +777,7 @@ def test_a_failed_sub_agent_closes_with_its_error(spawn_tool, enabled, monkeypat
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             raise RuntimeError("model unavailable")
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Exploding)
@@ -647,7 +800,7 @@ def test_a_sub_agent_that_overruns_its_budget_is_still_closed(spawn_tool, worksp
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             cancel_event.wait(timeout=5)
             return ""
 
@@ -677,7 +830,7 @@ def _child_emitting(monkeypatch, events_by_goal, reply="done"):
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             for event in events_by_goal.get(goal, []):
                 if on_event:
                     on_event(event)
@@ -853,7 +1006,7 @@ def test_a_conclusion_that_never_arrived_says_so(spawn_tool, enabled, monkeypatc
         def __init__(self, **kwargs):
             self.extra_system_suffix = None
 
-        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None):
+        def run_stream(self, goal, clear_history=False, cancel_event=None, on_event=None, steer_inbox=None):
             raise RuntimeError("model unavailable")
 
     monkeypatch.setattr("agent.protocol.agent.Agent", _Exploding)

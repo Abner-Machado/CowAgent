@@ -1,14 +1,35 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import * as electron from 'electron'
+
+const { contextBridge, ipcRenderer } = electron
+
+// webUtils.getPathForFile was added in Electron 32. The Win7 legacy build pins
+// Electron to 22, whose typings don't declare webUtils, so we look it up off
+// the runtime module instead of a static named import to keep tsc happy there.
+const webUtils = (electron as { webUtils?: { getPathForFile(file: File): string } }).webUtils
 
 contextBridge.exposeInMainWorld('electronAPI', {
   getBackendPort: () => ipcRenderer.invoke('get-backend-port'),
   getBackendStatus: () => ipcRenderer.invoke('get-backend-status'),
   getBackendError: () => ipcRenderer.invoke('get-backend-error'),
   getDataDir: () => ipcRenderer.invoke('get-data-dir') as Promise<string>,
+  getDesktopToken: () => ipcRenderer.invoke('get-desktop-token') as Promise<string>,
+  // Real on-disk path of a File picked or dropped by the user, so the local
+  // backend can read it directly instead of receiving the bytes over HTTP.
+  // '' for files with no path (e.g. a pasted clipboard image).
+  getPathForFile: (file: File): string => {
+    try {
+      return webUtils?.getPathForFile(file) || ''
+    } catch {
+      return ''
+    }
+  },
+  getLanAddresses: () => ipcRenderer.invoke('get-lan-addresses') as Promise<string[]>,
+  getHostName: () => ipcRenderer.invoke('get-host-name') as Promise<string>,
   restartBackend: () => ipcRenderer.invoke('restart-backend'),
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
   selectFile: (filters?: Electron.FileFilter[]) => ipcRenderer.invoke('select-file', filters),
   openPath: (targetPath: string) => ipcRenderer.invoke('open-path', targetPath) as Promise<string>,
+  revealPath: (targetPath: string) => ipcRenderer.invoke('reveal-path', targetPath) as Promise<void>,
 
   // Each listener registrar returns an unsubscribe fn so renderers can clean
   // up on unmount / effect re-run and avoid accumulating duplicate handlers.
@@ -50,6 +71,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Current app version (e.g. "0.0.5"), shown in the NavRail footer.
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
 
+  // Ask for OS-level microphone access (prompts once on macOS; true elsewhere).
+  requestMicAccess: () => ipcRenderer.invoke('mic-request-access') as Promise<boolean>,
+
   // Launch-at-login toggle (macOS + Windows). get returns the effective state;
   // set returns the real outcome so the UI can surface refusals/errors.
   getLoginItemEnabled: () => ipcRenderer.invoke('get-login-item') as Promise<boolean>,
@@ -60,13 +84,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
       error: string
     }>,
 
-  // Themes (bundled + user themes from ~/.cow/themes), assets inlined.
+  // Themes (bundled + user themes from <workspace>/system/themes), assets inlined.
   listThemes: () => ipcRenderer.invoke('themes-list') as Promise<Record<string, unknown>[]>,
   getThemesDir: () => ipcRenderer.invoke('themes-dir') as Promise<string>,
+  // Import a theme (.zip / folder / theme.json); shows a picker when no path.
+  importTheme: (opts: { path?: string; title?: string; overwrite?: boolean; reserved?: string[] }) =>
+    ipcRenderer.invoke('themes-import', opts),
   // Optional app config (first-run default theme + display name). Null in
   // the standard build.
   getAppConfig: () =>
-    ipcRenderer.invoke('app-config-get') as Promise<{ defaultTheme?: string; appName?: string } | null>,
+    ipcRenderer.invoke('app-config-get') as Promise<{
+      defaultTheme?: string
+      hiddenThemes?: string[]
+      appName?: string
+    } | null>,
 
   // Generic HTTPS relay via the main process (bypasses the renderer's CORS
   // restrictions for external endpoints). Optional extensions may use it.
@@ -88,6 +119,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   checkForUpdate: (lang?: string) => ipcRenderer.invoke('update-check', lang),
   downloadUpdate: (lang?: string) => ipcRenderer.invoke('update-download', lang),
   installUpdate: () => ipcRenderer.invoke('update-install'),
+  // Extra query parameters for the update feed URL; pass {} to clear.
+  setUpdateFeedQuery: (params: Record<string, string>) => ipcRenderer.invoke('update-feed-query', params),
   onUpdateStatus: (callback: (status: unknown) => void) => {
     const handler = (_event: unknown, status: unknown) => callback(status)
     ipcRenderer.on('update-status', handler)
@@ -100,13 +133,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   // Show a native OS notification; clicking it focuses the window and asks the
   // renderer (via onOpenSession) to open the given session.
-  notify: (payload: { title?: string; body?: string; sessionId?: string; silent?: boolean }) =>
+  notify: (payload: { title?: string; body?: string; sessionId?: string; silent?: boolean; force?: boolean }) =>
     ipcRenderer.invoke('notify', payload) as Promise<boolean>,
   onOpenSession: (callback: (sessionId: string) => void) => {
     const handler = (_event: unknown, sessionId: string) => callback(sessionId)
     ipcRenderer.on('open-session', handler)
     return () => ipcRenderer.removeListener('open-session', handler)
   },
+  setUnreadBadge: (count: number) => ipcRenderer.send('set-unread-badge', count),
 
   platform: process.platform,
   // OS UI language (e.g. "zh-CN"), read synchronously so the renderer can pick

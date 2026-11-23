@@ -1,0 +1,95 @@
+---
+title: subagent - Sub-Agent
+description: "How the subagent tool works: pick a built-in type or define your own in subagents/ as Markdown, restrict its tools, and let sub-agents run tasks in their own context and return only the result."
+---
+
+`subagent` lets the lead Agent create temporary execution units during a conversation, hand an independent task to one, and get the result back after it completes the task in its own context. For the functional effect and use cases, see [Sub-Agent](/multi-agent/subagent); this page covers the tool's types, configuration, and implementation details.
+
+## Built-in Types
+
+A type is chosen at creation time, and it determines the system prompt and the range of available tools:
+
+| Type | Use case | Tool range |
+| --- | --- | --- |
+| `general-purpose` | Multi-step tasks that need both investigation and action: search, read, run commands, write files | All of the lead Agent's tools (except the disabled ones) |
+| `explore` | Read-only investigation: find files, search code or documents, gather information from the web | `read`, `ls`, `search_files`, `web_search`, `web_fetch`, `vision`, `memory_search`, `memory_get` |
+
+## Custom Types
+
+Add a type by placing a `.md` file in the workspace's `subagents/` directory, in the same format as a skill:
+
+```markdown
+---
+name: research-report
+description: Reads a large amount of web material on a topic and returns a short, sourced report. Use it when you need to open many pages but only need the conclusion.
+tools: web_search, web_fetch, read, write
+---
+You are a research assistant. You receive one topic at a time and return a report.
+
+How to work:
+1. Search broadly first, then dig into the two or three most valuable sources.
+2. Prefer primary sources (official docs, vendor pricing pages, original announcements) over secondhand articles.
+3. Cross-check numbers, dates, and prices against a second source.
+
+Keep the report under 400 words, containing, in order:
+- Conclusion: two or three sentences answering the question
+- Findings: as a list, each item ending with a source URL
+- Unverified: anything that cannot be confirmed from a primary source
+
+Write "not found" for anything you cannot find; do not fill gaps with guesses.
+```
+
+Field reference:
+
+| Field | Description |
+| --- | --- |
+| `name` | The type name |
+| `description` | The lead Agent selects a type based on this, so it should describe "when to use it" rather than "what it is" |
+| `tools` | The available tools; omit it to inherit all of the lead Agent's tools |
+| Body | The sub-Agent's system prompt, describing how to work and what to return |
+
+Restricting `tools` is the most reliable constraint: a type that only has `read, ls, search_files` cannot modify any file. A type that specifies `tools` does not inherit skills; omit the field when skills are needed, and scope the work in the body instead.
+
+The first time a workspace starts, `README.md` and `example.md.template` are generated under `subagents/`; copy the latter to a `.md` file to enable it. Templates are re-read every turn, so a new file takes effect on the next message with no restart needed.
+
+<Tip>
+  Tool names are matched exactly, and the `tools` allowlist does not include MCP tools. Omit the field when MCP tools are needed.
+</Tip>
+
+## Disabled Tools
+
+The following tools are unavailable to all sub-Agents:
+
+| Tool | Reason |
+| --- | --- |
+| `send`, `scheduler` | Would send messages to a user channel or create tasks on behalf of the lead Agent, beyond the scope of a single task |
+| `env_config`, `evolution_undo` | Would modify the Agent's own configuration |
+| `subagent` | Prevents infinite recursion for types that expose all tools; the actual nesting depth is controlled by `max_depth` |
+
+## Configuration
+
+Sub-Agents are enabled by default. You can toggle them under "Config → Agent Config" in the Web console and desktop client, and a change takes effect on the next turn with no restart needed. Finer limits are adjusted in `config.json`:
+
+```json
+"subagent": {
+  "enabled": true,
+  "max_depth": 1,
+  "max_concurrent": 3,
+  "timeout_seconds": 300
+}
+```
+
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `enabled` | Whether sub-Agents are enabled | `true` |
+| `max_depth` | The nesting depth; `1` means only the lead Agent can create sub-Agents | `1` |
+| `max_concurrent` | The maximum number of sub-Agents running in parallel per call | `3` |
+| `timeout_seconds` | The total time limit for a single call, including all parallel tasks within it | `300` |
+
+## Implementation Design
+
+- **Context isolation**: a sub-Agent starts with an empty message history, does not load persona files, and is not connected to the memory manager. Only a single call record and the final conclusion remain in the main conversation.
+- **Parallel execution**: multiple tasks in a single call run in their own threads and share one time budget; multiple calls issued in the same turn also start at the same time.
+- **Halved step budget**: a sub-Agent's maximum step count is half that of the lead Agent. Its task scope is already well defined and does not need the same budget as a full conversation; when it runs out, it is asked to summarize what it has completed.
+- **Traceable timeouts**: a timed-out task is cancelled and marked as timed out, and the number of results always matches the number of tasks, so the lead Agent can tell "found nothing" apart from "did not finish".
+- **Presentation separate from context**: what is returned to the model is structured data, while what is shown to the user is a formatted report; both are generated from the same result, and the displayed content does not enter the model's context.

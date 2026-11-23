@@ -18,6 +18,7 @@ from agent.tools.mcp.tool_retrieval import (
     build_retrieval_query,
     cosine_similarity,
     select_mcp_tools,
+    select_mcp_tools_with_metadata,
 )
 from agent.tools.mcp.mcp_tool import McpTool
 
@@ -164,6 +165,49 @@ class TestSelectMcpTools(unittest.TestCase):
                                            already_selected=set()))
 
 
+class TestSelectMcpToolsMetadata(unittest.TestCase):
+
+    def setUp(self):
+        self.vectors = {
+            "a": [1.0, 0.0, 0.0],
+            "b": [0.0, 1.0, 0.0],
+            "c": [0.0, 0.0, 1.0],
+            "d": [0.9, 0.1, 0.0],
+        }
+
+    def test_returns_selection_and_ranking_metadata(self):
+        decision = select_mcp_tools_with_metadata(
+            [1.0, 0.0, 0.0], self.vectors, top_k=2
+        )
+
+        self.assertEqual(decision.selected, {"a", "d"})
+        ranked_names = [name for name, _score in decision.ranked]
+        self.assertEqual(ranked_names[:2], ["a", "d"])
+        self.assertEqual(set(ranked_names), set(self.vectors))
+        self.assertEqual(decision.candidate_count, 4)
+        self.assertIsNone(decision.fallback_reason)
+
+    def test_reports_fallback_reason(self):
+        decision = select_mcp_tools_with_metadata(
+            None, self.vectors, top_k=2, already_selected={"existing"}
+        )
+
+        self.assertEqual(decision.selected, {"existing"})
+        self.assertEqual(decision.fallback_reason, "missing_query_vector")
+        self.assertEqual(decision.ranked, [])
+
+    def test_rejects_non_finite_vectors(self):
+        decision = select_mcp_tools_with_metadata(
+            [1.0, 0.0], {"bad": [float("nan"), 1.0]}, top_k=1
+        )
+
+        self.assertEqual(decision.fallback_reason, "no_compatible_candidates")
+        self.assertEqual(decision.ranked, [])
+
+    def test_legacy_api_keeps_fallback_contract(self):
+        self.assertIsNone(select_mcp_tools(None, self.vectors, top_k=2))
+
+
 # --------------------------------------------------------------------------
 # Executor integration: AgentStream._select_tools_for_injection
 # --------------------------------------------------------------------------
@@ -179,11 +223,21 @@ class TestSelectToolsForInjection(unittest.TestCase):
         for i in range(mcp_count):
             name = f"mcp_{i}"
             tools[name] = _mcp_tool(name, f"tool number {i}")
-        return SimpleNamespace(
+        fake = SimpleNamespace(
             tools=tools,
             messages=[{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
             _retrieved_mcp_names=set(),
         )
+        fake.events = []
+        fake._emit_event = lambda event_type, data=None: fake.events.append({
+            "type": event_type,
+            "data": data or {},
+        })
+        from agent.protocol.agent_stream import AgentStreamExecutor
+        fake._emit_tool_retrieval_event = (
+            AgentStreamExecutor._emit_tool_retrieval_event.__get__(fake)
+        )
+        return fake
 
     def _call(self, fake_self):
         from agent.protocol.agent_stream import AgentStreamExecutor
@@ -212,13 +266,20 @@ class TestSelectToolsForInjection(unittest.TestCase):
         self.assertEqual(len(result), len(fake.tools))
 
     def test_degrade_no_provider_returns_all_tools(self):
-        """Maintainer scenario 2: no embedding provider → full injection."""
+        """Maintainer scenario 2: no embedding provider → full injection.
+
+        Fallback is diagnostic-only: it must degrade safely to full injection
+        and must NOT emit a client-facing ``tool_retrieval`` event (the reason
+        is logged for troubleshooting instead).
+        """
         fake = self._make_self(mcp_count=25)  # > threshold
         fake_tm = _FakeToolManager(tool_vectors={}, query_vectors=[None])
         with patch("config.conf", return_value=self._conf()), \
              patch("agent.tools.ToolManager", return_value=fake_tm):
             result = self._call(fake)
         self.assertEqual(len(result), len(fake.tools))
+        retrieval_events = [event for event in fake.events if event["type"] == "tool_retrieval"]
+        self.assertEqual(retrieval_events, [])
 
     def test_builtins_always_injected_and_set_grows(self):
         """Maintainer scenario 3: multi-turn MCP set only grows; builtins stay."""
@@ -247,6 +308,12 @@ class TestSelectToolsForInjection(unittest.TestCase):
         self.assertIn("mcp_0", names2)
         self.assertIn("mcp_1", names2)
         self.assertTrue(fake._retrieved_mcp_names >= {"mcp_0", "mcp_1"})
+        retrieval_events = [event for event in fake.events if event["type"] == "tool_retrieval"]
+        self.assertEqual(len(retrieval_events), 2)
+        self.assertEqual(retrieval_events[0]["data"]["mode"], "retrieved")
+        self.assertEqual(retrieval_events[0]["data"]["selected_tools"], ["mcp_0"])
+        self.assertEqual(retrieval_events[1]["data"]["selected_tools"], ["mcp_0", "mcp_1"])
+        self.assertEqual(retrieval_events[0]["data"]["candidate_count"], 25)
 
 
 if __name__ == "__main__":

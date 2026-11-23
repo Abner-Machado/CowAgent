@@ -1,10 +1,7 @@
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
-sys.modules.setdefault("regex", re)
 
 
 class _Bot:
@@ -141,7 +138,10 @@ def test_agent_bridge_maps_dashscope_qwen38_high_to_xhigh(monkeypatch):
     assert bot.kwargs["reasoning_effort"] == "xhigh"
 
 
-def test_agent_bridge_forces_dashscope_qwen38_thinking(monkeypatch):
+def test_agent_bridge_respects_dashscope_qwen38_thinking_off(monkeypatch):
+    # qwen3.8 is a hybrid thinking model, so turning the global toggle off must
+    # actually disable thinking (and not send an effort), letting users avoid
+    # the long xhigh reasoning pass.
     from config import conf
 
     monkeypatch.setitem(conf(), "enable_thinking", False)
@@ -150,8 +150,8 @@ def test_agent_bridge_forces_dashscope_qwen38_thinking(monkeypatch):
 
     model.call(_Request())
 
-    assert bot.kwargs["thinking"] == {"type": "enabled"}
-    assert bot.kwargs["reasoning_effort"] == "medium"
+    assert bot.kwargs["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in bot.kwargs
 
 
 def test_agent_bridge_forces_kimi_k3_thinking(monkeypatch):

@@ -1,16 +1,64 @@
+import hashlib
 import os
-import re
 
 import requests
 from dingtalk_stream import ChatbotMessage
 
 from bridge.context import ContextType
-from channel.chat_message import ChatMessage
+from channel.chat_message import ChatMessage, safe_filename
 # -*- coding=utf-8 -*-
 from common.log import logger
-from common.tmp_dir import TmpDir
 from common import state_dir
-from config import conf
+from common.media_download import MAX_FILE_BYTES, download_to_file
+
+
+def _extract_file_payload(event):
+    """Pull downloadCode/fileName out of a ChatbotMessage.
+
+    dingtalk_stream only parses text/picture/richText. File payloads land in
+    event.extensions["content"] as a dict with downloadCode and fileName.
+    """
+    content = None
+    extensions = getattr(event, "extensions", None) or {}
+    if isinstance(extensions, dict):
+        content = extensions.get("content") or extensions.get("file")
+    if not isinstance(content, dict):
+        raw = getattr(event, "content", None)
+        content = raw if isinstance(raw, dict) else None
+    if not isinstance(content, dict):
+        return None, None
+    download_code = content.get("downloadCode") or content.get("download_code")
+    file_name = (
+        content.get("fileName")
+        or content.get("file_name")
+        or content.get("filename")
+        or content.get("name")
+    )
+    return download_code, file_name
+
+
+def _media_filename(file_hash, file_name, default_ext):
+    safe = safe_filename(file_name) if file_name else ""
+    if safe:
+        return f"{file_hash}_{safe}"
+    ext = default_ext or ".bin"
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+    return f"{file_hash}{ext}"
+
+
+def _dingtalk_download_url(event, image_download_handler, download_code):
+    if not download_code:
+        return None
+    url = None
+    if image_download_handler is not None and hasattr(image_download_handler, "get_image_download_url"):
+        url = image_download_handler.get_image_download_url(download_code)
+    if url:
+        return url
+    robot_code = getattr(event, "robot_code", None)
+    if robot_code:
+        return f"dingtalk://download/{robot_code}:{download_code}"
+    return None
 
 
 class DingTalkMessage(ChatMessage):
@@ -94,9 +142,45 @@ class DingTalkMessage(ChatMessage):
                 self.content = "\n".join(content_parts) if content_parts else "[富文本消息]"
                 logger.info(f"[DingTalk] Received richText with {len(image_paths)} image(s): {self.content}")
             else:
-                self.ctype = ContextType.IMAGE
-                self.content = "[未找到图片]"
-                logger.debug(f"[DingTalk] messageType: {self.message_type}, imageList isEmpty")
+                # A richText message may be pure formatted text: the image list is
+                # empty, but the text still has to reach the agent. An IMAGE context
+                # without image_path is consumed and dropped by the channel, so
+                # keeping the placeholder here would answer the user with nothing.
+                text_content = ""
+                if self.message_type == 'richText' and self.rich_text_content:
+                    text_list = event.get_text_list()
+                    if text_list:
+                        text_content = "".join(text_list).strip()
+
+                if text_content:
+                    self.ctype = ContextType.TEXT
+                    self.content = text_content
+                    logger.info(f"[DingTalk] Received richText without images: {self.content}")
+                else:
+                    self.ctype = ContextType.IMAGE
+                    self.content = "[未找到图片]"
+                    logger.debug(f"[DingTalk] messageType: {self.message_type}, imageList isEmpty")
+
+        elif self.message_type == "file":
+            self.ctype = ContextType.FILE
+            self.file_path = None
+            download_code, file_name = _extract_file_payload(event)
+            download_url = _dingtalk_download_url(event, image_download_handler, download_code)
+            tmp_dir = str(state_dir.tmp_dir())
+            file_path = download_image_file(
+                download_url, tmp_dir, file_name=file_name, default_ext=".bin"
+            )
+            if file_path:
+                self.content = file_path
+                self.file_path = file_path
+                logger.info(f"[DingTalk] Downloaded file to {file_path}")
+            else:
+                self.content = "[文件下载失败]"
+                logger.warning("[DingTalk] Failed to download file message")
+        else:
+            self.ctype = None
+            self.content = None
+            logger.warning(f"[DingTalk] unsupported message type: {self.message_type}")
 
         if self.is_group:
             self.from_user_id = event.conversation_id
@@ -109,13 +193,17 @@ class DingTalkMessage(ChatMessage):
         self.other_user_nickname = event.conversation_title
 
 
-def download_image_file(image_url, temp_dir):
+def download_image_file(image_url, temp_dir, file_name=None, default_ext=".png"):
     """
     下载图片文件
     支持两种方式：
     1. 普通 HTTP(S) URL
     2. 钉钉 downloadCode: dingtalk://download/{download_code}
     """
+    if not image_url or not isinstance(image_url, str):
+        logger.error("[DingTalk] Empty download URL")
+        return None
+
     # 检查临时目录是否存在，如果不存在则创建
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
@@ -185,24 +273,13 @@ def download_image_file(image_url, temp_dir):
                         logger.error(f"[DingTalk] No downloadUrl in response: {download_data}")
                         return None
                     
-                    # 从 downloadUrl 下载实际图片
-                    image_response = requests.get(download_url, stream=True, timeout=60)
-                    
-                    if image_response.status_code == 200:
-                        # 生成文件名（使用 download_code 的 hash，避免特殊字符）
-                        import hashlib
-                        file_hash = hashlib.md5(actual_download_code.encode()).hexdigest()[:16]
-                        file_name = f"{file_hash}.png"
-                        file_path = os.path.join(temp_dir, file_name)
-                        
-                        with open(file_path, 'wb') as file:
-                            file.write(image_response.content)
-                        
-                        logger.info(f"[DingTalk] Image downloaded successfully: {file_path}")
-                        return file_path
-                    else:
-                        logger.error(f"[DingTalk] Failed to download image from URL: {image_response.status_code}")
-                        return None
+                    # 生成文件名（使用 download_code 的 hash，避免特殊字符）
+                    file_hash = hashlib.md5(actual_download_code.encode()).hexdigest()[:16]
+                    dest_name = _media_filename(file_hash, file_name, default_ext)
+                    file_path = os.path.join(temp_dir, dest_name)
+                    download_to_file(download_url, file_path, MAX_FILE_BYTES, timeout=60)
+                    logger.info(f"[DingTalk] Downloaded media to {file_path}")
+                    return file_path
                 else:
                     logger.error(f"[DingTalk] Failed to get download URL: {download_response.status_code}, {download_response.text}")
                     return None
@@ -221,20 +298,15 @@ def download_image_file(image_url, temp_dir):
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36'
         }
         
+        # The remote basename is not unique across messages; the signed URL is.
+        file_hash = hashlib.md5(image_url.encode()).hexdigest()[:16]
+        dest_name = _media_filename(
+            file_hash, file_name or image_url.split("/")[-1].split("?")[0], default_ext,
+        )
+        file_path = os.path.join(temp_dir, dest_name)
         try:
-            response = requests.get(image_url, headers=headers, stream=True, timeout=60 * 5)
-            if response.status_code == 200:
-                # 生成文件名
-                file_name = image_url.split("/")[-1].split("?")[0]
-                
-                # 将文件保存到临时目录
-                file_path = os.path.join(temp_dir, file_name)
-                with open(file_path, 'wb') as file:
-                    file.write(response.content)
-                return file_path
-            else:
-                logger.info(f"[Dingtalk] Failed to download image file, {response.content}")
-                return None
+            download_to_file(image_url, file_path, MAX_FILE_BYTES, headers=headers, timeout=60 * 5)
+            return file_path
         except Exception as e:
             logger.error(f"[Dingtalk] Exception downloading image: {e}")
             return None

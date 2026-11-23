@@ -1,6 +1,6 @@
 ---
 title: 功能介绍
-description: CowAgent 长期记忆、个人知识库、任务规划、技能系统、CLI 命令、浏览器工具详细说明
+description: "CowAgent 核心功能一览：三层长期记忆与梦境蒸馏、自主进化、个人知识库与知识图谱、任务规划与工具调用、定时任务、技能系统、命令行和浏览器操作，每项附示例截图和详细文档入口。"
 ---
 
 ## 1. 长期记忆
@@ -146,3 +146,19 @@ cow install-browser    # 安装浏览器工具
 详细命令参考 [命令总览](https://docs.cowagent.ai/cli)。
 
 <img src="https://cdn.link-ai.tech/doc/20260401114549.png" width="750" />
+
+## 6. 多智能体团队
+
+CowAgent 不止是一个 Agent，你可以创建多个 Agent 组成团队，每个成员有自己的职责、模型、技能与知识，工作空间和记忆互相隔离，既能独立工作，也能被拉进同一会话协作。通道可绑定单个 Agent 或整个团队对外服务，轻松搭建一支数字员工团队。
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/e0750df7b766ee63dfb341e30e181859.png" width="800" />
+</Frame>
+
+在群聊会话中，多个 Agent 可以共同参与：通过 `@` 指定成员回答，或由主 Agent 自动**委派**任务给更合适的成员处理，再统一汇总回复。此外，主 Agent 还可临时创建**子 Agent** 并行处理独立子任务，只返回结论、不占用主对话上下文。
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/20260908194946.png" width="800" />
+</Frame>
+
+详细说明请参考 [Agent 团队](/zh/multi-agent/team)、[任务委派](/zh/tools/delegate) 和 [子 Agent](/zh/multi-agent/subagent)。

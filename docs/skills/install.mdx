@@ -1,9 +1,16 @@
 ---
 title: Install Skills
-description: Install skills from multiple sources with a single command
+description: "Install skills with one command from the Skill Hub, GitHub, ClawHub or any URL (zip or SKILL.md), or add them from the market or by local upload with a preview in the web console and desktop app."
 ---
 
 CowAgent supports installing skills from [Cow Skill Hub](https://skills.cowagent.ai/), GitHub, ClawHub, LinkAI, and any URL via a unified `install` command. Use `/skill install` in chat or `cow skill install` in the terminal.
+
+You can also add skills from the Capabilities page in the web console and desktop app. Click **Add skill**, then either:
+
+- **From a market**: pick Cow Skill Hub or ClawHub and enter the skill name, or pick GitHub and enter a repository or folder URL.
+- **Upload**: drop in a `.zip` / `.tar.gz` archive, a `SKILL.md`, or a whole skill folder.
+
+The skill is fetched first and shown for review (its `SKILL.md`, file list, and whether it would replace an installed skill). Nothing is installed until you confirm.
 
 ## From the Skill Hub
 
@@ -31,15 +38,22 @@ All [ClawHub](https://clawhub.ai/) skills (40k+) can be installed with a single 
 /skill install clawhub:<name>
 ```
 
+ClawHub skill names are only unique per publisher. When several publishers share a name, include the publisher or use the skill's page URL:
+
+```text
+/skill install clawhub:steipete/gog
+/skill install https://clawhub.ai/steipete/skills/gog
+```
+
 ## From LinkAI
 
-All public resources on [LinkAI](https://link-ai.tech/console) (10k+ apps / workflows / plugins), as well as your own resources (apps, workflows, knowledge bases, databases, plugins), can be installed via:
+All public resources on [LinkAI](https://link-ai.tech/console?utm_source=cowagent&utm_medium=docs&utm_campaign=skills-install) (10k+ apps / workflows / plugins), as well as your own resources (apps, workflows, knowledge bases, databases, plugins), can be installed via:
 
 ```text
 /skill install linkai:<code>
 ```
 
-> Every resource created on the LinkAI platform has a unique `code`. Find it on each resource's page in the [console](https://link-ai.tech/console).
+> Every resource created on the LinkAI platform has a unique `code`. Find it on each resource's page in the [console](https://link-ai.tech/console?utm_source=cowagent&utm_medium=docs&utm_campaign=skills-install).
 
 ## From URL
 

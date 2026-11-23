@@ -79,7 +79,7 @@ if (process.platform === 'darwin') {
   // Sign the backend binaries here, but do NOT notarize in CI: Apple's notary
   // service routinely keeps this large PyInstaller bundle "In Progress" for
   // hours, which no CI job can afford to block on. Notarization is decoupled
-  // into a manual local step (build/notarize-dmg.sh) run after the CI produces
+  // into a manual local step run after the CI produces
   // the signed dmg. The dmg is code-signed and hardened-runtime enabled here,
   // so it only needs the notarization ticket stapled afterwards.
   config.mac = { ...config.mac, binaries, notarize: false }

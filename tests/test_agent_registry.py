@@ -11,7 +11,7 @@ def test_legacy_config_synthesizes_default_agent(tmp_path):
 
     profile = registry.get()
     assert profile.id == "default"
-    assert profile.name == "Default"
+    assert profile.name == "CowAgent"
     assert profile.workspace_path == workspace.resolve()
     assert registry.default_agent_id == "default"
 

@@ -2,7 +2,7 @@
 
 import requests
 import json
-from common import const
+from common import const, utils
 from models.bot import Bot
 from models.session_manager import SessionManager
 from bridge.context import ContextType
@@ -10,9 +10,6 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from config import conf
 from models.baidu.baidu_wenxin_session import BaiduWenxinSession
-
-BAIDU_API_KEY = conf().get("baidu_wenxin_api_key")
-BAIDU_SECRET_KEY = conf().get("baidu_wenxin_secret_key")
 
 class BaiduWenxinBot(Bot):
 
@@ -66,12 +63,13 @@ class BaiduWenxinBot(Bot):
                         reply = Reply(ReplyType.TEXT, reply_content)
                 return reply
             elif context.type == ContextType.IMAGE_CREATE:
-                ok, retstring = self.create_img(query, 0)
-                reply = None
-                if ok:
-                    reply = Reply(ReplyType.IMAGE_URL, retstring)
-                else:
-                    reply = Reply(ReplyType.ERROR, retstring)
+                # The Wenxin API has no image-generation backend in this project,
+                # so this class has no create_img(). The image-create prefix used
+                # to call it anyway and raise AttributeError, which the channel
+                # worker logs and swallows -- the user got no reply at all.
+                # Answer with the same "unsupported type" error the other
+                # text-only bots return.
+                reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
                 return reply
 
     def reply_text(self, session: BaiduWenxinSession, retry_count=0):
@@ -90,7 +88,7 @@ class BaiduWenxinBot(Bot):
                 'Content-Type': 'application/json'
             }
             payload = {'messages': session.messages, 'system': self.prompt} if self.prompt_enabled else {'messages': session.messages}
-            response = requests.request("POST", url, headers=headers, data=json.dumps(payload))
+            response = requests.request("POST", url, headers=headers, data=json.dumps(payload), timeout=180)
             response_text = json.loads(response.text)
             logger.info(f"[BAIDU] response text={response_text}")
             res_content = response_text["result"]
@@ -103,11 +101,10 @@ class BaiduWenxinBot(Bot):
                 "content": res_content,
             }
         except Exception as e:
-            need_retry = retry_count < 2
-            logger.warn("[BAIDU] Exception: {}".format(e))
-            need_retry = False
+            error = utils.scrub_secrets(e)
+            logger.warn("[BAIDU] Exception: {}".format(error))
             self.sessions.clear_session(session.session_id)
-            result = {"total_tokens": 0, "completion_tokens": 0, "content": "出错了: {}".format(e)}
+            result = {"total_tokens": 0, "completion_tokens": 0, "content": "出错了: {}".format(error)}
             return result
 
     def get_access_token(self):
@@ -116,5 +113,5 @@ class BaiduWenxinBot(Bot):
         :return: access_token，或是None(如果错误)
         """
         url = "https://aip.baidubce.com/oauth/2.0/token"
-        params = {"grant_type": "client_credentials", "client_id": BAIDU_API_KEY, "client_secret": BAIDU_SECRET_KEY}
-        return str(requests.post(url, params=params).json().get("access_token"))
+        params = {"grant_type": "client_credentials", "client_id": conf().get("baidu_wenxin_api_key"), "client_secret": conf().get("baidu_wenxin_secret_key")}
+        return str(requests.post(url, params=params, timeout=180).json().get("access_token"))

@@ -1,6 +1,6 @@
 {
   "name": "cowagent-desktop",
-  "version": "2.1.6",
+  "version": "2.2.2",
   "description": "CowAgent Desktop Client - AI Agent on your desktop",
   "main": "dist/main/index.js",
   "author": "CowAgent",
@@ -80,7 +80,10 @@
       "notarize": false,
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "extendInfo": {
-        "NSMicrophoneUsageDescription": "Used for voice input in chat: record a short clip and transcribe it via the configured speech recognition provider."
+        "NSMicrophoneUsageDescription": "Used for voice input in chat: record a short clip and transcribe it via the configured speech recognition provider.",
+        "NSCameraUsageDescription": "Used to capture a photo or short video clip to send as an attachment in chat.",
+        "NSCalendarsFullAccessUsageDescription": "Used to let the agent read and create calendar events you ask it to manage.",
+        "NSRemindersUsageDescription": "Used to let the agent read and create reminders you ask it to manage."
       },
       "target": [
         "dmg",

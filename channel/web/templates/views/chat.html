@@ -1,0 +1,276 @@
+                <!-- ====================================================== -->
+                <!-- VIEW: Chat                                              -->
+                <!-- ====================================================== -->
+                <div id="view-chat" class="view active">
+                  <div id="chat-main" class="chat-main relative">
+                    <!-- Messages -->
+                    <div id="chat-messages" class="flex-1 overflow-y-auto">
+                        <!-- Welcome Screen -->
+                        <div id="welcome-screen" class="flex flex-col items-center justify-center h-full px-6 pb-16" style="padding-top: 6vh">
+                            <img src="/assets/logo.jpg" alt="CowAgent" class="w-16 h-16 rounded-2xl mb-6 shadow-lg shadow-primary-500/20">
+                            <h1 id="welcome-title" class="text-2xl font-bold text-slate-800 dark:text-slate-100 mb-3">CowAgent</h1>
+                            <p id="welcome-subtitle" class="text-slate-500 dark:text-slate-400 text-center max-w-lg mb-10 leading-relaxed"
+                               data-i18n-html="welcome_subtitle">我可以帮你解答问题、管理计算机、创造和执行技能，并通过<br>长期记忆和知识库不断成长</p>
+
+                            <div class="grid grid-cols-2 sm:grid-cols-3 gap-3 w-full max-w-2xl">
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-blue-50 dark:bg-blue-900/30 flex items-center justify-center">
+                                            <i class="fas fa-folder-open text-blue-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_sys_title">系统管理</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_sys_text">查看工作空间里有哪些文件</p>
+                                </div>
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-amber-50 dark:bg-amber-900/30 flex items-center justify-center">
+                                            <i class="fas fa-clock text-amber-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_task_title">定时任务</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_task_text">1分钟后提醒我检查服务器</p>
+                                </div>
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center">
+                                            <i class="fas fa-code text-emerald-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_code_title">编程助手</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_code_text">搜索AI资讯并生成可视化网页报告</p>
+                                </div>
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-violet-50 dark:bg-violet-900/30 flex items-center justify-center">
+                                            <i class="fas fa-book text-violet-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_knowledge_title">知识库</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_knowledge_text">查看知识库当前文档情况</p>
+                                </div>
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-rose-50 dark:bg-rose-900/30 flex items-center justify-center">
+                                            <i class="fas fa-puzzle-piece text-rose-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_skill_title">技能系统</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_skill_text">查看所有支持的工具和技能</p>
+                                </div>
+                                <div class="example-card group bg-panel border border-slate-200 dark:border-white/10 rounded-xl p-4
+                                            cursor-pointer hover:border-primary-300 dark:hover:border-primary-600 hover:shadow-md transition-all duration-200"
+                                     data-send="/help">
+                                    <div class="flex items-center gap-2 mb-2">
+                                        <div class="w-7 h-7 rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center">
+                                            <i class="fas fa-terminal text-slate-500 text-xs"></i>
+                                        </div>
+                                        <span class="font-medium text-sm text-slate-700 dark:text-slate-200" data-i18n="example_web_title">指令中心</span>
+                                    </div>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 leading-relaxed" data-i18n="example_web_text">查看全部命令</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Scroll-to-bottom control follows the entire composer stack. -->
+                    <button id="scroll-to-bottom-btn" type="button" class="chat-scroll-to-bottom hidden" data-i18n-title="chat_scroll_to_bottom" data-i18n-aria-label="chat_scroll_to_bottom" onclick="scrollChatToBottom(true)">
+                        <i class="fas fa-chevron-down" aria-hidden="true"></i>
+                    </button>
+
+                    <!-- Chat Input -->
+                    <div id="chat-composer" class="flex-shrink-0 border-t border-slate-200 dark:border-white/10 bg-panel px-4 py-3">
+                        <div class="max-w-3xl mx-auto">
+                            <!-- Composer card: text on top, session controls along the bottom -->
+                            <div id="composer-card" class="composer-card">
+                                <!-- Attachment preview: scrolls horizontally above the text -->
+                                <div id="attachment-preview" class="attachment-preview hidden"></div>
+
+                                <div class="composer-identity-row">
+                                    <textarea id="chat-input"
+                                              class="composer-textarea"
+                                              rows="1"
+                                              data-i18n-placeholder="input_placeholder"
+                                              placeholder="输入消息，/ 使用指令，@ 引用文件"></textarea>
+                                </div>
+
+                                <div class="composer-toolbar">
+                                    <div class="composer-group">
+                                        <button id="new-chat-btn" type="button" class="composer-icon-btn"
+                                                onclick="newChat()">
+                                            <i class="fas fa-plus"></i>
+                                        </button>
+                                        <button id="clear-context-btn" type="button" class="composer-icon-btn ctx-pie-btn">
+                                            <span id="ctx-pie-mini" class="ctx-pie-mini"><svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="4" opacity="0.35"></circle></svg></span>
+                                        </button>
+                                        <button id="attach-btn" type="button" class="composer-icon-btn"
+                                                onclick="toggleAttachMenu(event)">
+                                            <i class="fas fa-paperclip"></i>
+                                        </button>
+
+                                        <span class="composer-divider"></span>
+
+                                        <button id="workspace-selector-btn" type="button" class="composer-chip"
+                                                onclick="toggleWorkspaceSelector(event)"
+                                                data-tip-float data-tooltip-pos="top">
+                                            <i class="fas fa-folder-open"></i>
+                                            <span id="workspace-selector-label" class="composer-chip-label" data-i18n="ws_default_workspace">默认空间</span>
+                                            <i class="fas fa-chevron-down composer-chip-caret"></i>
+                                        </button>
+
+                                        <button id="permission-selector-btn" type="button" class="composer-chip composer-chip-icon-only"
+                                                onclick="togglePermissionSelector(event)"
+                                                data-tip-float data-tooltip-pos="top">
+                                            <i id="permission-selector-icon" class="fas fa-shield-halved"></i>
+                                            <span id="permission-selector-label" class="composer-chip-label" data-i18n="perm_full_access">全部可访问</span>
+                                            <i class="fas fa-chevron-down composer-chip-caret"></i>
+                                        </button>
+                                    </div>
+
+                                    <div class="composer-group composer-group-end">
+                                        <button id="model-selector-btn" type="button" class="composer-chip"
+                                                onclick="toggleModelSelector(event)"
+                                                data-tip-float data-tooltip-pos="top">
+                                            <i class="fas fa-microchip"></i>
+                                            <span id="model-selector-label" class="composer-chip-label">—</span>
+                                            <i class="fas fa-chevron-down composer-chip-caret"></i>
+                                        </button>
+
+                                        <!-- The Agent identity chip sits right of the model, avatar-only,
+                                             as the face the reply comes from (matches the desktop composer).
+                                             Only shown in multi-Agent mode. -->
+                                        <div id="composer-identity" class="composer-identity hidden">
+                                            <button id="composer-agent-btn" type="button" class="composer-agent-btn"
+                                                    onclick="toggleComposerAgentMenu(event)"
+                                                    data-tip-float data-tooltip-pos="top">
+                                                <span id="composer-agent-avatar" class="agent-avatar agent-avatar-32"></span>
+                                            </button>
+                                            <div id="composer-agent-menu" class="composer-menu composer-menu-up hidden"></div>
+                                        </div>
+                                        <button id="optimize-btn" type="button" class="composer-icon-btn"
+                                                data-tooltip="智能优化输入">
+                                            <i class="fas fa-magic text-[13px]"></i>
+                                        </button>
+                                        <button id="mic-btn" type="button" class="composer-icon-btn text-slate-400"
+                                                data-tooltip="点击录音 / 再按一次结束">
+                                            <i class="fas fa-microphone text-sm"></i>
+                                        </button>
+                                        <button id="steer-btn" type="button"
+                                                class="hidden composer-send-btn composer-steer-btn"
+                                                data-i18n-aria-label="steer_active"
+                                                aria-label="引导当前任务"
+                                                data-tooltip="引导当前任务">
+                                            <i class="fas fa-arrow-turn-up text-sm"></i>
+                                        </button>
+                                        <button id="send-btn" class="composer-send-btn" disabled>
+                                            <i class="fas fa-paper-plane text-sm"></i>
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <input type="file" id="file-input" class="hidden" multiple
+                                       accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.xml,.zip,.rar,.7z,.py,.js,.ts,.java,.c,.cpp,.go,.rs,.md">
+                                <input type="file" id="folder-input" class="hidden" multiple webkitdirectory directory>
+                                <div id="attach-menu" class="attach-menu hidden">
+                                    <button id="attach-file-option" type="button" class="attach-menu-item" onclick="triggerFileUpload()">
+                                        <i class="fas fa-file-arrow-up"></i>
+                                        <span data-i18n="attach_menu_file">上传文件</span>
+                                    </button>
+                                    <button id="attach-folder-option" type="button" class="attach-menu-item" onclick="triggerFolderUpload()">
+                                        <i class="fas fa-folder-plus"></i>
+                                        <span data-i18n="attach_menu_folder">上传文件夹</span>
+                                    </button>
+                                </div>
+                                <div id="slash-menu" class="slash-menu hidden"></div>
+                                <div id="mention-menu" class="mention-menu hidden"></div>
+                                <div id="workspace-selector-menu" class="workspace-selector-menu hidden"></div>
+                                <div id="permission-selector-menu" class="composer-menu hidden"></div>
+                                <div id="model-selector-menu" class="composer-menu composer-menu-wide hidden"></div>
+                            </div>
+                        </div>
+                    </div>
+                  </div><!-- /#chat-main -->
+
+                    <!-- ================================================== -->
+                    <!-- Workspace panel: file preview + file manager        -->
+                    <!-- ================================================== -->
+                    <aside id="workspace-panel" class="workspace-panel hidden">
+                        <div id="ws-resizer" class="workspace-resizer" title="Drag to resize"></div>
+                        <div class="workspace-inner">
+                            <div class="workspace-header">
+                                <div class="workspace-tabs">
+                                    <button class="workspace-tab active" data-ws-tab="preview" onclick="switchWorkspaceTab('preview')">
+                                        <i class="fas fa-eye"></i>
+                                        <span data-i18n="ws_tab_preview">预览</span>
+                                    </button>
+                                    <button class="workspace-tab" data-ws-tab="files" onclick="switchWorkspaceTab('files')">
+                                        <i class="fas fa-folder-tree"></i>
+                                        <span data-i18n="ws_tab_files">文件</span>
+                                    </button>
+                                </div>
+                                <div class="workspace-header-actions">
+                                    <button id="ws-btn-save" class="workspace-icon-btn hidden" onclick="savePreviewEdit()"
+                                            data-tip-key="ws_edit_save" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-floppy-disk"></i>
+                                    </button>
+                                    <button id="ws-btn-edit-cancel" class="workspace-icon-btn hidden" onclick="cancelPreviewEdit()"
+                                            data-tip-key="ws_edit_cancel" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-rotate-left"></i>
+                                    </button>
+                                    <button id="ws-btn-edit" class="workspace-icon-btn hidden" onclick="startPreviewEdit()"
+                                            data-tip-key="ws_edit" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-pen-to-square"></i>
+                                    </button>
+                                    <button id="ws-btn-artifacts" class="workspace-icon-btn hidden" onclick="openArtifactsFor(wsCurrentFile)"
+                                            data-tip-key="artifacts_view_in" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-layer-group"></i>
+                                    </button>
+                                    <button id="ws-btn-external" class="workspace-icon-btn hidden" onclick="openPreviewExternally()"
+                                            data-tip-key="ws_open_external" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-up-right-from-square"></i>
+                                    </button>
+                                    <button id="ws-btn-reveal" class="workspace-icon-btn hidden" onclick="revealPreviewFile()"
+                                            data-tip-key="ws_reveal" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-folder-open"></i>
+                                    </button>
+                                    <button id="ws-btn-download" class="workspace-icon-btn hidden" onclick="downloadPreviewFile()"
+                                            data-tip-key="ws_download" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-download"></i>
+                                    </button>
+                                    <button class="workspace-icon-btn" onclick="closeWorkspacePanel(true)"
+                                            data-tip-key="ws_close" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-xmark"></i>
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Preview tab -->
+                            <div id="ws-body-preview" class="workspace-body active">
+                                <div id="ws-preview-title" class="workspace-file-title hidden"></div>
+                                <div id="ws-preview-content" class="workspace-preview-content"></div>
+                            </div>
+
+                            <!-- Files tab -->
+                            <div id="ws-body-files" class="workspace-body">
+                                <div class="workspace-files-toolbar">
+                                    <div class="workspace-search">
+                                        <i class="fas fa-magnifying-glass"></i>
+                                        <input id="ws-search-input" type="text" spellcheck="false"
+                                               data-i18n-placeholder="ws_search_placeholder" placeholder="搜索文件">
+                                    </div>
+                                    <button class="workspace-icon-btn" onclick="refreshWorkspaceTree()"
+                                            data-tip-key="ws_refresh" data-tip-float data-tooltip-pos="bottom">
+                                        <i class="fas fa-rotate-right"></i>
+                                    </button>
+                                </div>
+                                <div id="ws-breadcrumb" class="workspace-breadcrumb"></div>
+                                <div id="ws-file-list" class="workspace-file-list"></div>
+                            </div>
+                        </div>
+                    </aside>
+                </div>

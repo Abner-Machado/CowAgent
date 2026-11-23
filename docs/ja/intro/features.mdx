@@ -143,3 +143,19 @@ cow install-browser    # ブラウザツールをインストール
 ```
 
 詳細は [コマンド一覧](https://docs.cowagent.ai/ja/cli) を参照してください。
+
+## 6. マルチエージェントチーム
+
+CowAgent は単一の Agent にとどまりません。複数の Agent でチームを構成でき、各メンバーはそれぞれの役割、モデル、Skill、知識を持ち、ワークスペースと記憶は互いに分離されています。独立して作業することも、同じセッションに参加して協働することもできます。チャネルには単一の Agent またはチーム全体をバインドして対外的にサービスを提供でき、デジタル従業員チームを手軽に構築できます。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/team-overview.png" width="800" />
+</Frame>
+
+グループチャットのセッションでは、複数の Agent が一緒に参加できます。`@` でメンバーを指定して回答させるか、メイン Agent が自動的に適切なメンバーへタスクを**委譲**し、回答をまとめて返します。さらにメイン Agent は一時的な**サブ Agent** を立ち上げ、独立したサブタスクを並列処理し、結論のみを返してメイン会話のコンテキストを圧迫しません。
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/agent-group-session.png" width="800" />
+</Frame>
+
+詳細は [Agent チーム](/ja/multi-agent/team)、[タスク委譲](/ja/tools/delegate)、[サブ Agent](/ja/multi-agent/subagent) を参照してください。

@@ -1,0 +1,121 @@
+---
+title: v2.1.8
+description: CowAgent 2.1.8：推出多 Agent 团队、定时任务支持手动创建、上下文用量可视化、模型和搜索工具接入、工作空间文件编辑
+---
+
+🌐 [English](https://docs.cowagent.ai/releases/v2.1.8) | [中文](https://docs.cowagent.ai/zh/releases/v2.1.8)
+
+## 🤝 多 Agent 团队
+
+CowAgent 正式升级为**多 Agent 框架**，支持创建多个各司其职的 Agent 组成团队，在同一会话中协作完成复杂任务。Web 端、桌面客户端、通道接入端均已支持：
+
+- **团队管理**：支持创建和维护 Agent，配置名称、职责、默认模型、技能、知识，并可从已有 Agent 进行复制。
+- **资源隔离**：每个 Agent 拥有独立的工作空间、记忆与会话；知识库和技能可选择共享或独立。
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/e0750df7b766ee63dfb341e30e181859.png" alt="Agent team" width="800" />
+</Frame>
+
+- **群聊协作**：在一个会话中可加入多个 Agent，通过 `@` 指定成员应答，每个 Agent 使用各自配置的模型。
+- **任务分发**：群聊设有主 Agent，可根据成员职责将任务转交给更适合的成员，支持多级委派，可配置范围、深度与超时时间。
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/20260911094642.png" alt="Agent-team-group" width="800"/>
+</Frame>
+
+- **通道多实例**：现在同一类型的 IM 通道可以运行多个实例，分别绑定不同的单 Agent 或 Agent 团队，微信、企微智能机器人、飞书、钉钉、QQ、Telegram、Slack、Discord 等均支持。
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/20260908204924.png" alt="Agent-team-channel" width="800"/>
+</Frame>
+
+Thanks @AaronZ345 (#2975, #2973)、@zkjqd (#3096)、@cowagent (#3118)
+
+相关文档：[Agent 团队](https://docs.cowagent.ai/zh/multi-agent/team)
+
+## ⏰ 定时任务升级
+
+定时任务支持在控制台手动创建与维护，并补齐通道接收人与执行记录：
+
+- **手动创建定时任务**：可在任务页直接新建、编辑、执行任务，选择通道实例与接收人。
+- **通道接收人维护**：按通道实例维护可信接收人，任务可投递到指定接收人，不再局限于创建时所在的通道。Thanks @dajiaohuang (#3043)
+- **执行记录可视化**：增加定时任务执行记录页面，可查看历史记录列表和执行结果详情。Thanks @mengluo04 (#3107)
+- **并发更新修复：** 修复并发更新任务丢失的问题（Thanks @Whxuan0701 #3062）
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/20260908211533.png" width="800"/>
+</Frame>
+
+
+## 📊 上下文用量可视化
+
+对话上下文的消耗情况现在可视、可控，方便进行 Token 成本控制：
+
+- **上下文用量视图**：用环形视图代替原来的清除上下文按钮，可查看完整的上下文构成明细。
+- **上下文操作**：在环形视图下方可选择智能压缩、上下文清除、最大上下文配置等操作。
+- **上下文计算**：上下文构成占比根据模型返回自动推算，`agent_max_context_tokens` 作为用户可配置的成本上限。
+
+Thanks @chimyves (#3087)、@sufan721 (#3079)
+
+<Frame>
+  <img src="https://cdn.link-ai.tech/doc/20260908211650.png" width="700"/>
+</Frame>
+
+
+## 🤖 模型能力
+
+- **新增模型**：接入 `deepseek-flash`（DeepSeek V4.1 Flash）、`gpt-6-astra`、`claude-fable-5-1`、`qwen3.8-flash`、`glm-5.3-flash`、`gemini-3.8-flash`，以及视觉模型 `deepseek-v4-flash-vision-exp`（Thanks @a1094174619 #3094）。
+- **模型故障回退**：在「模型配置-主模型」处可配置「兜底模型」，当主模型失败时自动切换，避免因单一厂商故障而中断。Thanks @alanyz106 (#3099)
+- **新增 6 个搜索工具厂商**：
+  - **AnySearch**（支持匿名模式）。Thanks @WangPan59 (#3083)
+  - **Serply**（Google/Bing SERP API）。Thanks @googio (#3071)
+  - **Parallel Search**。Thanks @georgeatparallel (#3116)
+  - **Tavily**（面向 LLM 优化的搜索 API）。Thanks @1printf (#3124)
+  - **SearXNG**（本地部署的搜索引擎，仅需配置实例 URL）。Thanks @1printf (#3124)
+  - **Keenable**（支持匿名模式，无需 API Key）。Thanks @ilya-bogin-keenable (#3122)
+
+## 📝 工作空间文件编辑
+
+工作空间中的文件、长期记忆文档、技能定义现在可在 Web 控制台和桌面客户端直接编辑并保存：
+
+- **在线编辑**：工作空间、记忆、技能模块中的文本类文件（Markdown、代码、CSV、HTML、纯文本等）支持直接编辑。支持 `Ctrl+S` 保存、`Esc` 退出、`Tab` 缩进等快捷键。
+- **安全保存**：保存基于打开时的文件修改时间做冲突检测，若 Agent 期间改动过该文件会先询问而非直接覆盖。关闭面板、切换文件、切换会话、切换工作空间等操作前发起确认。
+
+Thanks @zkjqd (#3076)
+
+## 🛠 优化与修复
+
+- **技能修复**：
+  - 加固 tar 归档解压（Thanks @Whxuan0701 #3063）
+  - 安装技能时解析仓库默认分支而非默认使用 `main`（Thanks @aniruddhaadak80 #3080）
+- **MCP 增强**：
+  - 支持工具名前缀（Thanks @georgeatparallel #3116）
+  - 恢复过期的 Streamable HTTP 会话（Thanks @yiheng-kkk ad1f686）
+  - 多个 Agent 共用同一 `mcp.json` 时复用子进程、去除重复加载日志
+- **图像生成**：
+  - 修复 ModelScope `IMAGE_CREATE` 因参数不匹配而报错的问题（Thanks @Anai-Guo #3097）
+  - 修复空 base64 数据被误判、产出空图片文件的问题（Thanks @c020627 #3133，@justinguo7777 #3131）
+- **子 Agent 修复**：修复子 Agent 会清空父级会话回退设置的问题（Thanks @alanyz106 #3111）。
+- **结构化分块**：Markdown 记忆与知识文档根据标题结构化分块，并在分块版本过期时提示重建。Thanks @alanyz106 (#3115)
+- **流式报错修复**：修复 7 个模型 bot 在流式出错时因闭包引用已被清除的异常变量而抛出 `NameError`、掩盖真实上游错误的问题（Thanks @Anai-Guo #3128）。
+- **记忆索引修复**：修复空文本块导致嵌入接口报错、整个记忆索引构建失败而退回关键词搜索的问题（Thanks @6vision #3121）。
+- **中断识别**：向 Agent 循环透传 `stop_reason`，以区分模型主动结束与被输出上限截断（Thanks @6vision #3074）。
+- **附件识别**：按解析后的路径判断关键词附件 URL（Thanks @Whxuan0701 #3061）。
+- **网关归属**：为 OrcaRouter 网关请求补充来源归属（Thanks @Marc-oss-hub #3058）。
+- **代理渲染**：为 `/chat` 设置 Content-Type，使控制台在带 nosniff 的反向代理后正常渲染（Thanks @alanyz106 #3110）。
+- **头像处理**：修复上传头像因按文本解码而失败的问题，改为读取原始字节（Thanks @mengluo04）。
+- **评估工具**：新增最小化的 Agent 轨迹评估流程。Thanks @yanzhiliaoliao (#3100)
+- **钉钉通道**：流式连接禁用代理并对重连做退避，消除持续报错。
+- **Windows 客户端**：修复更新安装破坏快捷方式的问题。
+- **桌面客户端**：修复 Agent 设置中最大上下文 Token 等数字无法清空的问题（Thanks @zkjqd #3130）。
+- **备份恢复**：备份纳入全部 Agent 工作空间，修正多 Agent 场景下的嵌套归档、恢复布局与版本兼容。
+- **文档**：
+  - 日语文档语言切换器补充繁体中文入口（Thanks @c020627 #3072）
+  - 补充 Kimi 相关链接（Thanks @oriengy #2885）
+
+## 📦 升级方式
+
+- **源码部署**：执行 `cow update` 一键升级，或手动拉取代码后重启。详见 [更新升级文档](https://docs.cowagent.ai/zh/guide/upgrade)。
+- **桌面客户端**：可在客户端内自动检查并一键更新，或前往 [下载页](https://cowagent.ai/zh/download/) 获取最新版本。
+
+**发布日期**：2026.09.10 | [Full Changelog](https://github.com/zhayujie/CowAgent/compare/2.1.7...2.1.8)

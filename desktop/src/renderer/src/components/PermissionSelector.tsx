@@ -12,9 +12,9 @@ import {
 } from '../lib/permission'
 
 const ICONS: Record<PermissionMode, React.ReactNode> = {
-  'full-access': <LockOpen size={13} />,
-  'workspace-write': <Shield size={13} />,
-  'read-only': <Eye size={13} />,
+  'full-access': <LockOpen size={15} />,
+  'workspace-write': <Shield size={15} />,
+  'read-only': <Eye size={15} />,
 }
 
 interface PermissionSelectorProps {
@@ -73,6 +73,7 @@ const PermissionSelector: React.FC<PermissionSelectorProps> = ({ sessionId }) =>
         open={open}
         onToggle={toggle}
         onClose={close}
+        labelHidden
       >
         <div className="px-2.5 pt-1 pb-1.5 text-[11px] font-semibold text-content-tertiary">
           {t('perm_menu_title')}

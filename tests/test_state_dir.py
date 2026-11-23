@@ -109,12 +109,24 @@ def test_scaffolding_a_second_agent_does_not_opt_it_out(registry, tmp_path):
     ensure_workspace(str(tmp_path / "alpha"), create_templates=False)
     ensure_workspace(str(tmp_path / "beta"), create_templates=False)
 
-    for name in ("skills", "knowledge", "websites"):
+    for name in ("skills", "knowledge"):
         assert (tmp_path / "alpha" / name).is_dir(), name
         assert not (tmp_path / "beta" / name).exists(), name
 
     with identity_scope(agent_id="beta"):
         assert state_dir.skills_dir() == tmp_path / "alpha" / "skills"
+
+
+def test_published_files_belong_to_the_agent_that_made_them(registry, tmp_path):
+    """Not a shared asset: one Agent must not be able to overwrite what another
+    published, and a serving layer addresses the files by this path."""
+    from agent.prompt import ensure_workspace
+
+    ensure_workspace(str(tmp_path / "beta"), create_templates=False)
+
+    assert (tmp_path / "beta" / "websites").is_dir()
+    with identity_scope(agent_id="beta"):
+        assert state_dir.websites_dir() == tmp_path / "beta" / "websites"
 
 
 def test_an_agent_opts_out_by_having_its_own_copy(registry, tmp_path):
@@ -257,3 +269,10 @@ def test_a_single_agent_install_keeps_every_path_it_has_today(tmp_path, prepopul
             assert accessor(**kwargs) == resolved.joinpath(*parts), name
     finally:
         set_agent_registry(None)
+
+
+def test_tmp_file_is_unique_and_under_tmp_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(state_dir, "tmp_dir", lambda: tmp_path)
+    first, second = state_dir.tmp_file("wx_media", ".png"), state_dir.tmp_file("wx_media", ".png")
+    assert first != second
+    assert Path(first).parent == tmp_path and first.endswith(".png")

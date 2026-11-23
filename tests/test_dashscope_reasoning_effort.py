@@ -56,7 +56,11 @@ def test_dashscope_qwen38_sends_reasoning_effort_in_parameters(monkeypatch):
     assert "thinking_budget" not in captured["parameters"]
 
 
-def test_dashscope_qwen38_forces_thinking_when_requested_disabled(monkeypatch):
+def test_dashscope_qwen38_disables_thinking_when_requested(monkeypatch):
+    # qwen3.8 is a HYBRID thinking model: a disabled toggle must actually turn
+    # thinking off (enable_thinking=false), so users can avoid the long xhigh
+    # reasoning pass. It must NOT send preserve_thinking / reasoning_effort in
+    # that case.
     bot, captured = _bot_with_capture(monkeypatch, "qwen3.8-max")
 
     bot.call_with_tools(
@@ -67,9 +71,9 @@ def test_dashscope_qwen38_forces_thinking_when_requested_disabled(monkeypatch):
         reasoning_effort="xhigh",
     )
 
-    assert captured["parameters"]["enable_thinking"] is True
-    assert captured["parameters"]["preserve_thinking"] is False
-    assert captured["parameters"]["reasoning_effort"] == "xhigh"
+    assert captured["parameters"]["enable_thinking"] is False
+    assert "preserve_thinking" not in captured["parameters"]
+    assert "reasoning_effort" not in captured["parameters"]
 
 
 def test_dashscope_direct_glm_sends_enable_thinking_and_reasoning_effort(monkeypatch):

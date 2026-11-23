@@ -1,0 +1,154 @@
+/* Foundation: keyframes, scrollbars, tooltips, view switching.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* =====================================================================
+   CowAgent Console Styles
+   ===================================================================== */
+
+/* Palette (space-separated RGB so alpha can be applied). Tailwind's primary /
+   slate scales and the stylesheets read these; a theme overrides them inline
+   on <html> (static/js/core/themes.js). */
+:root {
+    --cw-primary-50: 237 253 243;
+    --cw-primary-100: 212 250 226;
+    --cw-primary-200: 171 244 199;
+    --cw-primary-300: 116 233 164;
+    --cw-primary-400: 74 190 110;
+    --cw-primary-500: 53 168 91;
+    --cw-primary-600: 34 133 71;
+    --cw-primary-700: 28 107 59;
+    --cw-primary-800: 26 85 50;
+    --cw-primary-900: 22 70 42;
+    --cw-slate-50: 248 250 252;
+    --cw-slate-100: 241 245 249;
+    --cw-slate-200: 226 232 240;
+    --cw-slate-300: 203 213 225;
+    --cw-slate-400: 148 163 184;
+    --cw-slate-500: 100 116 139;
+    --cw-slate-600: 71 85 105;
+    --cw-slate-700: 51 65 85;
+    --cw-slate-800: 30 41 59;
+    --cw-slate-900: 15 23 42;
+    /* Accent-colored text on a tinted accent background. */
+    --cw-accent-ink: 23 128 61;
+    --cw-canvas: 249 250 251;
+    --cw-panel: 255 255 255;
+    --cw-sidebar: 10 10 10;
+    /* Panel opacity; a glass wallpaper lowers it. */
+    --cw-glass-alpha: 1;
+}
+.dark {
+    --cw-accent-ink: 110 231 160;
+    --cw-canvas: 17 17 17;
+    --cw-panel: 26 26 26;
+}
+
+/* Mobile viewport fixes.
+   On mobile browsers `100vh` includes the (collapsible) URL bar, so a full-height
+   layout ends up taller than the visible area and leaks a vertical scrollbar/jitter.
+   `dvh` tracks the *dynamic* viewport instead. On desktop `dvh` equals `vh`, so this
+   is a no-op there and leaves the PC layout untouched. Guarded by @supports so old
+   engines keep the `100vh` fallback baked into the markup. */
+@supports (height: 100dvh) {
+    html.h-screen,
+    body.h-screen,
+    #app.h-screen,
+    #main-content.h-screen,
+    .session-panel {
+        height: 100dvh;
+    }
+}
+
+/* Belt-and-braces horizontal-overflow guard for phones. Some inner toolbars are
+   laid out as single non-wrapping flex rows that can exceed a narrow viewport; on
+   iOS Safari `overflow-x: hidden` alone doesn't always stop the page from panning.
+   Scoped to small screens so the desktop layout is completely unaffected. */
+@media (max-width: 768px) {
+    html, body { max-width: 100%; overflow-x: hidden; }
+    /* The header logout icon is redundant on phones (and was overflowing the top
+       bar). Hide it on small screens regardless of the JS-toggled `hidden` class. */
+    #logout-btn-header { display: none !important; }
+}
+
+/* Animations */
+@keyframes pulseDot {
+    0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+    40% { transform: scale(1); opacity: 1; }
+}
+
+/* Scrollbar */
+* { scrollbar-width: thin; scrollbar-color: rgb(var(--cw-slate-400)) transparent; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgb(var(--cw-slate-400)); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgb(var(--cw-slate-500)); }
+.dark ::-webkit-scrollbar-thumb { background: rgb(var(--cw-slate-600)); }
+.dark ::-webkit-scrollbar-thumb:hover { background: rgb(var(--cw-slate-500)); }
+
+/* Generic Tooltip (via data-tooltip attribute) */
+[data-tooltip] {
+    position: relative;
+}
+[data-tooltip]::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    transform: translateX(-50%);
+    padding: 5px 10px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    white-space: nowrap;
+    background: rgb(var(--cw-slate-800));
+    color: rgb(var(--cw-slate-200));
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    z-index: 100;
+}
+[data-tooltip-pos="bottom"]::after {
+    bottom: auto;
+    top: calc(100% + 8px);
+}
+.dark [data-tooltip]::after {
+    background: rgb(var(--cw-slate-700));
+    color: rgb(var(--cw-slate-100));
+}
+[data-tooltip]:hover::after {
+    opacity: 1;
+}
+[data-tooltip=""]:hover::after {
+    display: none;
+}
+/* Float-portal elements render their tooltip via the body-level node, so
+   suppress the clipped ::after variant to avoid a double tooltip. */
+[data-tip-float]::after,
+[data-tip-float]::before {
+    display: none !important;
+}
+
+/* Menu Groups */
+.menu-group-items { max-height: 0; overflow: hidden; transition: max-height 0.25s ease-out; }
+.menu-group.open .menu-group-items { max-height: 2000px; transition: max-height 0.35s ease-in; }
+.menu-group .chevron { transition: transform 0.25s ease; }
+.menu-group.open .chevron { transform: rotate(90deg); }
+
+/* View Switching */
+.view { display: none; height: 100%; }
+.view.active { display: flex; flex-direction: column; }
+
+/* Chat view is split horizontally: conversation + workspace panel */
+#view-chat.active { flex-direction: row; }
+.chat-main {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+

@@ -1,55 +1,311 @@
+import {
+  activeInstance,
+  deviceInfo,
+  diagnoseInstance,
+  sameDevice,
+  updateInstance,
+  type Instance,
+} from './instances'
 import type {
   ConfigData,
   ChannelInfo,
   ChannelAction,
   SkillInfo,
+  SkillInstallMeta,
+  SkillContent,
+  SkillFileEntry,
+  SkillCreateResult,
   ToolInfo,
+  McpServerConfig,
+  McpServersResult,
+  McpTestResult,
+  SkillMarketSource,
+  SkillPreviewResult,
   MemoryItem,
   MemoryCategory,
   MemoryPage,
+  MemoryDoc,
   SchedulerTask,
+  SchedulerRun,
+  SchedulerRunDetail,
+  TaskSchedule,
+  TaskAction,
+  SchedulerInstance,
+  TaskRecipient,
   Attachment,
   SessionsPage,
   SessionSettingsState,
   HistoryPage,
+  UserMessageIndex,
+  ContextUsage,
   ModelsData,
   ModelsAction,
   KnowledgeList,
   KnowledgeGraph,
   KnowledgeAction,
   KnowledgeImportPayload,
+  KnowledgeReadResult,
   WorkspaceEntry,
+  WorkspaceReadResult,
   WorkspaceTree,
+  WorkspaceWriteResult,
   ProjectState,
+  ChannelsResponse,
+  RosterSnapshot,
+  MenuDoc,
+  ArtifactListItem,
 } from '../types'
-import { getLang } from '../i18n'
+import { getLang, t } from '../i18n'
 
-interface ApiResult {
+export interface ApiResult {
   status: string
+  message?: string
+}
+
+export interface ExternalApiState {
+  enabled: boolean
+  api_key: string
+}
+
+export interface IntegrationsState {
+  public_url: string
+  /** This machine's addresses on the local network, empty while the server only listens locally. */
+  lan_urls: string[]
+  listen: { host: string; port: number }
+  /** The desktop app owns its backend's port. */
+  port_fixed?: boolean
+  local_only: boolean
+  password_set: boolean
+}
+
+export interface PairingCode {
+  pairing_id: string
+  /** Short code to type, as XXXX-XXXX. */
+  code: string
+  expires_in: number
+  urls: string[]
+  link: string
+  qr_image: string
+  password_set: boolean
+}
+
+export interface PairedDevice {
+  id: string
+  name: string
+  platform: string
+  app_version: string
+  created_at: number
+  last_seen_at: number
+  /** How it signed in: a pairing code or the access password. */
+  via?: 'pairing' | 'password'
+  /** The web page it calls from, for a browser console on another address. */
+  origin?: string
+  last_ip?: string
+  online?: boolean
+}
+
+/** The CowAgent device itself, as it introduces itself to signed-in clients. */
+export interface DeviceSelf {
+  id: string
+  name: string
+  version?: string
+  /** Named and reached the way whoever runs it decides; clients don't offer a rename. */
+  managed?: boolean
+}
+
+export interface DeviceList {
+  devices: PairedDevice[]
+  /** The device making this request, empty when it isn't one (e.g. this app on its own backend). */
+  current: string
+  instance?: DeviceSelf
+}
+
+export type GuestShareStatus = 'active' | 'unconfirmed' | 'password_missing' | 'disabled' | 'expired'
+
+export interface GuestShareConfig {
+  name?: string
+  language?: string
+  welcome?: string
+  suggested_questions?: string[]
+  provider?: string
+  model?: string
+  tools?: string[]
+  skills?: string[]
+  references?: { path: string; note?: string }[]
+  expires_at?: string
+  limits?: { daily_messages?: number; [k: string]: unknown }
+  access?: { password_required?: boolean; allowed_origins?: string[]; [k: string]: unknown }
+  network?: { enabled?: boolean; [k: string]: unknown }
+  branding?: { color?: string; footer_text?: string; footer_url?: string; [k: string]: unknown }
+  [k: string]: unknown
+}
+
+export interface GuestShare {
+  slug: string
+  name: string
+  status: GuestShareStatus
+  share_token: string
+  password_set: boolean
+  disabled: boolean
+  pending: string[]
+  notices: string[]
+  file_config: GuestShareConfig
+  effective_config: GuestShareConfig | null
+  logo_version: number | string
+  /** Only on single-share responses. */
+  raw_config?: GuestShareConfig
+  guest_md?: string
+}
+
+export interface GuestFeature {
+  enabled: boolean
+  web_password_set: boolean
+  serving: boolean
+  reason: string
+}
+
+export interface GuestSharesOverview {
+  feature: GuestFeature
+  shares: GuestShare[]
+  skills: { name: string; description?: string; needs_shell?: boolean }[]
+  references: { path: string; agent?: string; category?: string }[]
+  models: { id: string; label: string | { zh: string; en: string }; models: string[] }[]
+}
+
+export interface GuestLogSession {
+  session_id: string
+  updated_at: number
+  last?: string
+  deleted?: boolean
+}
+
+export interface GuestLogRecord {
+  role: 'user' | 'assistant' | 'event'
+  event?: string
+  ts?: number
+  content?: string
+  error?: string
+  status?: string
+  tokens?: number
+  attachments?: string[]
+  files?: { path?: string; file_name?: string }[]
+  steps?: { type: string; name?: string; is_error?: boolean }[]
+}
+
+/** A failed guest-share call, keeping the backend's reason code. */
+export class ShareApiError extends Error {
+  constructor(message: string, readonly reason: string = '') {
+    super(message)
+  }
+}
+
+export interface UploadResult {
+  status: string
+  file_path: string
+  file_name: string
+  file_type: string
+  preview_url: string
   message?: string
 }
 
 const AUTH_TOKEN_KEY = 'cow_auth_token'
 
 class ApiClient {
-  private baseUrl = 'http://127.0.0.1:9876'
+  private localBaseUrl = 'http://127.0.0.1:9876'
   // Bearer token for web_password-protected backends. The desktop renderer
   // runs from a file:// origin, where cross-origin cookies to http://127.0.0.1
   // aren't sent reliably, so we authenticate via an Authorization header
   // instead. Persisted in localStorage so it survives reloads.
-  private authToken: string | null =
+  private localToken: string | null =
     typeof localStorage !== 'undefined' ? localStorage.getItem(AUTH_TOKEN_KEY) : null
+  // Another computer or server this window drives instead of its own backend.
+  // Fixed for the window's lifetime: switching reloads.
+  private readonly instance: Instance | null = activeInstance()
 
+  private get baseUrl(): string {
+    return this.instance ? this.instance.url : this.localBaseUrl
+  }
+
+  // The address of another device can come to lead to a different machine;
+  // its token goes only where the device that issued it still answers. A
+  // check holds for a minute, and until a request finds the address silent.
+  private identity: { at: number; ok: boolean } | null = null
+  private identityCheck: Promise<'ok' | 'unreachable' | 'wrong_device'> | null = null
+  private wrongDeviceListener: (() => void) | null = null
+
+  onWrongDevice(listener: (() => void) | null) {
+    this.wrongDeviceListener = listener
+  }
+
+  /** Whether the active instance's address still leads to the device that issued its token. */
+  confirmInstance(force = false): Promise<'ok' | 'unreachable' | 'wrong_device'> {
+    const item = this.instance
+    if (!item || !item.instance_id) return Promise.resolve('ok')
+    if (!force && this.identity && Date.now() - this.identity.at < 60_000) {
+      return Promise.resolve(this.identity.ok ? 'ok' : 'wrong_device')
+    }
+    if (!this.identityCheck) {
+      this.identityCheck = diagnoseInstance(item.url, 8000)
+        .then((info) => {
+          const ok = sameDevice(item, info)
+          this.identity = { at: Date.now(), ok }
+          if (!ok) this.wrongDeviceListener?.()
+          return ok ? ('ok' as const) : ('wrong_device' as const)
+        })
+        .catch(() => 'unreachable' as const)
+        .finally(() => {
+          this.identityCheck = null
+        })
+    }
+    return this.identityCheck
+  }
+
+  /** Records the id of a device paired before devices had ids. */
+  adoptInstanceId(id: string) {
+    if (!this.instance || this.instance.instance_id || !id) return
+    this.instance.instance_id = id
+    updateInstance(this.instance.id, { instance_id: id })
+    this.identity = { at: Date.now(), ok: true }
+  }
+
+  /** The token to send right now: none to a remote address not confirmed as its device. */
+  private async sendableToken(): Promise<string | null> {
+    if (!this.instance) return this.localToken
+    if (!this.instance.token) return null
+    return (await this.confirmInstance()) === 'ok' ? this.instance.token : null
+  }
+
+  /** Same, for addresses built synchronously (EventSource, <img>): the last check decides. */
+  private get confirmedToken(): string | null {
+    if (!this.instance) return this.localToken
+    if (this.instance.instance_id && !this.identity?.ok) return null
+    return this.instance.token || null
+  }
+
+  /** The backend this app started; requests go elsewhere while an instance is active. */
   setBaseUrl(url: string) {
-    this.baseUrl = url
+    this.localBaseUrl = url
   }
 
   getBaseUrl() {
     return this.baseUrl
   }
 
+  getInstance(): Instance | null {
+    return this.instance
+  }
+
+  isRemote(): boolean {
+    return !!this.instance
+  }
+
   setAuthToken(token: string | null) {
-    this.authToken = token
+    if (this.instance) {
+      this.instance.token = token || ''
+      updateInstance(this.instance.id, { token: this.instance.token })
+      return
+    }
+    this.localToken = token
     try {
       if (token) localStorage.setItem(AUTH_TOKEN_KEY, token)
       else localStorage.removeItem(AUTH_TOKEN_KEY)
@@ -58,19 +314,121 @@ class ApiClient {
     }
   }
 
-  private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      ...options,
-      // Cookies still work for browser access; the desktop app relies on the
-      // Authorization header below.
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(this.authToken ? { Authorization: `Bearer ${this.authToken}` } : {}),
-        ...options?.headers,
-      },
-    })
+  // Told about every 401, so the app can bring back the login screen once the
+  // token stops working (the password was changed elsewhere, or it expired).
+  private unauthorizedListener: (() => void) | null = null
+
+  onUnauthorized(listener: (() => void) | null) {
+    this.unauthorizedListener = listener
+  }
+
+  // A password change in flight: requests answered after the backend switched
+  // passwords but before its reply hands over the new token fail with the old
+  // one, so hold their 401s until the new token is in place.
+  private passwordChange: Promise<unknown> | null = null
+
+  private noteStatus(res: Response) {
+    if (res.status !== 401) return
+    const notify = () => this.unauthorizedListener?.()
+    if (this.passwordChange) this.passwordChange.then(notify, notify)
+    else notify()
+  }
+
+  // The Agent whose workspace scoped endpoints (skills/knowledge/scheduler,
+  // and new chat sessions) should target. Empty means "let the backend use its
+  // default Agent" — exactly the legacy single-Agent behavior, so nothing is
+  // sent and the old requests are byte-for-byte unchanged. Set by the agent
+  // store only when the install is in multi-Agent mode.
+  private activeAgentId = ''
+
+  setActiveAgentId(id: string) {
+    this.activeAgentId = (id || '').trim()
+  }
+
+  getActiveAgentId(): string {
+    return this.activeAgentId
+  }
+
+  // Append agent_id to a query string. An explicit `override` wins (used by the
+  // Knowledge/Memory pages, which scope to a chosen Agent independent of the
+  // chat's active one); otherwise the active Agent is used. No-op in
+  // single-Agent mode with no override, so legacy URLs are untouched.
+  private scoped(path: string, override?: string): string {
+    const id = (override ?? this.activeAgentId) || ''
+    if (!id) return path
+    const sep = path.includes('?') ? '&' : '?'
+    return `${path}${sep}agent_id=${encodeURIComponent(id)}`
+  }
+
+  // Add agent_id to a JSON body when an active Agent is set, without clobbering
+  // an explicit agent_id a caller already put there. No-op in single-Agent mode.
+  private withAgent<T extends Record<string, unknown>>(body: T): T {
+    if (!this.activeAgentId || 'agent_id' in body) return body
+    return { ...body, agent_id: this.activeAgentId }
+  }
+
+  // Carry the active Agent through every request, the way the web console's
+  // fetch wrapper does: sessions, history, projects, skills, knowledge and
+  // uploads are all stored per Agent workspace, so a request that forgets the
+  // id silently lands on the default Agent's data. Query string always; JSON
+  // bodies too (handlers read either). An explicit agent_id — even an empty
+  // one — always wins, so callers can still scope to another Agent or opt out
+  // (e.g. the aggregated scheduler list). No-op in single-Agent mode, keeping
+  // legacy requests byte-for-byte unchanged.
+  private carryAgent(path: string, options?: RequestInit): { path: string; options?: RequestInit } {
+    const id = this.activeAgentId
+    if (!id) return { path, options }
+    let url = path
+    if (!/[?&]agent_id=/.test(url)) {
+      url += `${url.includes('?') ? '&' : '?'}agent_id=${encodeURIComponent(id)}`
+    }
+    let opts = options
+    if (options && typeof options.body === 'string') {
+      try {
+        const body = JSON.parse(options.body)
+        if (body && typeof body === 'object' && !Array.isArray(body) && !('agent_id' in body)) {
+          opts = { ...options, body: JSON.stringify({ ...body, agent_id: id }) }
+        }
+      } catch {
+        /* not JSON; leave the body alone */
+      }
+    }
+    return { path: url, options: opts }
+  }
+
+  // The renderer is a file:// page, so the backend sees its writes as
+  // cross-site and only lets them through with the desktop shell's token.
+  private async authHeaders(): Promise<Record<string, string>> {
+    const desktopToken = this.isLoopbackBackend() ? await this.getDesktopToken() : ''
+    const token = await this.sendableToken()
+    return {
+      ...(desktopToken ? { 'X-Cow-Desktop-Token': desktopToken } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    }
+  }
+
+  private async request<T>(path: string, rawOptions?: RequestInit): Promise<T> {
+    const { path: url, options } = this.carryAgent(path, rawOptions)
+    const headers = await this.authHeaders()
+    let res: Response
+    try {
+      res = await fetch(`${this.baseUrl}${url}`, {
+        ...options,
+        // Cookies still work for browser access; the desktop app relies on the
+        // Authorization header below.
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          ...headers,
+          ...options?.headers,
+        },
+      })
+    } catch (e) {
+      if (this.instance) this.identity = null
+      throw e
+    }
     if (!res.ok) {
+      this.noteStatus(res)
       throw new Error(`HTTP ${res.status}: ${res.statusText}`)
     }
     return res.json()
@@ -84,24 +442,35 @@ class ApiClient {
    * the header, never the cookie.
    */
   private async postFormData<T>(path: string, formData: FormData): Promise<T> {
-    const url = `${this.baseUrl}${path}`
-    // A plain `fetch` that never reaches the backend throws a bare
-    // `TypeError: Failed to fetch`, which is useless in a bug report. The most
-    // common cause here is a transient connection refusal (the local backend
-    // still booting, or briefly restarting), so retry once after a short delay
-    // and, on a persistent network failure, raise an actionable message that
-    // names the target URL instead of the opaque browser error.
+    // Multipart bodies must NOT get a copy of agent_id when the query already
+    // carries it: web.py merges query + form fields and a duplicate collapses
+    // into a list, which breaks handlers expecting a string. So scope via the
+    // query only, and only when the form doesn't already name an Agent.
+    const scopedPath = formData.has('agent_id') ? path : this.carryAgent(path).path
+    const url = `${this.baseUrl}${scopedPath}`
+    // A plain `fetch` throws a bare `TypeError: Failed to fetch` for any
+    // network-level failure. In Electron this is almost never "the backend is
+    // down" — the backend is a local child process that either answers with a
+    // JSON error or a real HTTP status. It's a transient connection reset:
+    // the WSGI thread pool is momentarily busy (an SSE stream holding threads,
+    // a concurrent request), or the socket got dropped mid-body. It's
+    // intermittent and unrelated to the file's type, which is why some uploads
+    // go through and others don't. So retry a few times with backoff before
+    // giving up, and never surface the internal "local service / backend"
+    // wording to the user — just tell them the upload was interrupted.
+    const maxAttempts = 4
     let lastErr: unknown
-    for (let attempt = 0; attempt < 2; attempt++) {
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 600))
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 400 * attempt))
       try {
         const res = await fetch(url, {
           method: 'POST',
           body: formData,
           credentials: 'include',
-          headers: this.authToken ? { Authorization: `Bearer ${this.authToken}` } : undefined,
+          headers: await this.authHeaders(),
         })
         if (!res.ok) {
+          this.noteStatus(res)
           // The backend returns JSON errors even on failure; surface its message
           // when present so the user sees the real reason (e.g. file too large).
           let detail = res.statusText
@@ -121,10 +490,25 @@ class ApiClient {
         if (!isNetwork) throw e
       }
     }
+    // Keep the technical detail (the target URL and raw error) in the console
+    // for bug reports, but hand the user a plain, non-alarming message.
     console.error(`[api] upload network failure to ${url}:`, lastErr)
-    throw new Error(
-      `无法连接到本地服务 (${url})，请确认客户端后台正在运行后重试`,
-    )
+    throw new Error(t('upload_network_error'))
+  }
+
+  /** A file's bytes in memory, for a multipart body to carry.
+   *
+   * In Electron, `fetch` streaming a File straight from disk intermittently
+   * rejects with a bare "Failed to fetch" (see `uploadFile`), and a retry of the
+   * same File hits the same backing path. Reading the bytes first sidesteps it;
+   * on failure the File itself is returned so behavior only degrades.
+   */
+  private async fileBytes(file: File): Promise<Blob | File> {
+    try {
+      return new Blob([await file.arrayBuffer()], { type: file.type })
+    } catch {
+      return file
+    }
   }
 
   // ---------------------------------------------------------
@@ -134,18 +518,44 @@ class ApiClient {
   async sendMessage(
     sessionId: string,
     message: string,
-    opts?: { stream?: boolean; attachments?: Attachment[]; isVoice?: boolean; lang?: string }
-  ): Promise<{ status: string; request_id: string; stream: boolean; inline_reply?: string }> {
+    opts?: {
+      stream?: boolean
+      attachments?: Attachment[]
+      isVoice?: boolean
+      lang?: string
+      /** The conversation's owner Agent; defaults to the active one. */
+      agentId?: string
+      /** A teammate addressed for this turn (group chat); the owner still owns
+       *  the conversation, this only changes who answers. */
+      speakerAgentId?: string
+      /** Shown for this turn instead of `message`, which the agent still gets in full. */
+      display?: string
+    }
+  ): Promise<{
+    status: string
+    request_id: string
+    stream: boolean
+    inline_reply?: string
+    speaker?: string
+    message?: string
+  }> {
+    // Route to a specific Agent when asked, else the active one. Empty (legacy
+    // single-Agent) omits agent_id entirely, so the backend uses its default.
+    const agentId = opts?.agentId || this.activeAgentId
+    const body: Record<string, unknown> = {
+      session_id: sessionId,
+      message,
+      stream: opts?.stream ?? true,
+      attachments: opts?.attachments,
+      is_voice: opts?.isVoice ?? false,
+      lang: opts?.lang,
+    }
+    if (agentId) body.agent_id = agentId
+    if (opts?.speakerAgentId) body.speaker_agent_id = opts.speakerAgentId
+    if (opts?.display) body.display = opts.display
     return this.request('/message', {
       method: 'POST',
-      body: JSON.stringify({
-        session_id: sessionId,
-        message,
-        stream: opts?.stream ?? true,
-        attachments: opts?.attachments,
-        is_voice: opts?.isVoice ?? false,
-        lang: opts?.lang,
-      }),
+      body: JSON.stringify(body),
     })
   }
 
@@ -172,9 +582,10 @@ class ApiClient {
   // EventSource can't set an Authorization header, so append the auth token as
   // a query param for SSE endpoints (the backend accepts it there).
   private withToken(url: string): string {
-    if (!this.authToken) return url
+    const token = this.confirmedToken
+    if (!token) return url
     const sep = url.includes('?') ? '&' : '?'
-    return `${url}${sep}token=${encodeURIComponent(this.authToken)}`
+    return `${url}${sep}token=${encodeURIComponent(token)}`
   }
 
   createSSEStream(requestId: string): EventSource {
@@ -186,15 +597,19 @@ class ApiClient {
     userSeq: number
     deleteUser?: boolean
     cascade?: boolean
+    /** Owner of the session; defaults to the active Agent. */
+    agentId?: string
   }): Promise<{ status: string; deleted: number }> {
+    const body: Record<string, unknown> = {
+      session_id: opts.sessionId,
+      user_seq: opts.userSeq,
+      delete_user: opts.deleteUser ?? true,
+      cascade: opts.cascade ?? false,
+    }
+    if (opts.agentId) body.agent_id = opts.agentId
     return this.request('/api/messages/delete', {
       method: 'POST',
-      body: JSON.stringify({
-        session_id: opts.sessionId,
-        user_seq: opts.userSeq,
-        delete_user: opts.deleteUser ?? true,
-        cascade: opts.cascade ?? false,
-      }),
+      body: JSON.stringify(body),
     })
   }
 
@@ -202,14 +617,74 @@ class ApiClient {
   // Upload / files
   // ---------------------------------------------------------
 
-  async uploadFile(file: File, sessionId?: string): Promise<{
-    status: string
-    file_path: string
-    file_name: string
-    file_type: string
-    preview_url: string
-    message?: string
-  }> {
+  // Whether the backend runs on this machine. Only then does a local file path
+  // mean anything to it; a remote backend must receive the bytes.
+  isLoopbackBackend(): boolean {
+    // A paired instance is another installation even on a loopback address
+    // (an SSH tunnel, a second copy): it gets neither this machine's desktop
+    // token nor its file paths.
+    if (this.instance) return false
+    try {
+      const host = new URL(this.baseUrl).hostname
+      return host === '127.0.0.1' || host === 'localhost' || host === '[::1]' || host === '::1'
+    } catch {
+      return false
+    }
+  }
+
+  private desktopTokenPromise: Promise<string> | null = null
+
+  private getDesktopToken(): Promise<string> {
+    if (!this.desktopTokenPromise) {
+      const api = typeof window !== 'undefined' ? window.electronAPI : undefined
+      this.desktopTokenPromise = api?.getDesktopToken
+        ? api.getDesktopToken().catch(() => '')
+        : Promise.resolve('')
+    }
+    return this.desktopTokenPromise
+  }
+
+  /**
+   * Hand the local backend the file's path and let it copy the file itself.
+   *
+   * Resolves to null when this route doesn't apply (no path, remote backend,
+   * not running under the desktop shell) or the backend declines, so the
+   * caller falls back to a regular multipart upload. Never throws.
+   */
+  private async importLocalFile(
+    file: File,
+    sessionId?: string
+  ): Promise<UploadResult | null> {
+    const api = typeof window !== 'undefined' ? window.electronAPI : undefined
+    if (!api?.getPathForFile || !this.isLoopbackBackend()) return null
+    const localPath = api.getPathForFile(file)
+    if (!localPath) return null
+    const token = await this.getDesktopToken()
+    if (!token) return null
+    try {
+      const body: Record<string, unknown> = { local_path: localPath }
+      if (sessionId) body.session_id = sessionId
+      const res = await this.request<UploadResult>('/upload', {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'X-Cow-Desktop-Token': token },
+      })
+      if (res?.status === 'success') return res
+      console.warn('[api] import by path declined, falling back to upload:', res?.message)
+      return null
+    } catch (e) {
+      console.warn('[api] import by path failed, falling back to upload:', e)
+      return null
+    }
+  }
+
+  async uploadFile(file: File, sessionId?: string): Promise<UploadResult> {
+    // Same machine, same disk: skip the HTTP body entirely when we can. The
+    // multipart route below stays as the fallback for pasted images (no path),
+    // remote backends and plain browsers.
+    const imported = await this.importLocalFile(file, sessionId)
+    if (imported) return imported
+
     const formData = new FormData()
     // Read the file into memory (a Blob) instead of appending the File directly.
     // In Electron, `fetch` streaming a File straight from disk intermittently
@@ -260,6 +735,41 @@ class ApiClient {
 
   async workspaceResolve(path: string, session?: string): Promise<{ file: WorkspaceEntry } & ApiResult> {
     return this.request(`/api/workspace/resolve?path=${encodeURIComponent(path)}${this.sessionQuery(session)}`)
+  }
+
+  /**
+   * Text content of one workspace file, for the preview panel's editor.
+   *
+   * Unlike the preview URL used for rendering, this reports the `mtime` to pass
+   * back on save and whether the file is editable at all.
+   */
+  async workspaceRead(path: string, session?: string): Promise<WorkspaceReadResult & ApiResult> {
+    return this.request(`/api/workspace/read?path=${encodeURIComponent(path)}${this.sessionQuery(session)}`)
+  }
+
+  /**
+   * Save edited text back to a workspace file.
+   *
+   * The backend answers 200 even when it refuses, so the caller must check
+   * `status`: `code === 'conflict'` means the file changed since
+   * `expectedMtime` and the user has to choose between reloading and
+   * overwriting. Pass `expectedMtime: null` to force the overwrite.
+   */
+  async workspaceWrite(args: {
+    path: string
+    content: string
+    session?: string
+    expectedMtime?: number | null
+  }): Promise<WorkspaceWriteResult & ApiResult> {
+    return this.request('/api/workspace/write', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: args.path,
+        content: args.content,
+        session: args.session || '',
+        expected_mtime: args.expectedMtime ?? null,
+      }),
+    })
   }
 
   // ---------------------------------------------------------
@@ -321,60 +831,128 @@ class ApiClient {
   // Sessions
   // ---------------------------------------------------------
 
+  // Conversations live in their owner Agent's store. Every session call below
+  // takes the owner (`agentId`) explicitly so the list can act on any row, not
+  // just the active Agent's; when omitted, the active Agent (the owner of the
+  // open conversation) is carried automatically. Single-Agent installs pass
+  // nothing and get the legacy requests.
+
+  /** All Agents' web sessions merged into one recency-ordered list. A
+   *  single-Agent backend returns exactly its own list (with an `agent` badge);
+   *  a legacy backend ignores the unknown `scope` parameter. */
   async getSessions(page = 1, pageSize = 50): Promise<SessionsPage> {
-    return this.request<{ status: string } & SessionsPage>(`/api/sessions?page=${page}&page_size=${pageSize}`)
+    return this.request<{ status: string } & SessionsPage>(
+      `/api/sessions?page=${page}&page_size=${pageSize}&scope=all`
+    )
   }
 
-  async deleteSession(sessionId: string): Promise<ApiResult> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+  async deleteSession(sessionId: string, agentId?: string): Promise<ApiResult> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}`, agentId), {
+      method: 'DELETE',
+    })
   }
 
-  async renameSession(sessionId: string, title: string): Promise<ApiResult> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+  async renameSession(sessionId: string, title: string, agentId?: string): Promise<ApiResult> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}`, agentId), {
       method: 'PUT',
-      body: JSON.stringify({ title }),
+      body: JSON.stringify(agentId ? { title, agent_id: agentId } : { title }),
     })
   }
 
   /** Pin or unpin a session; pinned sessions sort to the top of their group. */
-  async setSessionPinned(sessionId: string, pinned: boolean): Promise<ApiResult> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}`, {
+  async setSessionPinned(sessionId: string, pinned: boolean, agentId?: string): Promise<ApiResult> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}`, agentId), {
       method: 'PUT',
-      body: JSON.stringify({ pinned }),
+      body: JSON.stringify(agentId ? { pinned, agent_id: agentId } : { pinned }),
     })
   }
 
-  /** This session's effective model + permission, with the catalog to switch. */
-  async getSessionSettings(sessionId: string): Promise<{ status: string } & SessionSettingsState> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/settings`)
+  /** This session's effective model + permission (and team), with the catalog to switch. */
+  async getSessionSettings(sessionId: string, agentId?: string): Promise<{ status: string } & SessionSettingsState> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, agentId))
   }
 
-  /** Set or clear this session's model / permission override. Pass null to a
-   *  field to drop the override and follow the global default. */
+  /** Set or clear this session's model / permission override, or its team
+   *  members. Pass null to a field to drop the override and follow the global
+   *  default (null members = nobody invited). */
   async updateSessionSettings(
     sessionId: string,
-    body: { provider?: string | null; model?: string | null; permission?: string | null }
+    body: { provider?: string | null; model?: string | null; permission?: string | null; members?: string[] | null },
+    agentId?: string
   ): Promise<{ status: string } & Partial<SessionSettingsState> & { message?: string }> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/settings`, agentId), {
+      method: 'POST',
+      body: JSON.stringify(agentId ? { ...body, agent_id: agentId } : body),
+    })
+  }
+
+  async generateSessionTitle(
+    sessionId: string,
+    userMessage: string,
+    assistantReply?: string,
+    agentId?: string
+  ): Promise<{ status: string; title: string }> {
+    const body: Record<string, unknown> = { user_message: userMessage, assistant_reply: assistantReply }
+    if (agentId) body.agent_id = agentId
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/generate_title`, agentId), {
       method: 'POST',
       body: JSON.stringify(body),
     })
   }
 
-  async generateSessionTitle(sessionId: string, userMessage: string, assistantReply?: string): Promise<{ status: string; title: string }> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/generate_title`, {
+  async clearContext(sessionId: string, agentId?: string): Promise<{ status: string; context_start_seq: number }> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/clear_context`, agentId), {
       method: 'POST',
-      body: JSON.stringify({ user_message: userMessage, assistant_reply: assistantReply }),
+      body: JSON.stringify(agentId ? { agent_id: agentId } : {}),
     })
   }
 
-  async clearContext(sessionId: string): Promise<{ status: string; context_start_seq: number }> {
-    return this.request(`/api/sessions/${encodeURIComponent(sessionId)}/clear_context`, { method: 'POST' })
+  async getContextUsage(sessionId: string, agentId?: string): Promise<{ status: string } & ContextUsage> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/context_usage`, agentId))
   }
 
-  async getHistory(sessionId: string, page = 1, pageSize = 20): Promise<HistoryPage> {
+  // Synchronous manual compaction (same logic as the /compact command). Returns
+  // the refreshed usage so the caller can redraw the chart without a refetch.
+  async compactContext(
+    sessionId: string,
+    agentId?: string,
+  ): Promise<{
+    status: string
+    ok?: boolean
+    available?: boolean
+    compacted_turns?: number
+    before?: number
+    after?: number
+    usage?: ContextUsage | null
+  }> {
+    return this.request(this.scoped(`/api/sessions/${encodeURIComponent(sessionId)}/compact_context`, agentId), {
+      method: 'POST',
+      body: JSON.stringify(agentId ? { agent_id: agentId } : {}),
+    })
+  }
+
+  async getHistory(
+    sessionId: string,
+    page = 1,
+    pageSize = 20,
+    agentId?: string,
+    untilSeq?: number
+  ): Promise<HistoryPage> {
+    const until = untilSeq != null ? `&until_seq=${untilSeq}` : ''
     return this.request<{ status: string } & HistoryPage>(
-      `/api/history?session_id=${encodeURIComponent(sessionId)}&page=${page}&page_size=${pageSize}`
+      this.scoped(
+        `/api/history?session_id=${encodeURIComponent(sessionId)}&page=${page}&page_size=${pageSize}${until}`,
+        agentId
+      )
+    )
+  }
+
+  // Lightweight index of a session's user messages for the navigation timeline.
+  // Returns the whole conversation's user turns at once (no pagination): the
+  // payload is small since it only carries {seq, preview, created_at}.
+  async getUserMessages(sessionId: string, agentId?: string): Promise<UserMessageIndex> {
+    return this.request<{ status: string } & UserMessageIndex>(
+      this.scoped(`/api/history/user_messages?session_id=${encodeURIComponent(sessionId)}`, agentId)
     )
   }
 
@@ -387,9 +965,237 @@ class ApiClient {
   }
 
   async updateConfig(updates: Record<string, unknown>): Promise<{ status: string; applied: Record<string, unknown> }> {
-    return this.request('/config', {
+    const save = this.request<{ status: string; applied: Record<string, unknown>; auth_token?: string }>('/config', {
       method: 'POST',
       body: JSON.stringify({ updates }),
+    }).then((res) => {
+      // Setting a password voids the current token; the backend returns one
+      // signed with the new password.
+      if (res.auth_token) this.setAuthToken(res.auth_token)
+      return res
+    })
+    if (!('web_password' in updates)) return save
+    this.passwordChange = save
+    try {
+      return await save
+    } finally {
+      if (this.passwordChange === save) this.passwordChange = null
+    }
+  }
+
+  /** The OpenAI-compatible chat API: whether it is on, its key, and the Agents it serves. */
+  async getExternalApi(): Promise<ApiResult & ExternalApiState> {
+    return this.request('/api/external_api')
+  }
+
+  async updateExternalApi(
+    action: 'enable' | 'disable' | 'regenerate'
+  ): Promise<ApiResult & ExternalApiState> {
+    return this.request('/api/external_api', { method: 'POST', body: JSON.stringify({ action }) })
+  }
+
+  // ---------------------------------------------------------
+  // Integrations: public address and guest pages
+  // ---------------------------------------------------------
+
+  async getIntegrations(): Promise<ApiResult & IntegrationsState> {
+    return this.request('/api/integrations')
+  }
+
+  async savePublicUrl(publicUrl: string): Promise<ApiResult & IntegrationsState> {
+    return this.request('/api/integrations', { method: 'PUT', body: JSON.stringify({ public_url: publicUrl }) })
+  }
+
+  /** Saves web_host; the server restarts on it right after answering. */
+  async saveListenHost(host: string): Promise<ApiResult & IntegrationsState & { reason?: string }> {
+    return this.request('/api/integrations', { method: 'PUT', body: JSON.stringify({ web_host: host }) })
+  }
+
+  /** `baseUrl` is an address this side knows reaches the server, offered to the phone first. */
+  async createPairing(baseUrl = ''): Promise<ApiResult & PairingCode & { reason?: string }> {
+    return this.request('/api/pairing', { method: 'POST', body: JSON.stringify({ base_url: baseUrl }) })
+  }
+
+  async getPairing(id: string): Promise<ApiResult & { state: 'pending' | 'paired' | 'expired'; device?: PairedDevice }> {
+    return this.request(`/api/pairing/${encodeURIComponent(id)}`)
+  }
+
+  async listDevices(): Promise<ApiResult & DeviceList> {
+    return this.request('/api/devices')
+  }
+
+  /** Names this CowAgent device for every client that connects to it. */
+  async renameSelf(name: string): Promise<ApiResult & { instance?: DeviceSelf }> {
+    return this.request('/api/device', { method: 'PATCH', body: JSON.stringify({ name }) })
+  }
+
+  async renameDevice(id: string, name: string): Promise<ApiResult & { device?: PairedDevice }> {
+    return this.request(`/api/devices/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+  }
+
+  async removeDevice(id: string): Promise<ApiResult> {
+    return this.request(`/api/devices/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  }
+
+  /** Guest pages belong to the instance, not an Agent, and their errors carry a reason code. */
+  private async shareRequest<T>(path: string, method = 'GET', body?: unknown | FormData): Promise<T> {
+    const isForm = body instanceof FormData
+    const res = await fetch(`${this.baseUrl}/api/guest-shares${path}`, {
+      method,
+      credentials: 'include',
+      headers: {
+        ...(body !== undefined && !isForm ? { 'Content-Type': 'application/json' } : {}),
+        ...(await this.authHeaders()),
+      },
+      body: body === undefined ? undefined : isForm ? (body as FormData) : JSON.stringify(body),
+    })
+    let data: Record<string, unknown> = {}
+    try {
+      data = await res.json()
+    } catch {
+      /* empty body */
+    }
+    if (!res.ok || data.status === 'error') {
+      this.noteStatus(res)
+      throw new ShareApiError(String(data.message || `HTTP ${res.status}`), String(data.reason || ''))
+    }
+    return data as T
+  }
+
+  listGuestShares(): Promise<GuestSharesOverview> {
+    return this.shareRequest('')
+  }
+
+  setGuestSharesEnabled(enabled: boolean): Promise<{ feature: GuestFeature }> {
+    return this.shareRequest('', 'PUT', { enabled })
+  }
+
+  getGuestShare(slug: string): Promise<{ share: GuestShare }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}`)
+  }
+
+  createGuestShare(config: GuestShareConfig, guestMd: string): Promise<{ share: GuestShare }> {
+    return this.shareRequest('', 'POST', { config, guest_md: guestMd })
+  }
+
+  updateGuestShare(slug: string, config: GuestShareConfig, guestMd?: string): Promise<{ share: GuestShare }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}`, 'PUT', guestMd === undefined ? { config } : { config, guest_md: guestMd })
+  }
+
+  deleteGuestShare(slug: string): Promise<ApiResult> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}`, 'DELETE')
+  }
+
+  guestShareAction(
+    slug: string,
+    action: 'confirm' | 'reset-link' | 'disable' | 'enable' | 'password',
+    body: Record<string, unknown> = {}
+  ): Promise<{ share: GuestShare }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}/${action}`, 'POST', body)
+  }
+
+  uploadGuestShareLogo(slug: string, file: File): Promise<{ share: GuestShare }> {
+    const form = new FormData()
+    form.append('file', file)
+    return this.shareRequest(`/${encodeURIComponent(slug)}/logo`, 'POST', form)
+  }
+
+  deleteGuestShareLogo(slug: string): Promise<{ share: GuestShare }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}/logo`, 'DELETE')
+  }
+
+  guestShareLogoUrl(share: Pick<GuestShare, 'slug' | 'logo_version'>): string {
+    return share.logo_version
+      ? this.withToken(`${this.baseUrl}/api/guest-shares/${encodeURIComponent(share.slug)}/logo?v=${share.logo_version}`)
+      : `${this.baseUrl}/assets/logo.jpg`
+  }
+
+  guestShareLogs(slug: string): Promise<{ sessions: GuestLogSession[] }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}/logs`)
+  }
+
+  guestShareLog(slug: string, sessionId: string): Promise<{ records: GuestLogRecord[] }> {
+    return this.shareRequest(`/${encodeURIComponent(slug)}/logs/${encodeURIComponent(sessionId)}`)
+  }
+
+  // ---------------------------------------------------------
+  // Menu (shared with the web console) and the artifacts it can hold
+  // ---------------------------------------------------------
+
+  /** The menu the user arranged, or null while they keep the built-in one. */
+  async getMenu(): Promise<ApiResult & { menu: MenuDoc | null }> {
+    return this.request('/api/menu')
+  }
+
+  /** Save the whole menu; null goes back to the built-in one. */
+  async saveMenu(menu: MenuDoc | null): Promise<ApiResult & { menu: MenuDoc | null }> {
+    return this.request('/api/menu', { method: 'POST', body: JSON.stringify({ menu }) })
+  }
+
+  /** Web pages and markdown documents produced across every Agent's conversations, newest first. */
+  async listPageArtifacts(query: string, limit = 40): Promise<ApiResult & { items: ArtifactListItem[] }> {
+    return this.listArtifacts({ scope: 'all', kind: 'page', q: query, limit })
+  }
+
+  // ---------------------------------------------------------
+  // Artifacts: the files the conversations produced, across Agents
+  // ---------------------------------------------------------
+
+  /**
+   * One page of the index, pinned first, then newest first. `scope` is `all`
+   * or an Agent id, and decides whose files are listed, so the active Agent is
+   * not carried.
+   */
+  async listArtifacts(params: {
+    scope: string
+    kind?: string
+    q?: string
+    path?: string
+    offset?: number
+    limit?: number
+  }): Promise<ApiResult & { items: ArtifactListItem[]; has_more: boolean }> {
+    const qs = new URLSearchParams({
+      scope: params.scope,
+      kind: params.kind || '',
+      q: params.q || '',
+      path: params.path || '',
+      offset: String(params.offset || 0),
+      limit: String(params.limit || 48),
+      agent_id: '',
+    })
+    return this.request(`/api/artifacts?${qs.toString()}`)
+  }
+
+  /** Put a file back in the index, attributed to the turn it came from. */
+  async addArtifact(body: {
+    path: string
+    session_id: string
+    agent_id: string
+    turn_seq: number | null
+  }): Promise<ApiResult & { item: ArtifactListItem | null }> {
+    return this.request('/api/artifacts/add', { method: 'POST', body: JSON.stringify(body) })
+  }
+
+  async pinArtifact(id: number, agentId: string, pinned: boolean): Promise<ApiResult & { pinned_at: number }> {
+    return this.request('/api/artifacts/pin', {
+      method: 'POST',
+      body: JSON.stringify({ id, agent_id: agentId, pinned }),
+    })
+  }
+
+  /** Name an entry in the view; the file keeps its name on disk, and '' restores it. */
+  async renameArtifact(id: number, agentId: string, title: string): Promise<ApiResult & { title: string }> {
+    return this.request('/api/artifacts/rename', {
+      method: 'POST',
+      body: JSON.stringify({ id, agent_id: agentId, title }),
+    })
+  }
+
+  /** Forget an entry; the file stays where it is. */
+  async deleteArtifact(id: number, agentId: string): Promise<ApiResult & { removed: boolean }> {
+    return this.request('/api/artifacts/delete', {
+      method: 'POST',
+      body: JSON.stringify({ id, agent_id: agentId }),
     })
   }
 
@@ -409,6 +1215,71 @@ class ApiClient {
   }
 
   // ---------------------------------------------------------
+  // Agents / team roster (multi-Agent mode)
+  //
+  // A legacy single-Agent backend still answers GET /api/agents with a
+  // one-entry roster (the synthesized default Agent), so these are safe to call
+  // everywhere; the UI decides whether to surface multi-Agent affordances based
+  // on the roster size, never by assuming the endpoint is absent.
+  // ---------------------------------------------------------
+
+  async getAgents(): Promise<RosterSnapshot> {
+    return this.request<RosterSnapshot>('/api/agents')
+  }
+
+  async agentAction(
+    body: Record<string, unknown>
+  ): Promise<Record<string, unknown> & { status: string }> {
+    return this.request('/api/agents', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  }
+
+  // A cache-busting URL for an Agent's uploaded avatar. `version` should change
+  // whenever the image is replaced so the <img> refetches (the roster revision
+  // works well as the token). Carries the auth token for password-protected
+  // backends, like the other file endpoints.
+  agentAvatarUrl(agentId: string, version: string): string {
+    return this.withToken(
+      `${this.baseUrl}/api/agents/${encodeURIComponent(agentId)}/avatar?v=${encodeURIComponent(version)}`
+    )
+  }
+
+  async uploadAgentAvatar(agentId: string, file: File): Promise<{ status: string; message?: string; revision?: string }> {
+    const formData = new FormData()
+    formData.append('avatar', file)
+    return this.postFormData(`/api/agents/${encodeURIComponent(agentId)}/avatar`, formData)
+  }
+
+  // An Agent's editable core files (AGENT.md / USER.md / RULE.md / MEMORY.md).
+  // The read returns the current content plus a revision used for optimistic
+  // concurrency on write.
+  async getAgentCoreFile(
+    agentId: string,
+    filename: string
+  ): Promise<{ status: string; content?: string; revision?: string; message?: string }> {
+    return this.request(
+      `/api/agents/${encodeURIComponent(agentId)}/files/${encodeURIComponent(filename)}`
+    )
+  }
+
+  async saveAgentCoreFile(
+    agentId: string,
+    filename: string,
+    content: string,
+    revision?: string
+  ): Promise<{ status: string; revision?: string; message?: string }> {
+    return this.request(
+      `/api/agents/${encodeURIComponent(agentId)}/files/${encodeURIComponent(filename)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ content, revision }),
+      }
+    )
+  }
+
+  // ---------------------------------------------------------
   // Channels
   // ---------------------------------------------------------
 
@@ -421,20 +1292,36 @@ class ApiClient {
     return data.channels
   }
 
+  // Full channels response including the multi-Agent fields. A legacy backend
+  // simply omits `multi_agent`/`instances`, so callers see them as undefined
+  // and fall back to the single-instance path — no behavior change.
+  async getChannelsFull(): Promise<ChannelsResponse> {
+    return this.request<ChannelsResponse>(`/api/channels?lang=${getLang()}`)
+  }
+
   async channelAction(
     action: ChannelAction,
     channel: string,
-    config?: Record<string, unknown>
+    config?: Record<string, unknown>,
+    instanceId?: string
   ): Promise<Record<string, unknown> & { status: string }> {
+    // instance_id is only meaningful in multi-Agent mode (multi-instance
+    // channels). Sending an empty string is what "create a new instance" means
+    // to the backend; omitting it entirely keeps the legacy per-type path.
+    const body: Record<string, unknown> = { action, channel, config }
+    if (instanceId !== undefined) body.instance_id = instanceId
     return this.request('/api/channels', {
       method: 'POST',
-      body: JSON.stringify({ action, channel, config }),
+      body: JSON.stringify(body),
     })
   }
 
-  // Weixin QR login
-  async getWeixinQr(): Promise<{ status: string; qrcode_url?: string; qr_image?: string; source?: string; message?: string }> {
-    return this.request('/api/weixin/qrlogin')
+  // Weixin QR login. Pass instance_id so a live card reads that channel's
+  // own code instead of opening a standalone session (which would mint a
+  // second instance on confirm).
+  async getWeixinQr(instanceId?: string): Promise<{ status: string; qrcode_url?: string; qr_image?: string; source?: string; message?: string }> {
+    const q = instanceId ? `?instance_id=${encodeURIComponent(instanceId)}` : ''
+    return this.request(`/api/weixin/qrlogin${q}`)
   }
 
   async weixinQrAction(action: 'poll' | 'refresh'): Promise<Record<string, unknown> & { status: string }> {
@@ -465,8 +1352,13 @@ class ApiClient {
     return data.tools
   }
 
-  async getSkills(): Promise<SkillInfo[]> {
-    const data = await this.request<{ status: string; skills: SkillInfo[] }>('/api/skills')
+  // The global Skills page stays global (no agent scope), matching the web
+  // console: it manages the shared skill library. Per-Agent skill *selection*
+  // is a separate concern handled on the Agents page, which passes an explicit
+  // agentId to read/write that Agent's subset.
+  async getSkills(agentId?: string): Promise<SkillInfo[]> {
+    const path = agentId ? `/api/skills?agent_id=${encodeURIComponent(agentId)}` : '/api/skills'
+    const data = await this.request<{ status: string; skills: SkillInfo[] }>(path)
     return data.skills
   }
 
@@ -477,54 +1369,227 @@ class ApiClient {
     })
   }
 
+  /** Fetch a skill into a staging area so it can be reviewed before installing. */
+  async previewSkill(source: SkillMarketSource, value: string): Promise<SkillPreviewResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'preview', source, value }),
+    })
+  }
+
+  /** Stage uploaded files; `path` keeps each file's place inside a dropped folder. */
+  async uploadSkill(files: Array<{ file: File; path: string }>): Promise<SkillPreviewResult> {
+    const formData = new FormData()
+    for (const { file, path } of files) {
+      formData.append('files', file, file.name)
+      formData.append('paths', path)
+    }
+    return this.postFormData('/api/skills/upload', formData)
+  }
+
+  async confirmSkill(token: string, names: string[]): Promise<ApiResult & { installed?: string[] }> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'confirm', token, names }),
+    })
+  }
+
+  async discardSkill(token: string): Promise<ApiResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'discard', token }),
+    })
+  }
+
+  /** Install straight from a remote spec (e.g. an https archive URL), without staging. */
+  /** `meta` is recorded on the skill when the spec installs exactly one. */
+  async installSkill(spec: string, meta?: SkillInstallMeta): Promise<ApiResult & { installed?: string[] }> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'install', spec, ...(meta ? { meta } : {}) }),
+    })
+  }
+
+  async deleteSkill(name: string): Promise<ApiResult> {
+    return this.request('/api/skills', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'delete', name }),
+    })
+  }
+
+  async getMcpServers(): Promise<McpServersResult> {
+    const res: McpServersResult = await this.request('/api/mcp/servers')
+    // A broken mcp.json answers 200 with status "error"; surface it instead of
+    // rendering an empty list that looks like the configuration was lost.
+    if (res && res.status === 'error') {
+      throw new Error(res.message || 'failed to load MCP servers')
+    }
+    return res
+  }
+
+  async saveMcpServers(servers: McpServerConfig[]): Promise<McpServersResult> {
+    return this.request('/api/mcp/servers', {
+      method: 'PUT',
+      body: JSON.stringify({ servers }),
+    })
+  }
+
+  async testMcpServer(server: McpServerConfig): Promise<McpTestResult> {
+    return this.request('/api/mcp/servers/test', {
+      method: 'POST',
+      body: JSON.stringify({ server }),
+    })
+  }
+
+  /**
+   * Create a skill from the fields a form collects (multipart: the body carries
+   * files as well as text). `name` is a title, which the server reduces to the
+   * hyphen-case name the directory uses; `files` are bundled beside SKILL.md.
+   *
+   * An attachment picked as part of a folder keeps the path it sat at, sent in a
+   * field of its own the way an uploaded folder's paths are: a skill's resources
+   * come as a `scripts/` directory as often as they come as loose files.
+   */
+  async createSkill(args: {
+    name: string
+    description: string
+    body?: string
+    files?: File[]
+  }): Promise<SkillCreateResult & ApiResult> {
+    const formData = new FormData()
+    formData.append('name', args.name)
+    formData.append('description', args.description)
+    formData.append('body', args.body || '')
+    for (const file of args.files || []) {
+      formData.append('files', await this.fileBytes(file), file.name)
+      formData.append('relative_paths', file.webkitRelativePath || file.name)
+    }
+    return this.postFormData('/api/skills/create', formData)
+  }
+
+  /**
+   * The files one skill is made of: its SKILL.md, and the `scripts/`,
+   * `references/` and assets installed beside it.
+   */
+  async listSkillFiles(name: string): Promise<SkillFileEntry[]> {
+    const data = await this.request<{ status: string; files: SkillFileEntry[] }>(
+      `/api/skills/files?name=${encodeURIComponent(name)}`
+    )
+    return data.files || []
+  }
+
+  /**
+   * Read one of a skill's files, its SKILL.md by default.
+   *
+   * The skill is addressed by name rather than by path: which directory a name
+   * resolves to is the loader's business, and a builtin skill sits outside the
+   * workspace. `path` then names a file inside that directory.
+   */
+  async readSkill(name: string, path?: string): Promise<SkillContent & ApiResult> {
+    const query = `name=${encodeURIComponent(name)}`
+      + (path ? `&path=${encodeURIComponent(path)}` : '')
+    return this.request(`/api/skills/content?${query}`)
+  }
+
+  /**
+   * Save one of a skill's files.
+   *
+   * Refuses a skill that ships with the installation, and answers
+   * `code === 'conflict'` when the file changed since `expectedMtime` - both
+   * with status 200, so the caller has to look.
+   */
+  async writeSkill(args: {
+    name: string
+    path?: string
+    content: string
+    expectedMtime?: number | null
+  }): Promise<WorkspaceWriteResult & ApiResult> {
+    return this.request('/api/skills/content', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: args.name,
+        path: args.path || '',
+        content: args.content,
+        expected_mtime: args.expectedMtime ?? null,
+      }),
+    })
+  }
+
   // ---------------------------------------------------------
   // Memory
   // ---------------------------------------------------------
 
-  async getMemoryList(page = 1, pageSize = 20, category: MemoryCategory = 'memory'): Promise<MemoryPage> {
+  async getMemoryList(
+    page = 1,
+    pageSize = 20,
+    category: MemoryCategory = 'memory',
+    agentId?: string
+  ): Promise<MemoryPage> {
     return this.request<{ status: string } & MemoryPage>(
-      `/api/memory?page=${page}&page_size=${pageSize}&category=${category}`
+      this.scoped(`/api/memory?page=${page}&page_size=${pageSize}&category=${category}`, agentId)
     )
   }
 
-  async getMemoryContent(filename: string, category: MemoryCategory = 'memory'): Promise<string> {
-    const data = await this.request<{ status: string; content: string }>(
-      `/api/memory/content?filename=${encodeURIComponent(filename)}&category=${category}`
+  /**
+   * Read a memory file.
+   *
+   * `rel_path` is what an edit needs: memory files are addressed by name and
+   * category here, but the read and write endpoints take a path. `agentId`
+   * scopes the read to the right agent's workspace in a multi-agent setup.
+   */
+  async getMemoryDoc(
+    filename: string,
+    category: MemoryCategory = 'memory',
+    agentId?: string
+  ): Promise<MemoryDoc & ApiResult> {
+    return this.request(
+      this.scoped(
+        `/api/memory/content?filename=${encodeURIComponent(filename)}&category=${category}`,
+        agentId
+      )
     )
-    return data.content
   }
 
   // ---------------------------------------------------------
   // Knowledge
   // ---------------------------------------------------------
 
-  async getKnowledgeList(): Promise<KnowledgeList> {
-    return this.request<{ status: string } & KnowledgeList>('/api/knowledge/list')
+  async getKnowledgeList(agentId?: string): Promise<KnowledgeList> {
+    return this.request<{ status: string } & KnowledgeList>(this.scoped('/api/knowledge/list', agentId))
   }
 
-  async readKnowledge(path: string): Promise<{ status: string; content: string; path: string; dir?: string }> {
-    return this.request(`/api/knowledge/read?path=${encodeURIComponent(path)}`)
+  // `mtime` and `editable` are what an editor needs to offer a safe save: the
+  // baseline a stale write is rejected against, and whether the page may be
+  // written back at all (index.md and log.md are the Agent's to maintain).
+  async readKnowledge(
+    path: string,
+    agentId?: string
+  ): Promise<KnowledgeReadResult> {
+    return this.request(this.scoped(`/api/knowledge/read?path=${encodeURIComponent(path)}`, agentId))
   }
 
-  async getKnowledgeGraph(): Promise<KnowledgeGraph> {
-    return this.request<KnowledgeGraph>('/api/knowledge/graph')
+  async getKnowledgeGraph(agentId?: string): Promise<KnowledgeGraph> {
+    return this.request<KnowledgeGraph>(this.scoped('/api/knowledge/graph', agentId))
   }
 
   async knowledgeAction(req: KnowledgeAction): Promise<Record<string, unknown> & { status: string }> {
     return this.request('/api/knowledge/action', {
       method: 'POST',
-      body: JSON.stringify(req),
+      body: JSON.stringify(this.withAgent(req as unknown as Record<string, unknown>)),
     })
   }
 
   // Bulk import: upload .md/.txt files into a target category (multipart).
   async importKnowledge(
     files: File[],
-    targetCategory: string
+    targetCategory: string,
+    agentId?: string
   ): Promise<{ status: string; message?: string; payload?: KnowledgeImportPayload }> {
     const formData = new FormData()
     formData.append('target_category', targetCategory)
     formData.append('conflict_strategy', 'rename')
+    const scope = (agentId ?? this.activeAgentId) || ''
+    if (scope) formData.append('agent_id', scope)
     files.forEach((file) => formData.append('files', file, file.name))
     return this.postFormData('/api/knowledge/import', formData)
   }
@@ -533,36 +1598,155 @@ class ApiClient {
   // Scheduler
   // ---------------------------------------------------------
 
+  // In multi-Agent mode we ask for the aggregate list across every Agent by
+  // sending an explicit empty agent_id (the backend treats that as "all"),
+  // mirroring the web console. Single-Agent mode omits the param entirely so
+  // the legacy request is unchanged.
   async getSchedulerTasks(): Promise<SchedulerTask[]> {
-    const data = await this.request<{ status: string; tasks: SchedulerTask[] }>('/api/scheduler')
+    const path = this.activeAgentId ? '/api/scheduler?agent_id=' : '/api/scheduler'
+    const data = await this.request<{ status: string; tasks: SchedulerTask[] }>(path)
     return data.tasks
   }
 
-  async runTask(taskId: string): Promise<ApiResult> {
+  // Execution history for scheduled tasks, newest first. In multi-Agent mode we
+  // send an explicit empty agent_id so the backend returns the whole team's
+  // history (mirroring the task list); single-Agent mode omits the param.
+  // Pass a taskId to narrow to one task's runs.
+  async getSchedulerRuns(taskId = '', limit = 100, offset = 0): Promise<SchedulerRun[]> {
+    const qs = new URLSearchParams()
+    if (this.activeAgentId) qs.set('agent_id', '')
+    if (taskId) qs.set('task_id', taskId)
+    if (limit) qs.set('limit', String(limit))
+    if (offset) qs.set('offset', String(offset))
+    const query = qs.toString()
+    const path = query ? `/api/scheduler/runs?${query}` : '/api/scheduler/runs'
+    const data = await this.request<{ status: string; runs: SchedulerRun[] }>(path)
+    return data.runs || []
+  }
+
+  // Delete a single execution-history record from the runs ledger. Removes only
+  // the list item; the delivered message in the session history is untouched.
+  async deleteSchedulerRun(runId: string): Promise<void> {
+    await this.request<{ status: string }>('/api/scheduler/runs/delete', {
+      method: 'POST',
+      body: JSON.stringify({ run_id: runId }),
+    })
+  }
+
+  // Runs across ALL Agents that started after `since` (epoch seconds). Powers
+  // the cross-session scheduler notification poll: a scheduled task can fire
+  // into a session (any Agent) the user isn't viewing, so this is deliberately
+  // NOT scoped to the active Agent — the notifier decides what to surface.
+  async getSchedulerRunsSince(since: number, limit = 20): Promise<SchedulerRun[]> {
+    const qs = new URLSearchParams()
+    qs.set('since', String(Math.floor(since)))
+    if (limit) qs.set('limit', String(limit))
+    const data = await this.request<{ status: string; runs: SchedulerRun[] }>(
+      `/api/scheduler/runs?${qs.toString()}`
+    )
+    return data.runs || []
+  }
+
+  // Full detail for one run: the complete delivered body recovered from the
+  // receiver's session, or null (fall back to preview). Opened on demand when a
+  // history record is clicked, so the list stays a light index.
+  async getSchedulerRunDetail(runId: string): Promise<SchedulerRunDetail | null> {
+    const data = await this.request<{ status: string; run?: SchedulerRunDetail }>(
+      `/api/scheduler/runs/detail?run_id=${encodeURIComponent(runId)}`
+    )
+    return data.run || null
+  }
+
+  // Task mutations route to the owning Agent's store via its agent_id. Passing
+  // an empty string (or omitting in single-Agent mode) keeps the legacy path.
+  async runTask(taskId: string, agentId = ''): Promise<ApiResult> {
     return this.request('/api/scheduler/run', {
       method: 'POST',
-      body: JSON.stringify({ task_id: taskId }),
+      body: JSON.stringify({ task_id: taskId, agent_id: agentId }),
     })
   }
 
-  async toggleTask(taskId: string, enabled: boolean): Promise<{ status: string; task: SchedulerTask }> {
+  async toggleTask(taskId: string, enabled: boolean, agentId = ''): Promise<{ status: string; task: SchedulerTask }> {
     return this.request('/api/scheduler/toggle', {
       method: 'POST',
-      body: JSON.stringify({ task_id: taskId, enabled }),
+      body: JSON.stringify({ task_id: taskId, enabled, agent_id: agentId }),
     })
   }
 
-  async updateTask(taskId: string, updates: Partial<Pick<SchedulerTask, 'name' | 'enabled' | 'schedule' | 'action'>>): Promise<{ status: string; task: SchedulerTask }> {
+  async updateTask(
+    taskId: string,
+    updates: Partial<Pick<SchedulerTask, 'name' | 'enabled' | 'schedule' | 'action'>>,
+    agentId = ''
+  ): Promise<{ status: string; task: SchedulerTask }> {
     return this.request('/api/scheduler/update', {
       method: 'POST',
-      body: JSON.stringify({ task_id: taskId, ...updates }),
+      body: JSON.stringify({ task_id: taskId, agent_id: agentId, ...updates }),
     })
   }
 
-  async deleteTask(taskId: string): Promise<ApiResult> {
+  async deleteTask(taskId: string, agentId = ''): Promise<ApiResult> {
     return this.request('/api/scheduler/delete', {
       method: 'POST',
-      body: JSON.stringify({ task_id: taskId }),
+      body: JSON.stringify({ task_id: taskId, agent_id: agentId }),
+    })
+  }
+
+  // Create a cross-channel task for a trusted recipient. The backend derives the
+  // owning Agent from the recipient's channel instance and rejects any receiver
+  // not already in the trusted directory, so the client only names the target.
+  async createTask(payload: {
+    name: string
+    enabled: boolean
+    schedule: TaskSchedule
+    action: TaskAction
+  }): Promise<{ status: string; task?: SchedulerTask; message?: string }> {
+    return this.request('/api/scheduler/create', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  }
+
+  // Step 1 of the create/edit picker: channel instances a task can deliver
+  // through (web/unknown excluded). Each carries a friendly name, its bound
+  // Agent, and how many trusted recipients it has.
+  async getSchedulerInstances(): Promise<SchedulerInstance[]> {
+    const data = await this.request<{ status: string; instances: SchedulerInstance[] }>(
+      '/api/scheduler/instances'
+    )
+    return data.instances || []
+  }
+
+  // Step 2 of the picker: every trusted recipient learned from inbound messages,
+  // shared across Agents. The UI scopes them to the chosen instance client-side.
+  async getSchedulerRecipients(): Promise<TaskRecipient[]> {
+    const data = await this.request<{ status: string; recipients: TaskRecipient[] }>(
+      '/api/scheduler/recipients'
+    )
+    return data.recipients || []
+  }
+
+  async setChannelProject(channel: string, instanceId: string, projectDir: string): Promise<ApiResult> {
+    return this.request('/api/channels', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'set_project', channel, instance_id: instanceId, project_dir: projectDir }),
+    })
+  }
+
+  async browseChannelProject(path: string): Promise<{ status: string; message?: string; path: string; parent?: string; dirs: {name: string; path: string}[] }> {
+    return this.request(`/api/projects/browse?path=${encodeURIComponent(path)}`)
+  }
+
+  // Set a channel instance's friendly display name. Goes through the shared
+  // /api/channels endpoint with the 'rename' action; does not touch credentials
+  // or the live connection, so renaming never interrupts a running channel.
+  async renameChannelInstance(
+    channel: string,
+    instanceId: string,
+    name: string
+  ): Promise<{ status: string; instance_id?: string; name?: string; message?: string }> {
+    return this.request('/api/channels', {
+      method: 'POST',
+      body: JSON.stringify({ action: 'rename', channel, instance_id: instanceId, name }),
     })
   }
 
@@ -621,10 +1805,10 @@ class ApiClient {
     return this.request('/auth/check')
   }
 
-  async authLogin(password: string): Promise<ApiResult & { token?: string }> {
-    const res = await this.request<ApiResult & { token?: string }>('/auth/login', {
+  async authLogin(password: string): Promise<ApiResult & { token?: string; reason?: string; retry_after?: number }> {
+    const res = await this.request<ApiResult & { token?: string; reason?: string; retry_after?: number }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password, device: await deviceInfo() }),
     })
     if (res.status === 'success' && res.token) {
       this.setAuthToken(res.token)
@@ -633,9 +1817,23 @@ class ApiClient {
   }
 
   async authLogout(): Promise<ApiResult> {
-    this.setAuthToken(null)
-    return this.request('/auth/logout', { method: 'POST' })
+    // Sent with the token still attached, so the server drops this device.
+    try {
+      return await this.request('/auth/logout', { method: 'POST' })
+    } finally {
+      this.setAuthToken(null)
+    }
   }
+}
+
+/** LAN addresses as the backend reports them, so the web console and mobile app
+ *  show the same ones; this machine's own list only when the backend found none
+ *  and is this machine's. */
+export async function lanUrls(state: IntegrationsState): Promise<string[]> {
+  if (state.local_only || !state.listen?.port) return []
+  if (state.lan_urls?.length || apiClient.isRemote()) return state.lan_urls || []
+  const ips = (await window.electronAPI?.getLanAddresses?.().catch(() => [])) || []
+  return ips.map((ip) => `http://${ip}:${state.listen.port}`)
 }
 
 export const apiClient = new ApiClient()

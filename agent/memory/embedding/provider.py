@@ -31,6 +31,15 @@ from urllib.parse import urlparse
 # endpoints hang forever.
 EMBEDDING_HTTP_TIMEOUT = 90
 
+# OpenAI-compatible endpoints reject an empty string inside an `input` array
+# and fail the entire batch on it, so blank texts are substituted rather than
+# dropped: the returned vectors must stay aligned with the caller's texts.
+BLANK_INPUT_PLACEHOLDER = " "
+
+
+def _is_blank(text) -> bool:
+    return not text or not text.strip()
+
 
 class EmbeddingProvider(ABC):
     """Base class for embedding providers"""
@@ -91,6 +100,16 @@ EMBEDDING_VENDORS = {
         # carrying hundreds of long chunks routinely exceeds the 30s read
         # timeout from China-side networks. 64 keeps each call well under
         # both the token-per-request budget and a reasonable wall clock.
+        "max_batch_size": 64,
+    },
+    "cowagent": {
+        "default_base_url": "https://api.cowagent.cn/v1",
+        "default_model": "text-embedding-3-small",
+        "default_dimensions": 1536,
+        "supports_dim_param": True,
+        "needs_client_truncate": False,
+        "needs_client_normalize": False,
+        "query_instruction": "",
         "max_batch_size": 64,
     },
     "linkai": {
@@ -241,6 +260,20 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 pass
         return headers
 
+    @staticmethod
+    def _sanitize_input(input_data):
+        """Swap blank texts for a placeholder before they hit the wire."""
+        texts = [input_data] if isinstance(input_data, str) else list(input_data)
+        blanks = sum(1 for t in texts if _is_blank(t))
+        if blanks:
+            from common.log import logger
+            logger.warning(
+                f"[Embedding] {blanks}/{len(texts)} blank input(s) replaced with a "
+                f"placeholder; the caller should not embed empty texts"
+            )
+        cleaned = [BLANK_INPUT_PLACEHOLDER if _is_blank(t) else t for t in texts]
+        return cleaned[0] if isinstance(input_data, str) else cleaned
+
     def _call_api(self, input_data):
         """Call OpenAI-compatible /embeddings endpoint"""
         import requests
@@ -252,7 +285,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             **self._request_headers(),
         }
         data = {
-            "input": input_data,
+            "input": self._sanitize_input(input_data),
             "model": self.model,
         }
         if self.supports_dim_param and self._dimensions:
@@ -313,7 +346,17 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         for i in range(0, len(texts), step):
             chunk = texts[i:i + step]
             result = self._call_api(chunk)
-            out.extend(self._post_process(item["embedding"]) for item in result["data"])
+            items = result["data"]
+            if len(items) != len(chunk):
+                raise ValueError("Embedding batch response count does not match input count")
+            # Some gateways answer out of order; `index` is the request position.
+            if any("index" in item for item in items):
+                indices = [item.get("index") for item in items]
+                if (any(type(index) is not int for index in indices)
+                        or set(indices) != set(range(len(chunk)))):
+                    raise ValueError("Embedding batch indexes must cover every input exactly once")
+                items = sorted(items, key=lambda item: item["index"])
+            out.extend(self._post_process(item["embedding"]) for item in items)
         return out
 
     @property
@@ -376,7 +419,7 @@ class DoubaoEmbeddingProvider(EmbeddingProvider):
         }
         payload = {
             "model": self.model,
-            "input": [{"type": "text", "text": text}],
+            "input": [{"type": "text", "text": BLANK_INPUT_PLACEHOLDER if _is_blank(text) else text}],
             "dimensions": self._dimensions,
             "encoding_format": "float",
         }

@@ -31,7 +31,11 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
+    // Keep in sync with VITE_DEV_PORTS in src/main/index.ts. strictPort makes a
+    // clash fail loudly instead of drifting to the next free port, which the
+    // main process would not be looking at.
     port: 5173,
+    strictPort: true,
   },
   resolve: {
     alias: {

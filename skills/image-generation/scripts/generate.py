@@ -6,19 +6,28 @@ Usage:
     python generate.py '<json_args>'
 
 Supported model families (each provider is tried in priority order:
-OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI; missing API keys
+OpenAI → Gemini → Seedream → Qwen → MiniMax → CowAgent → LinkAI; missing API keys
 are skipped, and the provider that natively owns the requested model is
 promoted to the front of the queue):
 
+    - gpt-image-2.6-flare / gpt-image-2.6-sunburst → OpenAI
+    - gpt-image-2.5-flare / gpt-image-2.5-sunburst → OpenAI
     - gpt-image-2 / gpt-image-1                    → OpenAI
     - nano-banana / gemini-*-image-*               → Gemini
     - doubao-seedream-* / seedream-*               → Seedream (Volcengine Ark)
     - qwen-image-2.0 / qwen-image-2.0-pro / etc.   → Qwen (DashScope)
     - image-01 / minimax-image                     → MiniMax
+    - models served by the CowAgent API            → CowAgent (OpenAI-compatible)
     - any model                                    → LinkAI (universal proxy)
 
 Dependencies: requests (stdlib: json, sys, os, base64, io, abc, uuid, pathlib, urllib)
 """
+
+# Defer annotation evaluation so ``X | None`` / ``list[str]`` signatures below
+# do not raise TypeError on Python 3.7-3.9 (PEP 563). This script is executed
+# with the same interpreter as the agent, and 3.9 is the documented
+# recommended version.
+from __future__ import annotations
 
 import json
 import sys
@@ -29,10 +38,7 @@ import time
 import uuid
 import re
 from abc import ABC, abstractmethod
-from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.parse import urlparse
-from urllib.error import URLError
 
 try:
     import requests
@@ -124,6 +130,26 @@ def _load_image(source: str) -> bytes:
         return resp.read()
 
 
+def _decode_image_item(item: dict, *, url_first: bool = False) -> bytes | None:
+    """Return the image bytes carried by an OpenAI-compatible result item.
+
+    Some backends send both keys even when only one of them holds a value —
+    e.g. an empty ``b64_json`` next to a usable ``url`` in URL output mode.
+    Branching on key presence would decode the empty string into a 0-byte
+    file, so branch on the value instead and fall through to the other key.
+    Returns None when neither field carries a value.
+    """
+    keys = ("url", "b64_json") if url_first else ("b64_json", "url")
+    for key in keys:
+        value = item.get(key)
+        if not value:
+            continue
+        if key == "b64_json":
+            return base64.b64decode(value)
+        return _load_image(value)
+    return None
+
+
 def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int = 4096) -> bytes:
     """Compress image to fit size/dimension limits. Requires Pillow only when needed."""
     if len(data) <= max_bytes:
@@ -146,6 +172,8 @@ def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int
 
     img = Image.open(io.BytesIO(data))
     w, h = img.size
+    # Image.resize() clears .format, so read it first.
+    fmt = img.format or "PNG"
 
     if max(w, h) > max_edge:
         ratio = max_edge / max(w, h)
@@ -153,7 +181,6 @@ def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int
         img = img.resize((w, h), Image.LANCZOS)
 
     buf = io.BytesIO()
-    fmt = img.format or "PNG"
     if fmt.upper() == "JPEG":
         quality = 85
         while True:
@@ -232,14 +259,28 @@ class ImageProvider(ABC):
         ...
 
 
+# Model families whose `quality` defaults to "high" when the caller omits it.
+_HIGH_QUALITY_DEFAULT_PREFIXES = ("gpt-image-2.6",)
+
+
+def _default_quality(model: str, quality: str | None) -> str | None:
+    if quality:
+        return quality
+    if (model or "").lower().startswith(_HIGH_QUALITY_DEFAULT_PREFIXES):
+        return "high"
+    return None
+
+
 # ---------------------------------------------------------------------------
-# OpenAI-compatible provider (gpt-image-2, gpt-image-1)
+# OpenAI-compatible provider
+# (gpt-image-2.6-flare, gpt-image-2.6-sunburst, gpt-image-2.5-flare,
+#  gpt-image-2.5-sunburst, gpt-image-2, gpt-image-1)
 # ---------------------------------------------------------------------------
 
 class OpenAIProvider(ImageProvider):
     """Provider for OpenAI Image API (generations + edits)."""
 
-    DEFAULT_MODEL = "gpt-image-2"
+    DEFAULT_MODEL = "gpt-image-2.5-flare"
 
     def __init__(self, api_key: str, api_base: str, model: str):
         self.api_key = api_key
@@ -325,6 +366,7 @@ class OpenAIProvider(ImageProvider):
         aspect_ratio: str | None = None,
         output_dir: str = ".",
     ) -> list[str]:
+        quality = _default_quality(self.model, quality)
         # OpenAI Images API expects pixel size like 1024x1024.
         resolved = resolve_size(size, aspect_ratio) if (size or aspect_ratio) else None
         if image_url:
@@ -383,11 +425,8 @@ class OpenAIProvider(ImageProvider):
     def _save_results(result: dict, output_dir: str) -> list[str]:
         paths = []
         for item in result.get("data", []):
-            if "b64_json" in item:
-                raw = base64.b64decode(item["b64_json"])
-                paths.append(_save_image(raw, output_dir))
-            elif "url" in item:
-                raw = _load_image(item["url"])
+            raw = _decode_image_item(item)
+            if raw:
                 paths.append(_save_image(raw, output_dir))
         return paths
 
@@ -399,7 +438,7 @@ class OpenAIProvider(ImageProvider):
 class LinkAIProvider(ImageProvider):
     """Provider for LinkAI unified image generation API."""
 
-    DEFAULT_MODEL = "gpt-image-2"
+    DEFAULT_MODEL = "gpt-image-2.5-flare"
 
     def __init__(self, api_key: str, api_base: str, model: str):
         self.api_key = api_key
@@ -416,6 +455,7 @@ class LinkAIProvider(ImageProvider):
         aspect_ratio: str | None = None,
         output_dir: str = ".",
     ) -> list[str]:
+        quality = _default_quality(self.model, quality)
         url = f"{self.api_base}/v1/images/generations"
         payload: dict = {
             "model": self.model,
@@ -472,11 +512,8 @@ class LinkAIProvider(ImageProvider):
 
         paths = []
         for item in result.get("data", []):
-            if "url" in item:
-                raw = _load_image(item["url"])
-                paths.append(_save_image(raw, output_dir))
-            elif "b64_json" in item:
-                raw = base64.b64decode(item["b64_json"])
+            raw = _decode_image_item(item, url_first=True)
+            if raw:
                 paths.append(_save_image(raw, output_dir))
         return paths
 
@@ -1047,6 +1084,7 @@ class MinimaxProvider(ImageProvider):
 # When the requested model matches a prefix, that provider is promoted to the
 # front of the queue. All other configured providers still run as fallbacks.
 _MODEL_PREFERRED_PROVIDER: list[tuple[tuple[str, ...], str]] = [
+    (("gpt-image-2.5",), "OpenAI"),
     (("gpt-image",), "OpenAI"),
     (("nano-banana", "gemini-"), "Gemini"),
     (("seedream", "doubao-seedream"), "Seedream"),
@@ -1055,7 +1093,13 @@ _MODEL_PREFERRED_PROVIDER: list[tuple[tuple[str, ...], str]] = [
 ]
 
 # Default global priority when the model has no preferred provider.
-_DEFAULT_PROVIDER_ORDER = ["OpenAI", "Gemini", "Seedream", "Qwen", "MiniMax", "LinkAI"]
+_DEFAULT_PROVIDER_ORDER = ["OpenAI", "Gemini", "Seedream", "Qwen", "MiniMax", "CowAgent", "LinkAI"]
+
+# Aggregator providers that also accept these vendors' model ids unchanged.
+_AGGREGATOR_FAMILIES = {
+    "CowAgent": {"OpenAI", "Gemini", "Seedream"},
+    "LinkAI": {"OpenAI", "Gemini"},
+}
 
 # UI provider id (persisted via the Models page) → internal label used by
 # the factory dict in `_build_providers`. Allows pinning a vendor for
@@ -1066,6 +1110,7 @@ _PROVIDER_ID_TO_LABEL = {
     "doubao": "Seedream",
     "dashscope": "Qwen",
     "minimax": "MiniMax",
+    "cowagent": "CowAgent",
     "linkai": "LinkAI",
 }
 
@@ -1117,12 +1162,13 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
 
     Behaviour:
       1. All providers with a configured API key are added in the global
-         priority order: OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI.
+         priority order: OpenAI → Gemini → Seedream → Qwen → MiniMax → CowAgent → LinkAI.
       2. If `model` natively belongs to one of the providers AND that provider
          is configured, it is promoted to the front so it gets the first
          attempt with the right model id.
       3. If the preferred provider is NOT configured (no API key), the model
-         id would 100% fail on every other backend, so we drop the explicit
+         goes to a configured aggregator that serves the same id; otherwise
+         the id would fail on every other backend, so we drop the explicit
          model and fall back to automatic routing — every provider then uses
          its own DEFAULT_MODEL.
     """
@@ -1136,6 +1182,7 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         "Seedream": os.environ.get("ARK_API_KEY", ""),
         "Qwen": os.environ.get("DASHSCOPE_API_KEY", ""),
         "MiniMax": os.environ.get("MINIMAX_API_KEY", ""),
+        "CowAgent": os.environ.get("COWAGENT_API_KEY", ""),
         "LinkAI": os.environ.get("LINKAI_API_KEY", ""),
     }
     bases = {
@@ -1144,6 +1191,7 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         "Seedream": os.environ.get("ARK_API_BASE", "https://ark.cn-beijing.volces.com/api/v3"),
         "Qwen": os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com"),
         "MiniMax": os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com"),
+        "CowAgent": os.environ.get("COWAGENT_API_BASE") or "https://api.cowagent.cn/v1",
         "LinkAI": os.environ.get("LINKAI_API_BASE", "https://api.link-ai.tech"),
     }
 
@@ -1155,10 +1203,16 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         pref = _preferred_provider(model)
 
     # If a specific model is requested and its native provider has no key,
-    # other backends won't recognise the id → reset to auto routing.
+    # use an aggregator serving the same id; otherwise no other backend
+    # recognises the id → reset to auto routing.
     if pref and not keys.get(pref):
-        model = ""
-        pref = None
+        via = next((p for p, fams in _AGGREGATOR_FAMILIES.items() if pref in fams and keys.get(p)), None)
+        if via:
+            model = _GEMINI_MODEL_ALIASES.get(model.lower(), model)
+            pref = via
+        else:
+            model = ""
+            pref = None
 
     factories = {
         "OpenAI": OpenAIProvider,
@@ -1166,6 +1220,8 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         "Seedream": SeedreamProvider,
         "Qwen": QwenProvider,
         "MiniMax": MinimaxProvider,
+        # OpenAI-compatible images API (generations + multipart edits).
+        "CowAgent": OpenAIProvider,
         "LinkAI": LinkAIProvider,
     }
     available: dict[str, ImageProvider] = {}
@@ -1197,10 +1253,18 @@ def main():
 
     try:
         raw = sys.argv[1]
-        raw = raw.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'")
-        args = json.loads(raw)
+        try:
+            args = json.loads(raw)
+        except json.JSONDecodeError:
+            # Curly quotes used as JSON delimiters; never straighten valid payloads.
+            raw = raw.replace('\u201c', '"').replace('\u201d', '"').replace('\u2018', "'").replace('\u2019', "'")
+            args = json.loads(raw)
     except json.JSONDecodeError as e:
         print(json.dumps({"error": f"Invalid JSON: {e}"}))
+        sys.exit(1)
+
+    if not isinstance(args, dict):
+        print(json.dumps({"error": "Arguments must be a JSON object"}))
         sys.exit(1)
 
     prompt = args.get("prompt")
@@ -1249,7 +1313,7 @@ def main():
                 f"No API key configured for {target}. "
                 "Set at least one of OPENAI_API_KEY / GEMINI_API_KEY / "
                 "ARK_API_KEY / DASHSCOPE_API_KEY / MINIMAX_API_KEY / "
-                "LINKAI_API_KEY via the env_config tool, then try again."
+                "COWAGENT_API_KEY / LINKAI_API_KEY via the env_config tool, then try again."
             )
         }, ensure_ascii=False))
         sys.exit(1)
@@ -1294,7 +1358,7 @@ def main():
                  "Do NOT retry with the same parameters. "
                  "Ask the user to verify their API key / base URL "
                  "(OPENAI_API_KEY, GEMINI_API_KEY, ARK_API_KEY, "
-                 "DASHSCOPE_API_KEY, MINIMAX_API_KEY, or LINKAI_API_KEY) "
+                 "DASHSCOPE_API_KEY, MINIMAX_API_KEY, COWAGENT_API_KEY, or LINKAI_API_KEY) "
                  "via env_config."
     }, ensure_ascii=False))
     sys.exit(1)

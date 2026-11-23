@@ -1,6 +1,6 @@
 ---
 title: Web Console
-description: Use CowAgent through the Web Console
+description: "The web console is CowAgent's default channel: chat in your browser, manage models, skills, memory and channels online, protect it with a password, and enable an OpenAI-compatible chat API."
 ---
 
 The Web Console is CowAgent's default channel. It runs automatically once started, letting you chat with the Agent in a browser and manage models, skills, memory, channels, and other configuration online.
@@ -13,6 +13,8 @@ The Web Console is CowAgent's default channel. It runs automatically once starte
   "web_host": "0.0.0.0",
   "web_port": 9899,
   "web_password": "",
+  "external_api_enabled": false,
+  "external_api_token": "",
   "enable_thinking": false
 }
 ```
@@ -20,14 +22,17 @@ The Web Console is CowAgent's default channel. It runs automatically once starte
 | Parameter | Description | Default |
 | --- | --- | --- |
 | `channel_type` | Set to `web` | `web` |
-| `web_host` | Web service listen address. Defaults to `127.0.0.1` (local only); set to `0.0.0.0` for public access and configure a password | `""` |
+| `web_host` | Web service listen address. When empty, it listens on `127.0.0.1` (local only) without a password and on `0.0.0.0` once a password is set. It can also be changed from the console, see "Access URL" below | `""` |
 | `web_port` | Web service listen port | `9899` |
+| `web_public_url` | Display address used in API URLs, share links and embed code. Enter your domain if you have one; leave empty to detect it | `""` |
 | `web_password` | Access password. Leave empty to disable password protection; recommended when listening on `0.0.0.0` | `""` |
+| `external_api_enabled` | Turn on the [Chat API](/extensions/chat-api) | `false` |
+| `external_api_token` | API key of the [Chat API](/extensions/chat-api), kept while the API is off | `""` |
 | `web_session_expire_days` | Login session validity in days | `30` |
-| `web_file_serve_root` | Root directory the web console can directly read/send files from. Defaults to the user home dir and agent workspace only; set to `/` to allow the whole filesystem | `"~"` |
+| `web_file_serve_root` | Additional root directory the web console can directly read/send files from (defaults to the user home directory). Configured Agent workspaces, including disabled Agents, and opened project directories are also allowed; set to `/` to allow the whole filesystem | `"~"` |
 | `enable_thinking` | Whether to enable deep thinking mode | `false` |
 
-Once a password is configured, you must enter it to log in when accessing the console. The login session is kept for 30 days by default, so restarting the service during that period does not require re-login. The password can also be changed online from the "Configuration" page in the console.
+Once a password is configured, you must enter it to log in when accessing the console. The login session is kept for 30 days by default, so restarting the service during that period does not require re-login. The password can also be changed online from the "Configuration" page in the console. A client that enters a wrong password 5 times in a row is locked out for 10 minutes.
 
 ## Access URL
 
@@ -39,6 +44,70 @@ After starting the project, visit:
 <Note>
   Ensure the server firewall and security group allow the corresponding port.
 </Note>
+
+Under **Config → Integrations → Addresses** in the console you can change:
+
+- **Display address**: the address used in API URLs, share links and embed code. Enter your domain if you have one; leave empty to detect it.
+- **Listen address**: the IP and port the service listens on. `127.0.0.1` is reachable from this machine only; `0.0.0.0` lets other devices on the local network or the internet connect and requires an access password first. After saving, the service switches to the new address without a restart, and goes back to the old one if the new one cannot be used. While other devices can connect, this machine's local network addresses are shown below.
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/web-console-integrations.png" alt="Integrations" width="800" />
+</Frame>
+
+## HTTPS and Domain Access
+
+To serve the console on a domain with HTTPS, use one of the two setups below.
+
+**Option 1: nginx reverse proxy (recommended).** Let nginx terminate TLS and forward plain HTTP to the console, and set `"web_host": "127.0.0.1"` so the console is only reachable through nginx:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name cow.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/cow.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/cow.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:9899;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # Replies stream over SSE: keep connections open and unbuffered
+        proxy_read_timeout 3600s;
+        proxy_buffering off;
+        # File uploads up to 512 MB
+        client_max_body_size 512m;
+    }
+}
+```
+
+**Option 2: direct HTTPS.** The console serves TLS itself:
+
+```json
+{
+  "web_https_enabled": true,
+  "web_ssl_certfile": "/etc/letsencrypt/live/cow.example.com/fullchain.pem",
+  "web_ssl_keyfile": "/etc/letsencrypt/live/cow.example.com/privkey.pem"
+}
+```
+
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `web_https_enabled` | Serve the console over HTTPS directly | `false` |
+| `web_ssl_certfile` | PEM certificate file (full chain recommended) | `""` |
+| `web_ssl_keyfile` | PEM private key file | `""` |
+
+A missing or unreadable certificate stops startup with an error instead of falling back to HTTP.
+
+<Note>
+  The console must be served at the root path; use a dedicated subdomain rather than a sub-path such as `/cow/`. If you use MCP servers with OAuth, also set `"mcp_oauth_redirect_base": "https://cow.example.com"`.
+</Note>
+
+## Chat API
+
+The Web Console's port also serves an OpenAI-compatible chat API, `/v1/chat/completions`. It is off by default; turn it on and get an API key from the Chat API card on the settings page. See [Chat API](/extensions/chat-api).
 
 ## Features
 
@@ -70,6 +139,12 @@ Each session can run under its own permission mode, controlling how far the Agen
 <Frame caption="Per-session permission modes: read-only, workspace-write, full-access">
   <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/web-console-access-mode.png" style={{ maxWidth: "600px" }} />
 </Frame>
+
+### Artifacts
+
+Collects the pages, documents, images and videos your agents create on one timeline, with preview, pinning, and a jump back to the original conversation. The page is hidden by default; show it from the [Custom Menu](/extensions/custom-menu) editor:
+
+<img width="850" src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/web-console-artifacts.png" />
 
 ### Model Management
 

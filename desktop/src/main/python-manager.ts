@@ -6,6 +6,7 @@ import os from 'os'
 import fs from 'fs'
 import http from 'http'
 import net from 'net'
+import crypto from 'crypto'
 
 // Writable data dir for the packaged app (config.json, run.log, user data).
 // Lives in the user's home so it survives app updates and avoids writing into
@@ -92,6 +93,11 @@ export class PythonBackend extends EventEmitter {
   // guess it has to make.
   private portReady: Promise<number>
   private markPortReady!: (port: number) => void
+  // Shared secret between this shell and the backend it spawns. Passed to the
+  // backend via COW_DESKTOP_TOKEN and echoed by the renderer on requests that
+  // only the desktop may make (importing an attachment by local path). Fixed
+  // for the life of the shell so a backend restart doesn't invalidate it.
+  private readonly desktopToken = crypto.randomBytes(24).toString('hex')
   // Rolling tail of backend output. A startup that never reaches "ready" is
   // otherwise reported as a bare timeout, and the actual cause (a bind error, a
   // config exception) is only visible in run.log — which the user can't open
@@ -166,18 +172,26 @@ export class PythonBackend extends EventEmitter {
     return this.packaged ? COW_DATA_DIR : this.backendPath
   }
 
-  // Optional runtime-origin tag from the bundled app-config, forwarded to the
-  // backend so it can be attached to outbound requests for stats.
-  private clientSource(): string {
+  getDesktopToken(): string {
+    return this.desktopToken
+  }
+
+  // Optional fields of the bundled app-config forwarded to the backend:
+  // clientSource tags outbound requests for stats and appName is the name
+  // shown in command output.
+  private appConfigEnv(): Record<string, string> {
     try {
       const cfgPath = this.packaged
         ? path.join(process.resourcesPath, 'app-config.json')
         : path.resolve(__dirname, '../../resources', 'app-config.json')
-      const raw = fs.readFileSync(cfgPath, 'utf8')
-      const val = JSON.parse(raw)?.clientSource
-      return typeof val === 'string' ? val.trim() : ''
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) || {}
+      const env: Record<string, string> = {}
+      if (typeof cfg.clientSource === 'string' && cfg.clientSource.trim()) env.COW_CLIENT_SOURCE = cfg.clientSource.trim()
+      if (typeof cfg.appName === 'string' && cfg.appName.trim()) env.COW_APP_NAME = cfg.appName.trim()
+      if (typeof cfg.agentName === 'string' && cfg.agentName.trim()) env.DEFAULT_AGENT_NAME = cfg.agentName.trim()
+      return env
     } catch {
-      return ''
+      return {}
     }
   }
 
@@ -785,8 +799,9 @@ export class PythonBackend extends EventEmitter {
         // The shell owns the port: tell the backend to bind exactly here so the
         // two sides can never disagree (and we avoid the 9899 web-console clash).
         COW_WEB_PORT: String(this.port),
+        COW_DESKTOP_TOKEN: this.desktopToken,
         ...(bundled ? { COW_DATA_DIR } : {}),
-        ...(this.clientSource() ? { COW_CLIENT_SOURCE: this.clientSource() } : {}),
+        ...this.appConfigEnv(),
         COW_CLIENT_VERSION: app.getVersion(),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -794,11 +809,13 @@ export class PythonBackend extends EventEmitter {
 
     const onOutput = (data: Buffer) => {
       const text = data.toString()
-      // Persist raw output to run.log first, so nothing is lost even if the
-      // per-line handling below throws. The backend already writes its own
-      // structured lines here once up; this captures the pre-logging bootstrap
-      // output (and anything it prints straight to stdout/stderr) as well.
-      if (this.logStream) {
+      // Mirror to run.log ONLY before the backend is ready. Once Python's own
+      // logging is up it writes every line to this same file via its FileHandler,
+      // so mirroring the same stdout here would duplicate every line. Before that
+      // (bootstrap crash: missing DLL, broken onedir, antivirus block) Python
+      // logging isn't running yet, and this is the only thing that captures the
+      // real cause — the reason this mirror exists at all.
+      if (this.logStream && this.status !== 'ready') {
         try {
           this.logStream.write(text)
         } catch {

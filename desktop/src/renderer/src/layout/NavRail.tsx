@@ -1,13 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
-  MessageSquare,
-  BookOpen,
-  Brain,
-  Zap,
-  Radio,
-  Clock,
-  Settings,
   PanelLeftClose,
   PanelLeftOpen,
   Sun,
@@ -22,24 +15,33 @@ import {
   Store,
   MessageSquareWarning,
   Palette,
-  Check,
+  SquarePen,
+  ExternalLink,
 } from 'lucide-react'
-import type { LucideIcon } from 'lucide-react'
 import type { Theme } from '../theme/themes'
+import ThemeFlyout from '../components/ThemePicker'
+import ThemeAddModal from '../components/ThemeAddModal'
+import type { MenuGroup, MenuItem } from '../types'
 // The desktop app's own brand icon (transparent PNG), bundled by Vite.
 import brandLogo from '../assets/logo.png'
 import { t, getLang, setLang, Lang } from '../i18n'
 import { useUIStore } from '../store/uiStore'
+import { guardDocEditors } from '../store/docEditorStore'
 import { useTheme } from '../hooks/useTheme'
 import { usePlatform } from '../hooks/usePlatform'
 import { useUpdateStore, hasPendingUpdate, hasAvailableUpdate } from '../store/updateStore'
 import UpdateBanner from '../components/UpdateBanner'
+import Tooltip from '../components/Tooltip'
+import InstanceSwitcher from '../components/instances/InstanceSwitcher'
+import { useInstanceStore } from '../store/instanceStore'
+import { useMenuStore } from '../store/menuStore'
+import { groupLabel, itemIcon, itemLabel, itemRoute, itemShows } from '../lib/menu'
 import { product } from '@product'
 
 // Fallback shown when app.getVersion() is unavailable (dev/web preview). Keep
 // in sync with desktop/package.json "version"; the packaged app overrides this
 // with the real value via IPC, so it only matters outside a packaged build.
-const FALLBACK_VERSION = '2.1.5'
+const FALLBACK_VERSION = '2.2.2'
 
 // External links opened in the user's default browser. The window-open handler
 // in the main process routes window.open() through shell.openExternal.
@@ -49,28 +51,12 @@ const SKILL_HUB_URL = 'https://skills.cowagent.ai/'
 // GitHub issues — where users report bugs / request features.
 const FEEDBACK_URL = 'https://github.com/zhayujie/CowAgent/issues'
 
-const websiteUrl = () => (getLang() === 'zh' ? 'https://cowagent.ai/zh' : 'https://cowagent.ai')
+const websiteUrl = () => (getLang() === 'zh' ? 'https://cowagent.cn' : 'https://cowagent.ai')
 const docsUrl = () => (getLang() === 'zh' ? 'https://docs.cowagent.ai/zh' : 'https://docs.cowagent.ai')
 
 const openExternal = (url: string) => {
   window.open(url, '_blank', 'noopener,noreferrer')
 }
-
-interface NavItem {
-  path: string
-  labelKey: string
-  icon: LucideIcon
-}
-
-const NAV_ITEMS: NavItem[] = [
-  { path: '/', labelKey: 'menu_chat', icon: MessageSquare },
-  { path: '/knowledge', labelKey: 'menu_knowledge', icon: BookOpen },
-  { path: '/memory', labelKey: 'menu_memory', icon: Brain },
-  { path: '/skills', labelKey: 'menu_skills', icon: Zap },
-  { path: '/channels', labelKey: 'menu_channels', icon: Radio },
-  { path: '/tasks', labelKey: 'menu_tasks', icon: Clock },
-  { path: '/settings', labelKey: 'menu_settings', icon: Settings },
-]
 
 interface NavRailProps {
   onLangChange: () => void
@@ -80,14 +66,41 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
   const location = useLocation()
   const navigate = useNavigate()
   const { navCollapsed, toggleNav } = useUIStore()
-  const { theme, toggleTheme, themeId, themes, appName, setThemeId } = useTheme()
+  const { theme, toggleTheme, themeId, themes, appName, setThemeId, reloadThemes, importTheme, openThemesDir } =
+    useTheme()
   // On macOS the top-left is occupied by the native traffic lights, so the
   // brand mark is only shown on Windows/Linux where that corner is otherwise
   // empty (mirrors the web console's sidebar logo).
   const { isMac } = usePlatform()
 
   const collapsed = navCollapsed
+  // The switcher may be hidden, but never while another device is in use.
+  const switcherHidden = useInstanceStore((s) => s.switcherHidden)
+  const remote = useInstanceStore((s) => !!s.activeId)
   const width = collapsed ? 'w-[56px]' : 'w-[208px]'
+
+  // Leaving a page unmounts its document editor, so settle any unsaved work
+  // first - here, while declining can still stop the navigation.
+  const go = async (path: string) => {
+    if (!(await guardDocEditors())) return
+    navigate(path)
+  }
+
+  const menu = useMenuStore((s) => s.doc)
+  const openMenuEditor = useMenuStore((s) => s.openEditor)
+  // Always draw by group — the built-in menu is "Chat" / "Manage" until the
+  // user saves their own. Empty groups (e.g. footer-only Monitor) drop out.
+  const sections: { group: MenuGroup; items: MenuItem[] }[] = menu.groups
+    .map((group) => ({ group, items: group.items.filter(itemShows) }))
+    .filter((s) => s.items.length)
+
+  const openItem = (item: MenuItem) => {
+    if (item.type === 'url' && item.open === 'tab') {
+      if (item.url) openExternal(item.url)
+      return
+    }
+    void go(itemRoute(item))
+  }
 
   const updateState = useUpdateStore()
   // Footer dot: hidden once dismissed for this version (user asked for this).
@@ -98,6 +111,7 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
   const checking = updateState.status?.state === 'checking'
 
   const [menuOpen, setMenuOpen] = useState(false)
+  const [addThemeOpen, setAddThemeOpen] = useState(false)
   // Local fallback so a version always shows even if the main-process IPC is
   // unavailable (e.g. dev/web preview). The real value comes from
   // app.getVersion() (packaged package.json), never from a remote service.
@@ -194,29 +208,62 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
 
       {/* Content area carries the right divider, starting below the titlebar */}
       <div className="flex-1 flex flex-col min-h-0 border-r border-default">
+      {(!switcherHidden || remote) && <InstanceSwitcher collapsed={collapsed} />}
       {/* Nav items */}
-      <nav className="flex-1 overflow-y-auto px-2 py-2 space-y-0.5">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon
-          const isActive = location.pathname === item.path
-          return (
-            <button
-              key={item.path}
-              onClick={() => navigate(item.path)}
-              title={collapsed ? t(item.labelKey) : undefined}
-              className={`group w-full flex items-center gap-3 rounded-btn cursor-pointer transition-colors h-9 ${
-                collapsed ? 'justify-center px-0' : 'px-3'
-              } ${
-                isActive
-                  ? 'bg-accent-soft text-accent'
-                  : 'text-content-secondary hover:bg-surface-2 hover:text-content'
-              }`}
-            >
-              <Icon size={18} strokeWidth={isActive ? 2.2 : 1.8} className="flex-shrink-0" />
-              {!collapsed && <span className="text-[13px] truncate">{t(item.labelKey)}</span>}
-            </button>
-          )
-        })}
+      <nav className="flex-1 overflow-y-auto px-2 py-2">
+        {sections.map(({ group, items }, index) => (
+          <div
+            key={group.id}
+            className={index ? (collapsed ? 'mt-1.5 pt-1.5 border-t border-subtle' : 'mt-2') : ''}
+          >
+            {!collapsed && (
+              <div className="group/head relative flex items-center pr-1">
+                <div className="flex-1 min-w-0 px-3 pt-1 pb-1 text-[11px] font-medium text-content-tertiary truncate select-none">
+                  {groupLabel(group)}
+                </div>
+                <Tooltip label={t('menu_edit')} placement="right">
+                  <button
+                    type="button"
+                    onClick={() => openMenuEditor()}
+                    aria-label={t('menu_edit')}
+                    className="flex-shrink-0 w-6 h-6 inline-flex items-center justify-center rounded-md
+                               text-content-tertiary opacity-0 group-hover/head:opacity-100 hover:opacity-100
+                               hover:bg-surface-2 hover:text-content cursor-pointer transition-opacity"
+                  >
+                    <SquarePen size={11} />
+                  </button>
+                </Tooltip>
+              </div>
+            )}
+            <div className="space-y-0.5">
+              {items.map((item) => {
+                const Icon = itemIcon(item)
+                const label = itemLabel(item)
+                const isActive = location.pathname === itemRoute(item)
+                return (
+                  <button
+                    key={item.id}
+                    onClick={() => openItem(item)}
+                    title={collapsed ? label : undefined}
+                    className={`group w-full flex items-center gap-3 rounded-btn cursor-pointer transition-colors h-9 ${
+                      collapsed ? 'justify-center px-0' : 'px-3'
+                    } ${
+                      isActive
+                        ? 'bg-accent-soft text-accent'
+                        : 'text-content-secondary hover:bg-surface-2 hover:text-content'
+                    }`}
+                  >
+                    <Icon size={18} strokeWidth={isActive ? 2.2 : 1.8} className="flex-shrink-0" />
+                    {!collapsed && <span className="flex-1 min-w-0 text-left text-[13px] truncate">{label}</span>}
+                    {!collapsed && item.type === 'url' && item.open === 'tab' && (
+                      <ExternalLink size={12} className="flex-shrink-0 opacity-50" />
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        ))}
       </nav>
 
       {/* Update banner floats above the footer when a new version is pending */}
@@ -237,12 +284,21 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
             upToDate={checkedManually && updateStatusState === 'not-available' && !availableUpdate}
             onLogs={() => {
               setMenuOpen(false)
-              navigate('/logs')
+              void go('/logs')
+            }}
+            onEditMenu={() => {
+              setMenuOpen(false)
+              openMenuEditor()
             }}
             onTheme={toggleTheme}
             themeId={themeId}
             themes={themes}
             onThemeId={setThemeId}
+            onThemesOpen={() => void reloadThemes()}
+            onAddTheme={() => {
+              setMenuOpen(false)
+              setAddThemeOpen(true)
+            }}
             onLanguage={toggleLanguage}
             onCheckUpdate={checkUpdate}
             onOpenLink={(url) => {
@@ -284,12 +340,25 @@ const NavRail: React.FC<NavRailProps> = ({ onLangChange }) => {
             <div className="flex-1" />
           )}
 
+          {/* The editor lives in the "more" menu. A build that hides it keeps a
+              button, unless its own footer slot takes over the menu. */}
+          {product.nav?.hideFooterMenu && !product.slots?.NavRailFooter && (
+            <FooterBtn collapsed={collapsed} onClick={() => openMenuEditor()} title={t('menu_edit')}>
+              <SquarePen size={16} />
+            </FooterBtn>
+          )}
           <FooterBtn collapsed={collapsed} onClick={toggleNav} title={collapsed ? t('nav_expand') : t('nav_collapse')}>
             {collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
           </FooterBtn>
         </div>
       </div>
       </div>
+      <ThemeAddModal
+        open={addThemeOpen}
+        onClose={() => setAddThemeOpen(false)}
+        onImport={importTheme}
+        onOpenDir={() => void openThemesDir()}
+      />
     </aside>
   )
 }
@@ -337,13 +406,15 @@ const FooterMenu: React.FC<{
   themeId: string
   themes: Theme[]
   onThemeId: (id: string) => void
+  onThemesOpen: () => void
+  onAddTheme: () => void
   onLogs: () => void
+  onEditMenu: () => void
   onTheme: () => void
   onLanguage: () => void
   onCheckUpdate: () => void
   onOpenLink: (url: string) => void
-}> = ({ theme, checking, pendingUpdate, upToDate, themeId, themes, onThemeId, onLogs, onTheme, onLanguage, onCheckUpdate, onOpenLink }) => {
-  const [themeMenuOpen, setThemeMenuOpen] = useState(false)
+}> = ({ theme, checking, pendingUpdate, upToDate, themeId, themes, onThemeId, onThemesOpen, onAddTheme, onLogs, onEditMenu, onTheme, onLanguage, onCheckUpdate, onOpenLink }) => {
   const updateLabel = checking
     ? t('update_checking')
     : upToDate
@@ -367,7 +438,7 @@ const FooterMenu: React.FC<{
       </>
     )}
 
-    {/* App actions below: update, theme, language, logs */}
+    {/* App actions below: update, theme, language, menu, logs */}
     <MenuItem
       icon={checking ? <Loader2 size={16} className="animate-spin" /> : <Download size={16} />}
       label={updateLabel}
@@ -380,45 +451,30 @@ const FooterMenu: React.FC<{
       label={theme === 'dark' ? t('menu_theme_light') : t('menu_theme_dark')}
       onClick={onTheme}
     />
-    <MenuItem
-      icon={<Palette size={16} />}
-      label={t('menu_theme_picker')}
-      trailing={themeMenuOpen ? '▾' : '▸'}
-      onClick={() => setThemeMenuOpen((o) => !o)}
-    />
-    {themeMenuOpen &&
-      themes.map((th) => (
-        <button
-          key={th.id}
-          onClick={() => onThemeId(th.id)}
-          className="w-full flex items-center gap-2.5 pl-8 pr-3 h-9 text-[13px] text-content-secondary hover:bg-surface-2 hover:text-content cursor-pointer transition-colors"
-        >
-          <ThemeSwatch preview={th.preview ?? { accent: '#4abe6e', bg: '#111', surface: '#1c1c1f' }} />
-          <span className="flex-1 text-left truncate">{th.name}</span>
-          {themeId === th.id && <Check size={14} className="flex-shrink-0 text-accent" />}
-        </button>
-      ))}
+    {/* Theme picker: hovering opens a flyout beside the menu, bottom-aligned
+        with it, so a long list never grows the menu. The wrapper is left
+        unpositioned so the flyout anchors to the menu box. */}
+    <ThemeFlyout
+      flyoutClassName="left-full -bottom-px pl-1.5"
+      onOpen={onThemesOpen}
+      themes={themes}
+      themeId={themeId}
+      onSelect={onThemeId}
+      onAdd={onAddTheme}
+    >
+      <MenuItem icon={<Palette size={16} />} label={t('menu_theme_picker')} trailing="▸" onClick={() => {}} />
+    </ThemeFlyout>
     <MenuItem
       icon={<Languages size={16} />}
       label={t('menu_language')}
       trailing={getLang() === 'zh' ? 'EN' : '中'}
       onClick={onLanguage}
     />
+    <MenuItem icon={<SquarePen size={16} />} label={t('menu_edit')} onClick={onEditMenu} />
     <MenuItem icon={<ScrollText size={16} />} label={t('menu_logs')} onClick={onLogs} />
   </div>
   )
 }
-
-// Tiny 3-color preview (bg / surface / accent) for the theme picker.
-const ThemeSwatch: React.FC<{ preview: { accent: string; bg: string; surface: string } }> = ({
-  preview,
-}) => (
-  <span className="flex-shrink-0 inline-flex h-4 w-4 rounded-full overflow-hidden border border-default">
-    <span className="w-1/3 h-full" style={{ background: preview.bg }} />
-    <span className="w-1/3 h-full" style={{ background: preview.surface }} />
-    <span className="w-1/3 h-full" style={{ background: preview.accent }} />
-  </span>
-)
 
 const MenuItem: React.FC<{
   icon: React.ReactNode

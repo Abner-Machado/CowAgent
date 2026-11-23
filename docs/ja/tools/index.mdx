@@ -1,6 +1,6 @@
 ---
 title: Tools 概要
-description: CowAgent 組み込みToolシステム
+description: "CowAgent の組み込みツール一覧。ファイル操作、検索、シェル、ファイル送信、記憶、Web 取得、スケジュール、マルチ Agent に加え、ブラウザ、Web 検索、画像理解、MCP も紹介。"
 ---
 
 Toolは、AgentがOSリソースにアクセスするための中核機能です。Agentはタスクの要件に基づいてToolをインテリジェントに選択・呼び出し、ファイル操作、コマンド実行、Web検索、スケジュールタスクなどを実行します。Toolは `agent/tools/` ディレクトリに実装されています。
@@ -33,6 +33,12 @@ Toolは、AgentがOSリソースにアクセスするための中核機能です
   </Card>
   <Card title="memory - メモリ" icon="brain" href="/ja/tools/memory">
     長期メモリの検索と読み取り
+  </Card>
+  <Card title="agent_delegate - 委譲" icon="users" href="/ja/tools/delegate">
+    セッション内の別の Agent にタスクを渡す
+  </Card>
+  <Card title="subagent - サブ Agent" icon="users-gear" href="/ja/tools/subagent">
+    一時的なサブ Agent を作成して独立したタスクを並行実行する
   </Card>
 </CardGroup>
 

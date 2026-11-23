@@ -1,6 +1,6 @@
 ---
 title: web_fetch - Web 取得
-description: Web ページやドキュメントのコンテンツを取得
+description: "web_fetch ツールは URL から内容を取得し、Web ページの本文抽出や PDF、Word、Excel の解析を行います。JavaScript 描画のページには browser を使います。"
 ---
 
 HTTP/HTTPS URL の内容を取得します。Web ページからは可読テキストを抽出し、ドキュメントファイル（PDF、Word、Excel など）は自動でダウンロードして解析します。
@@ -27,6 +27,54 @@ HTTP/HTTPS URL の内容を取得します。Web ページからは可読テキ�
 - リモートドキュメントのダウンロードと解析
 - API レスポンスの確認
 
+## DeepSeek Fetch バックエンド（オプトイン）
+
+デフォルトでは `web_fetch` はページを直接取得します。`tools.web_fetch.provider`
+を `"deepseek"` に設定すると、[DeepSeek 公式 Fetch API](https://api-docs.deepseek.com/guides/search)
+経由で取得し、ページを Markdown として返します。直接取得では描画できない
+ページ（JavaScript 中心のサイトなど）に有効です。
+
+```json
+{
+  "tools": {
+    "web_fetch": {
+      "provider": "deepseek"
+    }
+  }
+}
+```
+
+このバックエンドは `deepseek_api_key` モデル認証情報（または
+`DEEPSEEK_API_KEY` 環境変数）を使用します。呼び出しは成功リク
+エスト単位で課金（1,000 件あたり $0.75）されるためオプトイン制です。
+`"direct"`（デフォルト）は無料です。SSRF ガードは引き続き適用され、プラ
+イベート／ループバック／クラウドメタデータの URL はリクエスト前に拒否
+されます。
+ドキュメント URL（PDF、Word など）は常にローカルでダウンロード・解析されます。
+
+## Olostep バックエンド（オプトイン）
+
+`tools.web_fetch.provider` を `"olostep"` に設定すると、
+[Olostep Scrape API](https://docs.olostep.com/features/scrapes) 経由で取得します。
+Olostep はブラウザでページを描画して Markdown として返すため、JavaScript
+中心のサイトにも対応できます。
+
+```json
+{
+  "tools": {
+    "web_fetch": {
+      "provider": "olostep"
+    }
+  }
+}
+```
+
+このバックエンドは Olostep 検索プロバイダーと同じキー
+`tools.web_search.olostep_api_key`（または `OLOSTEP_API_KEY` 環境変数）を使用します。
+キーは [Olostep ダッシュボード](https://www.olostep.com/dashboard/api-keys) で作成できます。
+取得ごとに Olostep のクレジットを消費するためオプトイン制です。SSRF ガードは引き続き適用され、
+ドキュメント URL（PDF、Word など）は引き続きローカルでダウンロード・解析されます。
+
 <Note>
-  `web_fetch` は静的 HTML のみ取得できます。JavaScript レンダリングが必要なページ（SPA など）は `browser` ツールを使用してください。
+  デフォルトの `direct` バックエンドは静的 HTML のみ取得できます。JavaScript レンダリングが必要なページ（SPA など）は、上記の DeepSeek または Olostep バックエンドに切り替えるか、`browser` ツールを使用してください。
 </Note>

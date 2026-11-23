@@ -13,7 +13,7 @@ from agent.memory import (
     set_global_memory_config,
 )
 from common.runtime_identity import identity_scope
-from agent.registry import AgentProfile, AgentRegistry, get_agent_registry, set_agent_registry
+from agent.registry import AgentProfile, AgentRegistry, set_agent_registry
 from agent.tools.scheduler.integration import (
     get_scheduler_service,
     get_task_store,
@@ -32,7 +32,6 @@ def isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         SchedulerService, "stop", lambda service: setattr(service, "running", False)
     )
-    previous = get_agent_registry()
     registry = AgentRegistry(
         [
             AgentProfile("primary", "Primary", str(tmp_path / "primary")),
@@ -50,7 +49,10 @@ def isolated_registry(tmp_path, monkeypatch):
         reset_memory_configs()
         reset_scheduler_services()
         clear_conversation_store_cache()
-        set_agent_registry(previous)
+        # ``None``, not the instance from before the test: set_agent_registry
+        # pins process-wide, so restoring that instance would leave the
+        # registry pinned and outlive this test.
+        set_agent_registry(None)
 
 
 @pytest.fixture
@@ -87,10 +89,14 @@ def _task(task_id, name):
     }
 
 
-def test_conversations_with_same_session_id_use_different_databases(
+def test_conversations_with_same_session_id_are_isolated_by_agent_id(
     isolated_registry,
 ):
-    primary = isolated_registry.get("primary")
+    """Two Agents sharing a session_id no longer need separate files: they live
+    in the one global file (the default Agent's index.db) and are told apart by
+    the agent_id column. The default Agent scopes to "" so its historical rows
+    stay valid; every other Agent scopes to its own id."""
+    primary = isolated_registry.get("primary")  # the default Agent
     research = isolated_registry.get("research")
     primary_store = get_conversation_store(primary.workspace)
     research_store = get_conversation_store(research.workspace)
@@ -98,11 +104,18 @@ def test_conversations_with_same_session_id_use_different_databases(
     primary_store.append_messages("same-session", [_message("primary")])
     research_store.append_messages("same-session", [_message("research")])
 
+    # Distinct handles, one per Agent...
     assert primary_store is not research_store
+    # ...scoped by agent_id: default -> "", others -> their id.
+    assert primary_store._agent_id == ""
+    assert research_store._agent_id == "research"
+    # The same session_id does not collide across Agents.
     assert primary_store.load_messages("same-session")[0]["content"][0]["text"] == "primary"
     assert research_store.load_messages("same-session")[0]["content"][0]["text"] == "research"
-    assert Path(primary_store._db_path) == Path(primary.workspace) / "memory/long-term/index.db"
-    assert Path(research_store._db_path) == Path(research.workspace) / "memory/long-term/index.db"
+    # Both back onto the one global file (the default Agent's index.db).
+    global_db = Path(primary.workspace) / "memory/long-term/index.db"
+    assert Path(primary_store._db_path) == global_db
+    assert Path(research_store._db_path) == global_db
 
 
 def test_memory_config_keeps_each_agent_index_under_its_workspace(
@@ -119,31 +132,79 @@ def test_memory_config_keeps_each_agent_index_under_its_workspace(
     assert research_db == Path(research.workspace) / "memory/long-term/index.db"
 
 
-def test_scheduler_stores_allow_same_task_id_per_agent(isolated_registry):
+def test_scheduler_is_one_global_store_tagged_by_agent_id(isolated_registry):
+    """Tasks for every Agent live in one file; ownership is a field, not a path.
+    Re-binding a channel instance therefore never has to move a task."""
     class Bridge:
         agent_registry = isolated_registry
 
     bridge = Bridge()
-    for profile in isolated_registry.list(include_disabled=False):
-        assert init_scheduler(bridge, profile.workspace, profile.id)
+    assert init_scheduler(bridge)
 
-    primary_store = get_task_store(agent_id="primary")
-    research_store = get_task_store(agent_id="research")
-    primary_store.add_task(_task("daily", "Primary daily"))
-    research_store.add_task(_task("daily", "Research daily"))
+    store = get_task_store()
+    primary = _task("daily-p", "Primary daily")
+    primary["agent_id"] = "primary"
+    research = _task("daily-r", "Research daily")
+    research["agent_id"] = "research"
+    store.add_task(primary)
+    store.add_task(research)
 
-    assert primary_store is not research_store
-    assert primary_store.get_task("daily")["name"] == "Primary daily"
-    assert research_store.get_task("daily")["name"] == "Research daily"
-    assert Path(primary_store.store_path) == Path(
-        isolated_registry.get("primary").workspace
-    ) / "scheduler/tasks.json"
-    assert Path(research_store.store_path) == Path(
-        isolated_registry.get("research").workspace
-    ) / "scheduler/tasks.json"
-    assert get_scheduler_service(agent_id="primary") is not get_scheduler_service(
+    assert get_task_store(agent_id="primary") is store
+    assert get_task_store(agent_id="research") is store
+    assert get_scheduler_service(agent_id="primary") is get_scheduler_service(
         agent_id="research"
     )
+    assert [t["id"] for t in store.list_tasks(agent_id="primary")] == ["daily-p"]
+    assert [t["id"] for t in store.list_tasks(agent_id="research")] == ["daily-r"]
+    assert Path(store.store_path) == Path(
+        isolated_registry.get("primary").workspace
+    ) / "scheduler/tasks.json"
+
+
+def test_legacy_per_agent_task_files_fold_into_the_global_store(isolated_registry):
+    """A one-time boot migration imports each Agent's old tasks.json, stamps
+    ``agent_id``, and leaves the source renamed aside — not deleted, so a
+    rollback is possible. The default Agent's file *is* the global store, so
+    those tasks stay put and only get an owner stamp."""
+    import json
+
+    class Bridge:
+        agent_registry = isolated_registry
+
+    primary = isolated_registry.get("primary")
+    research = isolated_registry.get("research")
+    global_path = Path(primary.workspace) / "scheduler" / "tasks.json"
+    legacy_path = Path(research.workspace) / "scheduler" / "tasks.json"
+    global_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+    global_path.write_text(
+        json.dumps({"version": 1, "tasks": {"old-p": _task("old-p", "Default leftover")}}),
+        encoding="utf-8",
+    )
+    legacy_path.write_text(
+        json.dumps({"version": 1, "tasks": {"old-r": _task("old-r", "Research leftover")}}),
+        encoding="utf-8",
+    )
+
+    assert init_scheduler(Bridge())
+    store = get_task_store()
+    assert store.get_task("old-p")["agent_id"] == "primary"
+    assert store.get_task("old-r")["agent_id"] == "research"
+    assert store.get_task("old-r")["name"] == "Research leftover"
+    assert not legacy_path.exists()
+    assert legacy_path.with_name("tasks.json.migrated").exists()
+
+
+def test_list_tasks_treats_missing_agent_id_as_the_default(isolated_registry):
+    class Bridge:
+        agent_registry = isolated_registry
+
+    assert init_scheduler(Bridge())
+    store = get_task_store()
+    store.add_task(_task("orphan", "No owner field"))
+
+    assert [t["id"] for t in store.list_tasks(agent_id="primary")] == ["orphan"]
+    assert store.list_tasks(agent_id="research") == []
 
 
 def test_each_agent_boots_only_its_own_mcp_servers(mcp_workspaces, monkeypatch):
@@ -190,6 +251,127 @@ def test_tool_manager_instance_is_per_workspace(mcp_workspaces):
     assert primary._mcp_json_path() != research._mcp_json_path()
     assert primary._mcp_json_path().endswith("primary/mcp.json")
     assert research._mcp_json_path().endswith("research/mcp.json")
+
+
+def test_agents_sharing_one_mcp_json_boot_each_server_once(isolated_registry, monkeypatch):
+    """When several Agents resolve to the same shared mcp.json, the same server
+    must not be forked once per Agent — they attach to one pooled subprocess."""
+    import json
+
+    from agent.tools.tool_manager import ToolManager
+    from agent.tools.mcp import mcp_client as mcp_mod
+    from agent.tools.mcp.mcp_client import McpClientRegistry
+
+    # Only the default (primary) Agent has an mcp.json; the others share it.
+    primary_ws = Path(isolated_registry.get("primary").workspace)
+    primary_ws.mkdir(parents=True, exist_ok=True)
+    (primary_ws / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"shared-server": {"command": "true"}}})
+    )
+
+    booted = {"count": 0}
+
+    class _FakeClient:
+        def __init__(self, cfg):
+            booted["count"] += 1
+            self.name = cfg.get("name", "")
+            self._proc = SimpleNamespace(poll=lambda: None)
+
+        def initialize(self):
+            return True
+
+        def list_tools(self):
+            return [{"name": f"{self.name}__ping"}]
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(mcp_mod, "McpClient", _FakeClient)
+    # Reuse should key on the resolved shared mcp.json, not the Agent workspace.
+    monkeypatch.setattr(
+        "agent.tools.tool_manager.threading.Thread",
+        lambda target, args=(), **kwargs: SimpleNamespace(start=lambda: target(*args)),
+    )
+
+    # Fresh process-wide pool for a deterministic count.
+    McpClientRegistry()._shared_pool.clear()
+    ToolManager.reset_instances()
+    try:
+        for agent_id in ("primary", "research"):
+            with identity_scope(agent_id=agent_id):
+                tm = ToolManager()
+                tm._load_mcp_tools_async(tm._load_mcp_configs())
+        assert booted["count"] == 1
+    finally:
+        McpClientRegistry()._shared_pool.clear()
+        ToolManager.reset_instances()
+
+
+def test_concurrent_loaders_boot_a_shared_server_once(isolated_registry, monkeypatch):
+    """The real regression: each Agent's loader runs on its own thread, so two
+    threads can miss the pool for the same server at the same instant. Only one
+    must fork the subprocess; the other has to wait and reuse it."""
+    import json
+    import threading
+    import time
+
+    from agent.tools.tool_manager import ToolManager
+    from agent.tools.mcp import mcp_client as mcp_mod
+    from agent.tools.mcp.mcp_client import McpClientRegistry
+
+    primary_ws = Path(isolated_registry.get("primary").workspace)
+    primary_ws.mkdir(parents=True, exist_ok=True)
+    (primary_ws / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"shared-server": {"command": "true"}}})
+    )
+
+    booted = {"count": 0}
+    booted_lock = threading.Lock()
+
+    class _FakeClient:
+        def __init__(self, cfg):
+            with booted_lock:
+                booted["count"] += 1
+            self.name = cfg.get("name", "")
+            self._proc = SimpleNamespace(poll=lambda: None)
+
+        def initialize(self):
+            # Simulate a slow fork/handshake to widen the race window.
+            time.sleep(0.05)
+            return True
+
+        def list_tools(self):
+            return [{"name": f"{self.name}__ping"}]
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(mcp_mod, "McpClient", _FakeClient)
+
+    McpClientRegistry()._shared_pool.clear()
+    McpClientRegistry()._boot_locks.clear()
+    ToolManager.reset_instances()
+
+    barrier = threading.Barrier(2)
+
+    def _run(agent_id):
+        with identity_scope(agent_id=agent_id):
+            tm = ToolManager()
+            configs = tm._load_mcp_configs()
+        barrier.wait()
+        tm._load_mcp_tools_async(configs)
+
+    threads = [threading.Thread(target=_run, args=(a,)) for a in ("primary", "research")]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+        assert booted["count"] == 1
+    finally:
+        McpClientRegistry()._shared_pool.clear()
+        McpClientRegistry()._boot_locks.clear()
+        ToolManager.reset_instances()
 
 
 def test_mcp_path_stays_put_when_the_ambient_identity_is_gone(mcp_workspaces):

@@ -1,17 +1,62 @@
 """Tests for portable CowAgent backup archives."""
 
+import errno
 import json
+import os
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from agent import team
+from agent.registry import AgentRegistry
+from cli.commands import backup
 from cli.commands.backup import create_backup_archive, restore_backup_archive
 
 
 def _write_json(path: Path, value: dict):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+@pytest.mark.parametrize("default", [None, "", "   ", " primary ", "primary"])
+def test_backup_uses_the_registry_default_for_a_supported_roster(tmp_path, default):
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    settings = {
+        "agent_workspace": str(workspace),
+        "agents": [
+            {"id": "disabled", "enabled": False},
+            {"id": "primary", "name": "Primary"},
+            {"id": "alpha", "name": "Alpha"},
+        ],
+    }
+    if default is not None:
+        settings["default_agent_id"] = default
+    _write_json(data / "config.json", settings)
+    registry = AgentRegistry.from_config(settings)
+    assert registry.default_agent_id == "primary"
+    for profile in registry.list():
+        profile.workspace_path.mkdir(parents=True, exist_ok=True)
+        (profile.workspace_path / "MEMORY.md").write_text(profile.id, encoding="utf-8")
+
+    archive = tmp_path / "backup.zip"
+    create_backup_archive(archive, data, workspace)
+    with zipfile.ZipFile(archive) as bundle:
+        manifest = json.loads(bundle.read("manifest.json"))
+        assert manifest["workspace_source"] == str(workspace.resolve())
+        for profile in registry.list():
+            assert bundle.read(f"agents/{profile.id}/workspace/MEMORY.md") == profile.id.encode()
+
+    target = tmp_path / "restored-workspace"
+    restored_data = tmp_path / "restored-data"
+    restore_backup_archive(archive, restored_data, target)
+    restored = json.loads((restored_data / "config.json").read_text(encoding="utf-8"))
+    restored_registry = AgentRegistry.from_config(team.resolve(restored))
+    assert restored_registry.default_agent_id == "primary"
+    assert restored_registry.get().workspace_path == target.resolve()
+    for profile in restored_registry.list():
+        assert (profile.workspace_path / "MEMORY.md").read_text(encoding="utf-8") == profile.id
 
 
 def test_backup_restore_round_trip(tmp_path):
@@ -51,6 +96,67 @@ def test_backup_restore_round_trip(tmp_path):
     assert result["workspace_files"] == 5
 
 
+def test_backup_output_on_another_filesystem(tmp_path, monkeypatch):
+    source_workspace = tmp_path / "workspace"
+    source_workspace.mkdir()
+    (source_workspace / "MEMORY.md").write_bytes(b"portable\n")
+    output_dir = source_workspace / "backups"
+    archive = output_dir / "cow-backup.zip"
+    real_replace = os.replace
+
+    def replace_on_same_filesystem(source, destination):
+        # Treat the output directory as a separate mounted filesystem.
+        if output_dir.resolve() not in Path(source).resolve().parents:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(backup.os, "replace", replace_on_same_filesystem)
+    summary = create_backup_archive(archive, tmp_path / "data", source_workspace)
+
+    assert summary["contents"]["workspace_files"] == 1
+    with zipfile.ZipFile(archive) as bundle:
+        assert set(bundle.namelist()) == {"manifest.json", "workspace/MEMORY.md"}
+        assert bundle.read("workspace/MEMORY.md") == b"portable\n"
+    assert list(output_dir.iterdir()) == [archive]
+
+
+def test_backup_falls_back_to_move_on_cross_device_replace(tmp_path, monkeypatch):
+    source_workspace = tmp_path / "workspace"
+    source_workspace.mkdir()
+    (source_workspace / "MEMORY.md").write_bytes(b"portable\n")
+    output_dir = tmp_path / "backups"
+    output_dir.mkdir()
+    archive = output_dir / "cow-backup.zip"
+    archive.write_bytes(b"previous backup")
+
+    def replace_raising_exdev(source, destination):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(backup.os, "replace", replace_raising_exdev)
+    create_backup_archive(archive, tmp_path / "data", source_workspace)
+
+    with zipfile.ZipFile(archive) as bundle:
+        assert bundle.read("workspace/MEMORY.md") == b"portable\n"
+    assert list(output_dir.iterdir()) == [archive]
+
+
+def test_backup_replace_failure_preserves_existing_archive(tmp_path, monkeypatch):
+    output_dir = tmp_path / "backups"
+    output_dir.mkdir()
+    archive = output_dir / "cow-backup.zip"
+    archive.write_bytes(b"previous backup")
+
+    def fail_replace(source, destination):
+        raise PermissionError("destination is locked")
+
+    monkeypatch.setattr(backup.os, "replace", fail_replace)
+    with pytest.raises(PermissionError, match="destination is locked"):
+        create_backup_archive(archive, tmp_path / "data", tmp_path / "workspace")
+
+    assert archive.read_bytes() == b"previous backup"
+    assert list(output_dir.iterdir()) == [archive]
+
+
 def test_restore_merges_without_deleting_unrelated_files(tmp_path):
     source_data = tmp_path / "source-data"
     source_workspace = tmp_path / "source-workspace"
@@ -81,6 +187,26 @@ def test_restore_rejects_path_traversal(tmp_path):
         restore_backup_archive(archive, tmp_path / "data", tmp_path / "workspace")
 
 
+def test_restore_accepts_legacy_version_one_archive(tmp_path):
+    archive = tmp_path / "legacy.zip"
+    manifest = {"format": "cowagent-backup", "version": 1}
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        output.writestr(
+            "data/config.json", json.dumps({"agent_workspace": "/old/path"})
+        )
+        output.writestr("workspace/MEMORY.md", "legacy memory")
+
+    target_data = tmp_path / "data"
+    target_workspace = tmp_path / "workspace"
+    result = restore_backup_archive(archive, target_data, target_workspace)
+
+    assert (target_workspace / "MEMORY.md").read_text() == "legacy memory"
+    assert result["agents"] == []
+    restored = json.loads((target_data / "config.json").read_text())
+    assert restored["agent_workspace"] == str(target_workspace.resolve())
+
+
 def test_fresh_restore_ignores_archive_controlled_destinations(tmp_path, monkeypatch):
     source_data = tmp_path / "source-data"
     source_workspace = tmp_path / "source-workspace"
@@ -108,3 +234,401 @@ def test_fresh_restore_ignores_archive_controlled_destinations(tmp_path, monkeyp
     assert (target_data / "user_datas.pkl").read_bytes() == b"legacy"
     restored_config = json.loads((target_data / "config.json").read_text(encoding="utf-8"))
     assert restored_config["appdata_dir"] == ""
+
+
+def test_multi_agent_backup_restore_preserves_all_isolated_workspaces(tmp_path):
+    source_data = tmp_path / "source-data"
+    primary = tmp_path / "source-primary"
+    research = tmp_path / "source-research"
+    _write_json(
+        source_data / "config.json",
+        {
+            "agent_workspace": str(primary),
+            "default_agent_id": "primary",
+            "agents": [
+                {
+                    "id": "primary",
+                    "name": "Primary",
+                    "workspace": str(primary),
+                    "enabled": True,
+                },
+                {
+                    "id": "research",
+                    "name": "Research",
+                    "workspace": str(research),
+                    "enabled": True,
+                },
+            ],
+            "channel_instances": [
+                {"instance_id": "feishu-ops", "channel_type": "feishu", "agent_id": "research"}
+            ],
+        },
+    )
+    for workspace, marker in ((primary, "primary"), (research, "research")):
+        (workspace / "memory" / "long-term").mkdir(parents=True)
+        (workspace / "scheduler").mkdir()
+        (workspace / "MEMORY.md").write_text(marker, encoding="utf-8")
+        (workspace / "memory" / "long-term" / "index.db").write_bytes(
+            marker.encode("utf-8")
+        )
+        (workspace / "scheduler" / "tasks.json").write_text(
+            f'{{"owner":"{marker}"}}', encoding="utf-8"
+        )
+
+    archive = tmp_path / "multi.zip"
+    summary = create_backup_archive(archive, source_data, primary)
+
+    assert summary["layout"] == "agents"
+    assert summary["contents"]["agent_workspaces"] == 2
+    with zipfile.ZipFile(archive) as bundle:
+        names = set(bundle.namelist())
+    assert "agents/primary/workspace/memory/long-term/index.db" in names
+    assert "agents/research/workspace/memory/long-term/index.db" in names
+
+    target_data = tmp_path / "target-data"
+    target_root = tmp_path / "restored-agents"
+    result = restore_backup_archive(archive, target_data, target_root)
+    restored_config = json.loads(
+        (target_data / "config.json").read_text(encoding="utf-8")
+    )
+    destinations = {item["id"]: Path(item["workspace"]) for item in result["agents"]}
+    # Same layout AgentRegistry.from_config derives: the default Agent owns the
+    # instance root, the rest live under agents/<id>.
+    assert destinations == {
+        "primary": target_root.resolve(),
+        "research": (target_root / "agents" / "research").resolve(),
+    }
+    assert restored_config["agent_workspace"] == str(destinations["primary"])
+    # The roster is restored beside the workspaces, not back into config.json,
+    # and it names no paths at all: this layout is the one the registry derives,
+    # so the restored tree can be moved again without editing anything.
+    assert "agents" not in restored_config
+    restored_roster = team.read({"agent_workspace": str(destinations["primary"])})
+    assert [item["id"] for item in restored_roster["agents"]] == ["primary", "research"]
+    assert not any("workspace" in item for item in restored_roster["agents"])
+    assert restored_roster["channel_instances"][0]["agent_id"] == "research"
+    assert (destinations["primary"] / "MEMORY.md").read_text() == "primary"
+    assert (destinations["research"] / "MEMORY.md").read_text() == "research"
+    assert (destinations["primary"] / "memory/long-term/index.db").read_bytes() == b"primary"
+    assert (destinations["research"] / "scheduler/tasks.json").exists()
+    assert result["workspace_files"] == 6
+    assert {item["id"] for item in result["agents"]} == {"primary", "research"}
+
+
+def test_multi_agent_restore_reuses_matching_local_destinations(tmp_path):
+    source_data = tmp_path / "source-data"
+    source_primary = tmp_path / "source-primary"
+    source_research = tmp_path / "source-research"
+    config = {
+        "default_agent_id": "primary",
+        "agents": [
+            {"id": "primary", "workspace": str(source_primary)},
+            {"id": "research", "workspace": str(source_research)},
+        ],
+    }
+    _write_json(source_data / "config.json", config)
+    source_primary.mkdir()
+    source_research.mkdir()
+    (source_primary / "AGENT.md").write_text("new primary", encoding="utf-8")
+    (source_research / "AGENT.md").write_text("new research", encoding="utf-8")
+    archive = tmp_path / "multi.zip"
+    create_backup_archive(archive, source_data, source_primary)
+
+    target_data = tmp_path / "target-data"
+    local_primary = tmp_path / "local-primary"
+    local_research = tmp_path / "local-research"
+    _write_json(
+        target_data / "config.json",
+        {
+            "default_agent_id": "primary",
+            "agents": [
+                {"id": "primary", "workspace": str(local_primary)},
+                {"id": "research", "workspace": str(local_research)},
+            ],
+        },
+    )
+
+    restore_backup_archive(archive, target_data)
+
+    assert (local_primary / "AGENT.md").read_text() == "new primary"
+    assert (local_research / "AGENT.md").read_text() == "new research"
+    # What matters is where the registry then looks, not how the roster spells
+    # it: the default Agent's root is implied and Research sits outside the
+    # derived layout, so only one of the two is written down.
+    settings = team.resolve({"agent_workspace": str(local_primary)})
+    registry = AgentRegistry.from_config(settings)
+    assert {profile.id: Path(profile.workspace) for profile in registry.list()} == {
+        "primary": local_primary.resolve(),
+        "research": local_research.resolve(),
+    }
+
+
+def test_multi_agent_restore_reuses_the_local_roster_file(tmp_path):
+    source_data = tmp_path / "source-data"
+    source_primary = tmp_path / "source-primary"
+    source_research = tmp_path / "source-research"
+    _write_json(
+        source_data / "config.json",
+        {
+            "default_agent_id": "primary",
+            "agents": [
+                {"id": "primary", "workspace": str(source_primary)},
+                {"id": "research", "workspace": str(source_research)},
+            ],
+        },
+    )
+    source_primary.mkdir()
+    source_research.mkdir()
+    (source_primary / "AGENT.md").write_text("new primary", encoding="utf-8")
+    (source_research / "AGENT.md").write_text("new research", encoding="utf-8")
+    archive = tmp_path / "multi.zip"
+    create_backup_archive(archive, source_data, source_primary)
+
+    target_data = tmp_path / "target-data"
+    local_primary = tmp_path / "local-primary"
+    local_research = tmp_path / "local-research"
+    local_primary.mkdir()
+    local_research.mkdir()
+    # What a current install leaves behind once the roster has moved out of
+    # config.json: the file beside the workspaces holds it, config.json holds
+    # none of it.
+    _write_json(target_data / "config.json", {"agent_workspace": str(local_primary)})
+    _write_json(
+        local_primary / "agents" / team.FILE_NAME,
+        {
+            "default_agent_id": "primary",
+            "agents": [
+                {"id": "primary"},
+                {"id": "research", "workspace": str(local_research)},
+            ],
+        },
+    )
+    (local_research / "AGENT.md").write_text("local research", encoding="utf-8")
+
+    restore_backup_archive(archive, target_data)
+
+    assert (local_primary / "AGENT.md").read_text(encoding="utf-8") == "new primary"
+    assert (local_research / "AGENT.md").read_text(encoding="utf-8") == "new research"
+    roster = team.read({"agent_workspace": str(local_primary)})
+    assert {item["id"]: item.get("workspace") for item in roster["agents"]} == {
+        "primary": None,
+        "research": str(local_research.resolve()),
+    }
+
+
+def test_multi_agent_restore_rejects_manifest_registry_mismatch(tmp_path):
+    archive = tmp_path / "mismatch.zip"
+    manifest = {
+        "format": "cowagent-backup",
+        "version": 2,
+        "layout": "agents",
+        "agents": [
+            {
+                "id": "research",
+                "archive_root": "agents/research/workspace",
+            }
+        ],
+    }
+    config = {
+        "default_agent_id": "primary",
+        "agents": [{"id": "primary", "workspace": "/untrusted/path"}],
+    }
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        output.writestr("data/config.json", json.dumps(config))
+        output.writestr("agents/research/workspace/MEMORY.md", "nope")
+
+    with pytest.raises(ValueError, match="does not match"):
+        restore_backup_archive(archive, tmp_path / "data", tmp_path / "agents")
+
+
+def test_nested_agent_workspace_is_archived_once(tmp_path):
+    """The default Agent owns the instance root, so every other Agent's
+    workspace sits inside it. Walking the root must not pack them a second
+    time under the default Agent's archive root."""
+    source_data = tmp_path / "source-data"
+    instance_root = tmp_path / "instance-root"
+    nested = instance_root / "agents" / "beta"
+    instance_root.mkdir(parents=True)
+    nested.mkdir(parents=True)
+    (instance_root / "AGENT.md").write_text("main persona", encoding="utf-8")
+    (nested / "AGENT.md").write_text("beta persona", encoding="utf-8")
+    # "beta" has no explicit workspace, so the registry derives the nested path.
+    _write_json(
+        source_data / "config.json",
+        {
+            "agent_workspace": str(instance_root),
+            "default_agent_id": "main",
+            "agents": [
+                {"id": "main", "name": "Main", "workspace": str(instance_root)},
+                {"id": "beta", "name": "Beta"},
+            ],
+        },
+    )
+
+    archive = tmp_path / "nested.zip"
+    summary = create_backup_archive(archive, source_data, instance_root)
+
+    with zipfile.ZipFile(archive) as bundle:
+        names = sorted(n for n in bundle.namelist() if n.endswith("AGENT.md"))
+    assert names == [
+        "agents/beta/workspace/AGENT.md",
+        "agents/main/workspace/AGENT.md",
+    ]
+    assert summary["contents"]["workspace_files"] == 2
+
+    target_data = tmp_path / "target-data"
+    target_root = tmp_path / "restored"
+    restore_backup_archive(archive, target_data, target_root)
+
+    assert (target_root / "AGENT.md").read_text(encoding="utf-8") == "main persona"
+    assert (
+        target_root / "agents" / "beta" / "AGENT.md"
+    ).read_text(encoding="utf-8") == "beta persona"
+
+
+def test_manifest_reserves_the_user_dimension(tmp_path):
+    source_data = tmp_path / "source-data"
+    source_workspace = tmp_path / "source-workspace"
+    source_workspace.mkdir()
+    (source_workspace / "MEMORY.md").write_text("shared", encoding="utf-8")
+    _write_json(
+        source_data / "config.json", {"agent_workspace": str(source_workspace)}
+    )
+
+    archive = tmp_path / "reserved.zip"
+    summary = create_backup_archive(archive, source_data, source_workspace)
+
+    assert summary["users"] == []
+    with zipfile.ZipFile(archive) as bundle:
+        manifest = json.loads(bundle.read("manifest.json").decode("utf-8"))
+    assert manifest["users"] == []
+
+
+def test_single_workspace_archive_still_declares_version_one(tmp_path):
+    """A single-Agent archive is structurally what v1 produced, so it must keep
+    declaring v1 and stay restorable by an older CowAgent. Only the
+    multi-Agent layout is v2."""
+    source_data = tmp_path / "source-data"
+    single = tmp_path / "single"
+    single.mkdir()
+    (single / "AGENT.md").write_text("solo", encoding="utf-8")
+    _write_json(source_data / "config.json", {"agent_workspace": str(single)})
+
+    single_archive = tmp_path / "single.zip"
+    summary = create_backup_archive(single_archive, source_data, single)
+    assert summary["version"] == 1
+    assert summary["layout"] == "workspace"
+    with zipfile.ZipFile(single_archive) as bundle:
+        assert sorted(bundle.namelist()) == [
+            "data/config.json",
+            "manifest.json",
+            "workspace/AGENT.md",
+        ]
+
+    multi_data = tmp_path / "multi-data"
+    beta = tmp_path / "beta"
+    beta.mkdir()
+    (beta / "AGENT.md").write_text("beta", encoding="utf-8")
+    _write_json(
+        multi_data / "config.json",
+        {
+            "agent_workspace": str(single),
+            "default_agent_id": "main",
+            "agents": [
+                {"id": "main", "workspace": str(single)},
+                {"id": "beta", "workspace": str(beta)},
+            ],
+        },
+    )
+    multi_archive = tmp_path / "multi.zip"
+    assert create_backup_archive(multi_archive, multi_data, single)["version"] == 2
+
+
+def test_restore_rejects_archive_carrying_user_scoped_workspaces(tmp_path):
+    """A future writer may emit per-user roots. Refuse such an archive loudly
+    instead of restoring an Agent workspace and silently dropping a user's."""
+    archive = tmp_path / "with-users.zip"
+    manifest = {
+        "format": "cowagent-backup",
+        "version": 2,
+        "layout": "agents",
+        "agents": [{"id": "main", "archive_root": "agents/main/workspace"}],
+        "users": [{"id": "u-1", "archive_root": "users/u-1"}],
+    }
+    with zipfile.ZipFile(archive, "w") as output:
+        output.writestr("manifest.json", json.dumps(manifest))
+        output.writestr("data/config.json", json.dumps({"agents": [{"id": "main"}]}))
+        output.writestr("agents/main/workspace/AGENT.md", "main")
+        output.writestr("users/u-1/MEMORY.md", "private")
+
+    with pytest.raises(ValueError, match="user-scoped"):
+        restore_backup_archive(archive, tmp_path / "data", tmp_path / "root")
+
+
+@pytest.mark.parametrize("style", ["ordinary", "duplicate_lists", "persisted_team"])
+def test_backup_restore_preserves_canonical_agent_lists(tmp_path, monkeypatch, style):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("COW_DATA_DIR", str(tmp_path / "data"))
+    data = tmp_path / "data"
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "MEMORY.md").write_text("agent a memory", encoding="utf-8")
+    (b / "MEMORY.md").write_text("agent b memory", encoding="utf-8")
+    pa = {"id": "a", "name": "A", "workspace": str(a)}
+    pb = {"id": "b", "name": "B", "workspace": str(b)}
+    prefix = {"agent_workspace": str(b), "default_agent_id": "b"}
+    if style == "ordinary":
+        raw = json.dumps({**prefix, "agents": [pa, pb]})
+    else:
+        raw = (json.dumps(prefix)[:-1] + ',"agents":' + json.dumps([pa])
+               + ',"agents":' + json.dumps([pb]) + "}")
+    data.mkdir()
+    (data / "config.json").write_text(raw, encoding="utf-8")
+    if style == "persisted_team":
+        _write_json(b / "agents" / "team.json", {
+            "agents": [pa, pb], "default_agent_id": "b",
+        })
+
+    archive = tmp_path / "backup.zip"
+    summary = create_backup_archive(archive, data, b)
+    assert {item["id"] for item in summary["agents"]} == {"a", "b"}
+    with zipfile.ZipFile(archive) as bundle:
+        assert bundle.read("agents/a/workspace/MEMORY.md") == b"agent a memory"
+        assert bundle.read("agents/b/workspace/MEMORY.md") == b"agent b memory"
+
+    target_data = tmp_path / "restored-data"
+    target = tmp_path / "restored-workspace"
+    result = restore_backup_archive(archive, target_data, target)
+    assert {item["id"] for item in result["agents"]} == {"a", "b"}
+    assert (target / "MEMORY.md").read_text(encoding="utf-8") == "agent b memory"
+    assert (target / "agents" / "a" / "MEMORY.md").read_text(encoding="utf-8") == "agent a memory"
+    restored = json.loads((target_data / "config.json").read_text(encoding="utf-8"))
+    registry = AgentRegistry.from_config(team.resolve(restored))
+    assert {profile.id for profile in registry.list()} == {"a", "b"}
+    assert registry.default_agent_id == "b"
+
+
+@pytest.mark.parametrize("body", [
+    '{"channel_type":["terminal","web"]}',
+    '{"channel_type":["terminal"],"channel_type":["web"]}',
+])
+def test_restore_legacy_archive_preserves_canonical_channel_lists(tmp_path, monkeypatch, body):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("COW_DATA_DIR", str(tmp_path / "data"))
+    archive = tmp_path / "legacy.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("manifest.json", json.dumps({"format": "cowagent-backup", "version": 1}))
+        bundle.writestr("data/config.json", body)
+        bundle.writestr("workspace/MEMORY.md", "legacy memory")
+    data = tmp_path / "data"
+    workspace = tmp_path / "workspace"
+    result = restore_backup_archive(archive, data, workspace)
+    restored = json.loads((data / "config.json").read_text(encoding="utf-8"))
+    assert restored["channel_type"] == ["terminal", "web"]
+    assert result["config_restored"] is True
+    assert (workspace / "MEMORY.md").read_text(encoding="utf-8") == "legacy memory"

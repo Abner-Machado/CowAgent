@@ -30,10 +30,18 @@ _SECRET = "sk-SECRET-canary-value"
 class _TempHomeCase(unittest.TestCase):
     """Base case giving each test an isolated HOME with a credential file."""
 
+    #: ``expand_path`` -> ``os.path.expanduser('~')``, and on Windows
+    #: ``ntpath.expanduser`` resolves the home directory from USERPROFILE while
+    #: ignoring HOME entirely. Redirecting HOME alone therefore left the guard
+    #: comparing against the real ~/.cow/.env, so every assertion below failed
+    #: on Windows and the guard had no working coverage there.
+    _HOME_VARS = ("HOME", "USERPROFILE")
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        self._real_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.tmp
+        self._real_home = {name: os.environ.get(name) for name in self._HOME_VARS}
+        for name in self._HOME_VARS:
+            os.environ[name] = self.tmp
 
         os.makedirs(os.path.join(self.tmp, ".cow"))
         self.env_path = os.path.join(self.tmp, ".cow", ".env")
@@ -45,10 +53,11 @@ class _TempHomeCase(unittest.TestCase):
         self.config = {"cwd": self.workspace}
 
     def tearDown(self):
-        if self._real_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._real_home
+        for name, value in self._real_home.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         shutil.rmtree(self.tmp, ignore_errors=True)
 
 

@@ -12,6 +12,11 @@ from common.log import logger
 from config import conf, load_config
 from .modelscope_session import ModelScopeSession
 
+# An overloaded endpoint can hold the stream open with only ": keep-alive"
+# comments. Each one resets the socket read timeout, so without this cap a
+# queued request can hang for many minutes.
+STREAM_KEEPALIVE_MAX_SECONDS = 180
+
 
 class ModelScopeBot(Bot):
 
@@ -102,7 +107,7 @@ class ModelScopeBot(Bot):
             return reply
             
         elif context.type == ContextType.IMAGE_CREATE:
-            ok, retstring = self.create_img(query, 0)
+            ok, retstring = self.create_img(query)
             return Reply(ReplyType.IMAGE_URL, retstring) if ok else Reply(ReplyType.ERROR, retstring)
         else:
             return Reply(ReplyType.ERROR, "Bot 不支持处理{}类型的消息".format(context.type))
@@ -194,11 +199,25 @@ class ModelScopeBot(Bot):
                 total_tokens = completion_tokens = 0
                 finish_reason = None
                 
+                last_data_at = time.time()
                 for line in res.iter_lines():
                     if not line:
                         continue
                     
                     decoded_line = line.decode('utf-8')
+                    if decoded_line.startswith(':'):
+                        if time.time() - last_data_at > STREAM_KEEPALIVE_MAX_SECONDS:
+                            logger.error(
+                                f"[MODELSCOPE] Stream timeout: only keep-alive received for "
+                                f"{STREAM_KEEPALIVE_MAX_SECONDS}s"
+                            )
+                            return {
+                                "total_tokens": 0,
+                                "completion_tokens": 0,
+                                "content": f"请求超时：服务端 {STREAM_KEEPALIVE_MAX_SECONDS}s 内只返回 keep-alive 心跳，请稍后重试",
+                            }
+                        continue
+                    last_data_at = time.time()
                     if not decoded_line.startswith("data: "):
                         continue
                     
@@ -213,11 +232,16 @@ class ModelScopeBot(Bot):
                             total_tokens = json_data["usage"].get("total_tokens", 0)
                             completion_tokens = json_data["usage"].get("completion_tokens", 0)
 
-                        delta = json_data.get("choices", [{}])[0].get("delta", {})
+                        # Usage-only chunks may carry an empty choices list.
+                        choices = json_data.get("choices") or []
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
                         if delta and delta.get("content"):
                             content += delta["content"]
 
-                        choice = json_data.get("choices", [{}])[0]
+                        choice = choices[0]
                         if choice.get("finish_reason"):
                             finish_reason = choice["finish_reason"]
                             
@@ -449,6 +473,16 @@ class ModelScopeBot(Bot):
             # No drawing intent, proceed with normal tool call flow
             session_id = kwargs.get('session_id', 'default_session')
             session = self.sessions.session_query("", session_id)
+
+            # The agent passes its system prompt as `system=`; put it in the
+            # message list instead of sending it as an unknown request field.
+            system_prompt = kwargs.pop("system", None)
+            messages = list(messages)
+            if system_prompt:
+                if not messages or messages[0].get("role") != "system":
+                    messages.insert(0, {"role": "system", "content": system_prompt})
+                else:
+                    messages[0] = {"role": "system", "content": system_prompt}
             session.messages = messages
             
             args = self.args.copy()
@@ -532,6 +566,9 @@ class ModelScopeBot(Bot):
             body = args.copy()
             body["messages"] = self._convert_messages_for_modelscope(session.messages)
             body["stream"] = True
+            # Ask for a trailing usage chunk so the agent can surface a real
+            # prompt_tokens count for the context indicator.
+            body["stream_options"] = {"include_usage": True}
             
             response = requests.post(
                 "{}/chat/completions".format(self.base_url),
@@ -547,12 +584,31 @@ class ModelScopeBot(Bot):
             
             current_tool_calls = {}
             finish_reason = None
+            stream_usage = None  # Provider-reported token usage
             
+            last_data_at = time.time()
             for line in response.iter_lines():
                 if not line:
                     continue
                 
                 line = line.decode("utf-8")
+                if line.startswith(":"):
+                    if time.time() - last_data_at > STREAM_KEEPALIVE_MAX_SECONDS:
+                        logger.error(
+                            f"[MODELSCOPE] Stream timeout: only keep-alive received for "
+                            f"{STREAM_KEEPALIVE_MAX_SECONDS}s"
+                        )
+                        yield {
+                            "error": True,
+                            "message": f"Stream timeout: only keep-alive received for {STREAM_KEEPALIVE_MAX_SECONDS}s",
+                            "status_code": 504,
+                        }
+                        return
+                    # Empty chunk lets the caller check for cancel while the server is queueing
+                    yield {}
+                    continue
+                last_data_at = time.time()
+
                 if not line.startswith("data: ") or line[6:].strip() == "[DONE]":
                     continue
                 
@@ -562,6 +618,11 @@ class ModelScopeBot(Bot):
                     if chunk.get("error"):
                         yield {"error": True, "message": str(chunk["error"]), "status_code": 500}
                         return
+                    
+                    # The include_usage chunk carries usage with an empty choices
+                    # list — capture it before the choices skip below drops it.
+                    if isinstance(chunk.get("usage"), dict):
+                        stream_usage = chunk["usage"]
                     
                     choices = chunk.get("choices")
                     if not choices or len(choices) == 0:
@@ -720,20 +781,20 @@ class ModelScopeBot(Bot):
                                 }]
                             }
             
-            yield {
+            final_chunk = {
                 "choices": [{
                     "index": 0,
                     "delta": {},
                     "finish_reason": finish_reason or "stop"
                 }]
             }
+            if stream_usage is not None:
+                final_chunk["usage"] = stream_usage
+            yield final_chunk
             
         except Exception as e:
             logger.error("[MODELSCOPE] stream tool call error: {}".format(e))
-            error_msg = "{}".format(e)
-            def error_generator():
-                yield {"error": True, "message": error_msg, "status_code": 500}
-            return error_generator()
+            yield {"error": True, "message": "{}".format(e), "status_code": 500}
 
     # ==================== Format Conversion ====================
 

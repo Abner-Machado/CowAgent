@@ -1,0 +1,139 @@
+                <!-- ====================================================== -->
+                <!-- VIEW: Capabilities (tools, MCP, skills)                 -->
+                <!-- ====================================================== -->
+                <div id="view-skills" class="view">
+                    <div class="flex-1 overflow-y-auto p-6">
+                        <div class="max-w-4xl mx-auto">
+
+                            <!-- Panel: list -->
+                            <div id="skills-panel-list">
+                                <div class="mb-8">
+                                    <h2 class="text-xl font-bold text-slate-800 dark:text-slate-100" data-i18n="skills_title">能力</h2>
+                                    <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" data-i18n="skills_desc">管理 Agent 可以调用的内置工具、MCP 工具和技能</p>
+                                </div>
+
+                                <!-- Built-in Tools Section -->
+                                <section class="mb-10">
+                                    <div class="flex items-center gap-2 mb-3">
+                                        <span class="cap-section-title" data-i18n="tools_section_title">内置工具</span>
+                                        <span id="tools-count-badge" class="cap-count hidden"></span>
+                                        <button type="button" id="tools-toggle-btn" class="cap-link-btn ml-auto hidden">
+                                            <span id="tools-toggle-label" data-i18n="tools_show_all">展开全部</span>
+                                            <i id="tools-toggle-icon" class="fas fa-chevron-down text-[10px]"></i>
+                                        </button>
+                                    </div>
+                                    <div id="tools-empty" class="flex items-center gap-2 py-4 text-slate-400 dark:text-slate-500 text-sm">
+                                        <i class="fas fa-spinner fa-spin text-xs"></i>
+                                        <span data-i18n="tools_loading">加载工具中...</span>
+                                    </div>
+                                    <div id="tools-list" class="grid gap-3 sm:grid-cols-2 hidden"></div>
+                                </section>
+
+                                <!-- MCP Tools Section -->
+                                <section class="mb-10" id="mcp-section">
+                                    <div class="flex items-center gap-2 mb-3">
+                                        <span class="cap-section-title" data-i18n="mcp_section_title">MCP 工具</span>
+                                        <span id="mcp-count-badge" class="cap-count hidden"></span>
+                                        <button type="button" id="mcp-add-btn" class="cap-action-btn ml-auto">
+                                            <i class="fas fa-plus text-[10px]"></i>
+                                            <span data-i18n="mcp_add">添加 MCP</span>
+                                        </button>
+                                    </div>
+                                    <div id="mcp-empty" class="cap-empty">
+                                        <div class="cap-empty-icon"><i class="fas fa-plug"></i></div>
+                                        <p class="text-sm font-medium text-slate-600 dark:text-slate-300" data-i18n="mcp_empty">还没有接入 MCP 工具</p>
+                                        <p class="text-xs text-slate-400 dark:text-slate-500 mt-1" data-i18n="mcp_empty_hint">可以手动填写，也可以直接粘贴 MCP 市场提供的 JSON 配置</p>
+                                    </div>
+                                    <div id="mcp-list" class="grid gap-3 sm:grid-cols-2 hidden"></div>
+                                </section>
+
+                                <!-- Skills Section -->
+                                <section>
+                                    <div class="flex items-center gap-2 mb-3">
+                                        <span class="cap-section-title" data-i18n="skills_section_title">技能</span>
+                                        <span id="skills-count-badge" class="cap-count hidden"></span>
+                                        <a href="https://skills.cowagent.ai/" target="_blank" rel="noopener noreferrer" class="cap-link-btn ml-auto">
+                                            <i class="fas fa-compass text-[11px]"></i>
+                                            <span data-i18n="skills_hub_btn">探索技能广场</span>
+                                            <i class="fas fa-arrow-up-right-from-square text-[9px] opacity-60"></i>
+                                        </a>
+                                        <button type="button" id="skill-add-btn" class="cap-action-btn">
+                                            <i class="fas fa-plus text-[10px]"></i>
+                                            <span data-i18n="skill_add">添加技能</span>
+                                        </button>
+                                    </div>
+                                    <div id="skills-empty" class="flex flex-col items-center justify-center py-12">
+                                        <div class="w-14 h-14 rounded-2xl bg-primary-50 dark:bg-primary-900/20 flex items-center justify-center mb-3">
+                                            <i class="fas fa-bolt text-primary-500 text-lg"></i>
+                                        </div>
+                                        <p class="text-slate-500 dark:text-slate-400 font-medium" data-i18n="skills_loading">加载技能中...</p>
+                                        <p class="text-sm text-slate-400 dark:text-slate-500 mt-1" data-i18n="skills_loading_desc">技能加载后将显示在此处</p>
+                                    </div>
+                                    <div id="skills-list" class="grid gap-4 sm:grid-cols-2"></div>
+                                </section>
+                            </div>
+
+                            <!-- Panel: skill viewer / editor (replaces list) -->
+                            <div id="skills-panel-viewer" class="hidden">
+                                <div class="flex items-center gap-3 mb-6">
+                                    <button onclick="closeSkillViewer()"
+                                            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm
+                                                   text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-white/10
+                                                   border border-slate-200 dark:border-white/10 transition-colors cursor-pointer">
+                                        <i class="fas fa-arrow-left text-xs"></i>
+                                        <span data-i18n="skill_back">返回列表</span>
+                                    </button>
+                                    <h2 id="skill-viewer-title"
+                                        class="flex-1 min-w-0 text-base font-semibold text-slate-800 dark:text-slate-100 font-mono truncate"></h2>
+                                    <span id="skill-viewer-readonly"
+                                          class="hidden truncate max-w-[40%] px-2 py-0.5 rounded-full text-xs bg-slate-100 dark:bg-white/10 text-slate-500 dark:text-slate-400"
+                                          data-i18n="skill_builtin_readonly">内置技能不可编辑</span>
+                                    <button id="skill-btn-edit" onclick="skillEditor.start()"
+                                            class="doc-action-btn hidden">
+                                        <i class="fas fa-pen text-xs"></i>
+                                        <span data-i18n="ws_edit">编辑</span>
+                                    </button>
+                                    <button id="skill-btn-save" onclick="skillEditor.save()"
+                                            class="doc-action-btn doc-action-btn-primary hidden">
+                                        <i class="fas fa-check text-xs"></i>
+                                        <span data-i18n="ws_edit_save">保存 (Ctrl+S)</span>
+                                    </button>
+                                    <button id="skill-btn-cancel" onclick="skillEditor.cancel()"
+                                            class="doc-action-btn hidden">
+                                        <i class="fas fa-xmark text-xs"></i>
+                                        <span data-i18n="ws_edit_cancel">退出编辑</span>
+                                    </button>
+                                </div>
+                                <!-- One card for the file list and the document, so its edges
+                                     line up with the header above instead of the document
+                                     starting wherever the list happens to end. -->
+                                <div class="relative">
+                                    <!-- Folding the list away is the only way back to a full-width
+                                         document, so the switch cannot live inside the panel it
+                                         hides. It rides the border instead: the divider while the
+                                         list is out, the card's left edge once it is folded. -->
+                                    <button id="skill-files-toggle" onclick="toggleSkillFilesPanel()"
+                                            class="skill-files-switch hidden"
+                                            title="展开文件列表" aria-label="展开文件列表" aria-expanded="false"
+                                            data-i18n-title="skill_files_expand" data-i18n-aria-label="skill_files_expand">
+                                        <i class="fas fa-chevron-right"></i>
+                                    </button>
+                                    <div class="skill-viewer-card flex bg-panel rounded-xl border border-slate-200 dark:border-white/10 overflow-hidden">
+                                        <!-- A skill is a directory: the tree is what makes the files
+                                             beside its SKILL.md reachable, and what says what the
+                                             skill is made of even when that is one file. -->
+                                        <div id="skill-files-panel"
+                                             class="hidden w-56 flex-shrink-0 flex flex-col min-h-0 border-r border-slate-100 dark:border-white/10 bg-slate-50/60 dark:bg-white/[0.02]">
+                                            <div class="flex-shrink-0 px-3 pt-3 pb-1.5 text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500"
+                                                 data-i18n="skill_files_title">技能文件</div>
+                                            <div id="skill-files-tree" class="flex-1 min-h-0 pb-2 overflow-y-auto"></div>
+                                        </div>
+                                        <div id="skill-viewer-content"
+                                             class="flex-1 min-w-0 px-8 py-6 overflow-y-auto text-sm text-slate-700 dark:text-slate-200"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                        </div>
+                    </div>
+                </div>

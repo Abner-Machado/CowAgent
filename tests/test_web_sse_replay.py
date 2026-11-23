@@ -8,6 +8,7 @@ from bridge.context import Context
 from bridge.reply import Reply, ReplyType
 from agent.memory.conversation_store import ConversationStore
 from channel.web import web_channel
+from channel.web.api import chat as chat_api
 
 
 WebChannel = dict(zip(
@@ -53,9 +54,9 @@ def _events(chunks):
 
 
 def test_explicit_and_native_cursors_use_the_furthest_progress():
-    assert web_channel._parse_sse_cursor("0", "12") == 12
-    assert web_channel._parse_sse_cursor("15", "12") == 15
-    assert web_channel._parse_sse_cursor("invalid", "7") == 7
+    assert chat_api._parse_sse_cursor("0", "12") == 12
+    assert chat_api._parse_sse_cursor("15", "12") == 15
+    assert chat_api._parse_sse_cursor("invalid", "7") == 7
 
 
 def test_history_exposes_seq_for_merged_assistant_bubble(tmp_path):

@@ -1,0 +1,33 @@
+    <!-- Login Overlay -->
+    <div id="login-overlay" class="fixed inset-0 z-[200] bg-canvas flex items-center justify-center hidden">
+        <div class="w-full max-w-sm mx-4">
+            <div class="flex flex-col items-center mb-8">
+                <img src="/assets/logo.jpg" alt="CowAgent" class="w-16 h-16 rounded-2xl mb-4 shadow-lg">
+                <h1 class="text-xl font-bold text-slate-800 dark:text-slate-100">CowAgent</h1>
+                <p class="text-sm text-slate-500 dark:text-slate-400 mt-1" id="login-subtitle">请输入密码以访问控制台</p>
+            </div>
+            <form id="login-form" class="space-y-4" onsubmit="return false;">
+                <div class="relative">
+                    <input id="login-password" type="password" autocomplete="current-password"
+                           placeholder="Password"
+                           class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-white/10
+                                  bg-panel text-slate-800 dark:text-slate-200
+                                  placeholder-slate-400 dark:placeholder-slate-500
+                                  focus:outline-none focus:ring-2 focus:ring-primary-400/50 focus:border-primary-400
+                                  transition-all duration-150 text-sm">
+                    <button type="button" id="login-toggle-pwd"
+                            class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600
+                                   dark:hover:text-slate-300 cursor-pointer transition-colors"
+                            onclick="toggleLoginPassword()">
+                        <i class="fas fa-eye text-sm"></i>
+                    </button>
+                </div>
+                <p id="login-error" class="text-sm text-red-500 hidden"></p>
+                <button id="login-btn" type="submit"
+                        class="w-full py-3 rounded-xl bg-primary-500 hover:bg-primary-600 text-white font-medium
+                               text-sm cursor-pointer transition-colors duration-150 disabled:opacity-50 disabled:cursor-not-allowed">
+                    登录
+                </button>
+            </form>
+        </div>
+    </div>

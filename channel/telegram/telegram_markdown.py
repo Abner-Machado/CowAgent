@@ -8,6 +8,8 @@ they are flattened into shapes that still read well inside a chat bubble.
 import html
 import re
 
+from common.markdown_fence import replace_fenced_blocks
+
 # Bot API limits. Telegram counts these after entity parsing, so measuring the
 # markdown source against them errs on the safe side (tags add no length).
 TEXT_LIMIT = 4096
@@ -47,12 +49,14 @@ def to_telegram_html(text: str) -> str:
         parked.append(rendered)
         return f"\x00{len(parked) - 1}\x00"
 
-    def fence(m: re.Match) -> str:
-        lang = (m.group(1) or "").strip()
+    def fence(lang: str, code: str) -> str:
+        lang = lang.strip()
         attr = f' class="language-{html.escape(lang, quote=True)}"' if lang else ""
-        return park(f"<pre><code{attr}>{html.escape(m.group(2), quote=False)}</code></pre>")
+        return park(f"<pre><code{attr}>{html.escape(code, quote=False)}</code></pre>")
 
-    text = _FENCE_RE.sub(fence, text)
+    text = replace_fenced_blocks(text, lambda info, code, _block: fence(info, code))
+    # Whatever the line scan leaves, e.g. a fence closed on the code's own line.
+    text = _FENCE_RE.sub(lambda m: fence(m.group(1) or "", m.group(2)), text)
     text = _TABLE_RE.sub(lambda m: park(_render_table(m.group(0))), text)
     text = _INLINE_CODE_RE.sub(
         lambda m: park(f"<code>{html.escape(m.group(1), quote=False)}</code>"), text
@@ -100,14 +104,27 @@ def _render_line(line: str) -> str:
 
 
 def _render_inline(text: str) -> str:
+    links = {}
+    source = text
+
+    def emphasis(value: str) -> str:
+        value = _BOLD_RE.sub(r"<b>\1</b>", value)
+        value = _BOLD_ALT_RE.sub(r"<b>\1</b>", value)
+        value = _STRIKE_RE.sub(r"<s>\1</s>", value)
+        value = _ITALIC_RE.sub(r"<i>\1</i>", value)
+        return _ITALIC_ALT_RE.sub(r"<i>\1</i>", value)
+
     def link(m: re.Match) -> str:
         url = m.group(2).replace('"', "&quot;")
-        return f'<a href="{url}">{m.group(1)}</a>'
+        token = f"\x01link{len(links)}\x01"
+        while token in source:
+            token += "\x01"
+        links[token] = f'<a href="{url}">{emphasis(m.group(1))}</a>'
+        return token
 
-    text = _LINK_RE.sub(link, text)
-    text = _BOLD_RE.sub(r"<b>\1</b>", text)
-    text = _BOLD_ALT_RE.sub(r"<b>\1</b>", text)
-    text = _STRIKE_RE.sub(r"<s>\1</s>", text)
-    text = _ITALIC_RE.sub(r"<i>\1</i>", text)
-    text = _ITALIC_ALT_RE.sub(r"<i>\1</i>", text)
+    # URLs are not Markdown source. Park the anchor while surrounding prose
+    # is formatted, then restore it with the separately formatted label.
+    text = emphasis(_LINK_RE.sub(link, text))
+    for token, rendered in links.items():
+        text = text.replace(token, rendered)
     return text

@@ -1,10 +1,8 @@
 # encoding:utf-8
 
 import time
-import json
 
 from models.openai.openai_compat import (
-    error as openai_error,
     RateLimitError,
     Timeout,
     APIError,
@@ -12,12 +10,14 @@ from models.openai.openai_compat import (
     wrap_http_error,
 )
 from models.openai.openai_http_client import OpenAIHTTPClient, OpenAIHTTPError
+from models.openai import responses_adapter
 import requests
 from common import const
 from common.i18n import t as _t
 from models.bot import Bot
 from models.openai_compatible_bot import OpenAICompatibleBot
-from models.custom_provider import resolve_custom_credentials, parse_custom_bot_type
+from models.custom_provider import resolve_custom_credentials, resolve_custom_headers, parse_custom_bot_type
+from models.cowagent_provider import resolve_cowagent_credentials
 from models.chatgpt.chat_gpt_session import ChatGPTSession
 from models.openai.open_ai_image import OpenAIImage
 from models.session_manager import SessionManager
@@ -30,15 +30,27 @@ from models.baidu.baidu_wenxin_session import BaiduWenxinSession
 
 # OpenAI对话模型API (可用)
 class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
-    def __init__(self):
+    def __init__(self, bot_type=None):
         super().__init__()
         # Resolve api key / base from config (no global SDK state anymore).
-        is_custom, _ = parse_custom_bot_type(conf().get("bot_type", ""))
+        # ``bot_type`` is the provider this instance was built for; only when
+        # the caller has no opinion (None) do we fall back to the globally
+        # configured one. Resolution must use the *effective* type: a turn
+        # routed to another provider (a session override, or an engaged chat
+        # fallback) carries its own ``custom:<id>``, and reading the global
+        # value here would pair that provider's model id with this vendor's
+        # api_base — which the upstream answers with a 404 "model is not found".
+        self._bot_type = bot_type or conf().get("bot_type", "")
+        is_custom, _ = parse_custom_bot_type(self._bot_type)
         custom_model = None
+        extra_headers = None
         if is_custom:
             # Supports multiple custom providers via bot_type "custom:<id>"
             # with automatic fallback to the legacy custom_api_key/base fields.
-            self._api_key, self._api_base, custom_model = resolve_custom_credentials()
+            self._api_key, self._api_base, custom_model = resolve_custom_credentials(self._bot_type)
+            extra_headers = resolve_custom_headers(self._bot_type)
+        elif self._bot_type == const.COWAGENT:
+            self._api_key, self._api_base = resolve_cowagent_credentials()
         else:
             self._api_key = conf().get("open_ai_api_key")
             self._api_base = conf().get("open_ai_api_base") or None
@@ -47,6 +59,7 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
             api_key=self._api_key,
             api_base=self._api_base,
             proxy=self._proxy,
+            extra_headers=extra_headers,
         )
         if conf().get("rate_limit_chatgpt"):
             self.tb4chatgpt = TokenBucket(conf().get("rate_limit_chatgpt", 20))
@@ -75,12 +88,15 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
 
     def get_api_config(self):
         """Get API configuration for OpenAI-compatible base class"""
-        is_custom, _ = parse_custom_bot_type(conf().get("bot_type", ""))
+        is_custom, _ = parse_custom_bot_type(self._bot_type)
         if is_custom:
-            custom_key, custom_base, custom_model = resolve_custom_credentials()
+            custom_key, custom_base, custom_model = resolve_custom_credentials(self._bot_type)
             api_key = custom_key
             api_base = custom_base
             model = custom_model or conf().get("model", "gpt-3.5-turbo")
+        elif self._bot_type == const.COWAGENT:
+            api_key, api_base = resolve_cowagent_credentials()
+            model = conf().get("model", "gpt-3.5-turbo")
         else:
             api_key = conf().get("open_ai_api_key")
             api_base = conf().get("open_ai_api_base")
@@ -93,7 +109,22 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
             'default_top_p': conf().get("top_p", 1.0),
             'default_frequency_penalty': conf().get("frequency_penalty", 0.0),
             'default_presence_penalty': conf().get("presence_penalty", 0.0),
+            'api_type': self._openai_api_type(),
         }
+
+    def _openai_api_type(self) -> str:
+        """``open_ai_api_type`` applies to the OpenAI endpoint only; custom
+        providers keep the default routing. The CowAgent API serves every
+        model, gpt-6 included, over Chat Completions."""
+        if self._bot_type == const.COWAGENT:
+            return responses_adapter.API_TYPE_CHAT
+        is_custom, _ = parse_custom_bot_type(self._bot_type)
+        if is_custom:
+            return responses_adapter.API_TYPE_AUTO
+        return responses_adapter.resolve_api_type(conf().get("open_ai_api_type"))
+
+    def _use_responses_for_plain_calls(self) -> bool:
+        return self._openai_api_type() == responses_adapter.API_TYPE_RESPONSES
 
     def _get_http_client(self) -> OpenAIHTTPClient:
         """Override the default HTTP client to reuse our pre-configured one."""
@@ -172,9 +203,9 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
         """
         import base64
         import os
-        
+
+        image_path = context.content
         try:
-            image_path = context.content
             logger.info(f"[CHATGPT] Processing image: {image_path}")
             
             # Check if file exists
@@ -199,12 +230,16 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
             mime_type = mime_type_map.get(extension, "image/jpeg")
             
             # Get model and API config
-            is_custom, _ = parse_custom_bot_type(conf().get("bot_type", ""))
+            is_custom, _ = parse_custom_bot_type(self._bot_type)
             if is_custom:
-                custom_key, custom_base, custom_model = resolve_custom_credentials()
+                custom_key, custom_base, custom_model = resolve_custom_credentials(self._bot_type)
                 model = context.get("gpt_model") or custom_model or conf().get("model", "gpt-4o")
                 api_key = context.get("openai_api_key") or custom_key
                 api_base = custom_base
+            elif self._bot_type == const.COWAGENT:
+                cowagent_key, api_base = resolve_cowagent_credentials()
+                model = context.get("gpt_model") or conf().get("model", "gpt-4o")
+                api_key = context.get("openai_api_key") or cowagent_key
             else:
                 model = context.get("gpt_model") or conf().get("model", "gpt-4o")
                 api_key = context.get("openai_api_key") or conf().get("open_ai_api_key")
@@ -229,31 +264,39 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
             logger.info(f"[CHATGPT] Calling vision API with model: {model}")
             
             # Call OpenAI-compatible API via HTTP
-            response = self._http_client.chat_completions(
-                api_key=api_key or None,
-                api_base=api_base or None,
-                model=model,
-                messages=messages,
-                max_tokens=1000,
-            )
+            if self._use_responses_for_plain_calls():
+                response = self._responses_as_chat_completion(
+                    model=model,
+                    messages=messages,
+                    api_key=api_key or None,
+                    api_base=api_base or None,
+                    max_tokens=1000,
+                )
+            else:
+                response = self._http_client.chat_completions(
+                    api_key=api_key or None,
+                    api_base=api_base or None,
+                    model=model,
+                    messages=messages,
+                    max_tokens=1000,
+                )
 
             content = response["choices"][0]["message"]["content"]
             logger.info(f"[CHATGPT] Vision API response: {content[:100]}...")
-            
-            # Clean up temp file
-            try:
-                os.remove(image_path)
-                logger.debug(f"[CHATGPT] Removed temp image file: {image_path}")
-            except Exception:
-                pass
-            
+
             return Reply(ReplyType.TEXT, content)
-            
+
         except Exception as e:
             logger.error(f"[CHATGPT] Image processing error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return Reply(ReplyType.ERROR, _t("图片识别失败: ", "Image recognition failed: ") + str(e))
+        finally:
+            try:
+                os.remove(image_path)
+                logger.debug(f"[CHATGPT] Removed temp image file: {image_path}")
+            except Exception:
+                pass
 
     def reply_text(self, session: ChatGPTSession, api_key=None, args=None, retry_count=0) -> dict:
         """
@@ -273,12 +316,22 @@ class ChatGPTBot(Bot, OpenAIImage, OpenAICompatibleBot):
             # - request_timeout / timeout -> per-call timeout
             call_args = dict(args)
             timeout = call_args.pop("request_timeout", None) or call_args.pop("timeout", None)
-            response = self._http_client.chat_completions(
-                api_key=api_key or None,
-                timeout=timeout,
-                messages=session.messages,
-                **call_args,
-            )
+            if self._use_responses_for_plain_calls():
+                # Sampling params are dropped: Responses reasoning models reject them.
+                response = self._responses_as_chat_completion(
+                    model=call_args.get("model"),
+                    messages=session.messages,
+                    api_key=api_key or None,
+                    timeout=timeout,
+                    max_tokens=call_args.get("max_tokens"),
+                )
+            else:
+                response = self._http_client.chat_completions(
+                    api_key=api_key or None,
+                    timeout=timeout,
+                    messages=session.messages,
+                    **call_args,
+                )
             logger.info("[ChatGPT] reply={}, total_tokens={}".format(
                 response["choices"][0]["message"]["content"],
                 response["usage"]["total_tokens"]
@@ -365,22 +418,22 @@ class AzureChatGPTBot(ChatGPTBot):
         text_to_image_model = conf().get("text_to_image")
         if text_to_image_model == "dall-e-2":
             api_version = "2023-06-01-preview"
-            endpoint = conf().get("azure_openai_dalle_api_base","open_ai_api_base")
+            endpoint = conf().get("azure_openai_dalle_api_base") or conf().get("open_ai_api_base")
             # 检查endpoint是否以/结尾
             if not endpoint.endswith("/"):
                 endpoint = endpoint + "/"
             url = "{}openai/images/generations:submit?api-version={}".format(endpoint, api_version)
-            api_key = conf().get("azure_openai_dalle_api_key","open_ai_api_key")
+            api_key = conf().get("azure_openai_dalle_api_key") or conf().get("open_ai_api_key")
             headers = {"api-key": api_key, "Content-Type": "application/json"}
             try:
                 body = {"prompt": query, "size": conf().get("image_create_size", "256x256"),"n": 1}
-                submission = requests.post(url, headers=headers, json=body)
+                submission = requests.post(url, headers=headers, json=body, timeout=180)
                 operation_location = submission.headers['operation-location']
                 status = ""
                 while (status != "succeeded"):
                     if retry_count > 3:
                         return False, _t("图片生成失败", "Image generation failed")
-                    response = requests.get(operation_location, headers=headers)
+                    response = requests.get(operation_location, headers=headers, timeout=180)
                     status = response.json()['status']
                     retry_count += 1
                 image_url = response.json()['result']['data'][0]['url']
@@ -390,16 +443,16 @@ class AzureChatGPTBot(ChatGPTBot):
                 return False, _t("图片生成失败", "Image generation failed")
         elif text_to_image_model == "dall-e-3":
             api_version = conf().get("azure_api_version", "2024-02-15-preview")
-            endpoint = conf().get("azure_openai_dalle_api_base","open_ai_api_base")
+            endpoint = conf().get("azure_openai_dalle_api_base") or conf().get("open_ai_api_base")
             # 检查endpoint是否以/结尾
             if not endpoint.endswith("/"):
                 endpoint = endpoint + "/"
             url = "{}openai/deployments/{}/images/generations?api-version={}".format(endpoint, conf().get("azure_openai_dalle_deployment_id","text_to_image"),api_version)
-            api_key = conf().get("azure_openai_dalle_api_key","open_ai_api_key")
+            api_key = conf().get("azure_openai_dalle_api_key") or conf().get("open_ai_api_key")
             headers = {"api-key": api_key, "Content-Type": "application/json"}
             try:
                 body = {"prompt": query, "size": conf().get("image_create_size", "1024x1024"), "quality": conf().get("dalle3_image_quality", "standard")}
-                response = requests.post(url, headers=headers, json=body)
+                response = requests.post(url, headers=headers, json=body, timeout=180)
                 response.raise_for_status()  # 检查请求是否成功
                 data = response.json()
 
@@ -436,6 +489,11 @@ class AzureChatGPTBot(ChatGPTBot):
         # Passing the raw endpoint again would override it in call_with_tools().
         config["api_base"] = None
         return config
+
+    def _openai_api_type(self) -> str:
+        # Azure's Responses endpoint has a different URL shape than the
+        # deployment-scoped base built above, so keep the default routing.
+        return responses_adapter.API_TYPE_AUTO
 
 
 class _AzureChatHTTPClient(OpenAIHTTPClient):

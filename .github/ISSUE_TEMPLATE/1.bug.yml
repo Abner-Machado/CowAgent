@@ -22,7 +22,7 @@ body:
         OS: macOS / Linux / Windows / Docker
         Python: 3.11
         Install: installer / Docker / source
-        Model & channel: deepseek-v4-flash, web
+        Model & channel: deepseek-flash, web
     validations:
       required: true
   - type: textarea

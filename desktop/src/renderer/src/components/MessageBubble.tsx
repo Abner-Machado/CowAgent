@@ -1,13 +1,18 @@
 import React, { useState } from 'react'
-import { Copy, Check, RefreshCw, Trash2, File as FileIcon, Folder, Sprout } from 'lucide-react'
-import type { ChatMessage } from '../types'
-import { t } from '../i18n'
+import { Copy, Check, ChartColumn, RefreshCw, Trash2, File as FileIcon, Folder, Sprout } from 'lucide-react'
+import type { Attachment, ChatMessage, MessageUsage } from '../types'
+import { t, tf } from '../i18n'
 import apiClient from '../api/client'
 import { useWorkspaceStore } from '../store/workspaceStore'
 import Markdown from './Markdown'
-import MessageSteps, { ThinkingStep } from './MessageSteps'
+import MentionText from './MentionText'
+import MessageSteps, { ReplyStatus, ThinkingStep } from './MessageSteps'
 import FileCard from './FileCard'
 import { useLightboxStore } from './Lightbox'
+import AgentAvatar from './AgentAvatar'
+import Tooltip from './Tooltip'
+import { useAgentStore } from '../store/agentStore'
+import { useSessionSettingsStore, selectSharedConversation } from '../store/sessionSettingsStore'
 import { product } from '@product'
 
 interface MessageBubbleProps {
@@ -18,6 +23,12 @@ interface MessageBubbleProps {
   /** Fired when an inline image/video finishes loading, so the parent can
    *  re-scroll to the bottom (async media changes bubble height after mount). */
   onMediaLoad?: () => void
+  /** Seq of the question opening this turn, for the file cards it shows. */
+  turnSeq?: number | null
+  /** Current UI language. Unused in the body: the bubble is memoized, and `t()`
+   *  reads a module global, so this prop is what makes a language switch
+   *  re-render it. */
+  lang?: string
 }
 
 function fmtTime(ts: number): string {
@@ -32,22 +43,67 @@ const HoverAction: React.FC<{ onClick: () => void; title: string; danger?: boole
   danger,
   children,
 }) => (
-  <button
-    onClick={onClick}
-    title={title}
-    className={`inline-flex items-center justify-center w-7 h-7 rounded-md cursor-pointer transition-colors text-content-tertiary ${
-      danger ? 'hover:text-danger hover:bg-danger-soft' : 'hover:text-content hover:bg-surface-2'
-    }`}
-  >
-    {children}
-  </button>
+  <Tooltip label={title}>
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center justify-center w-7 h-7 rounded-md cursor-pointer transition-colors text-content-tertiary ${
+        danger ? 'hover:text-danger hover:bg-danger-soft' : 'hover:text-content hover:bg-surface-2'
+      }`}
+    >
+      {children}
+    </button>
+  </Tooltip>
 )
 
-const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, onEdit, onDelete, onMediaLoad }) => {
+/** One-line summary of a reply's provider usage, or '' when there is none. */
+function usageLabel(usage?: MessageUsage): string {
+  if (!usage) return ''
+  const n = (v?: number) => Math.max(0, Number(v) || 0)
+  const input = n(usage.prompt_tokens)
+  const output = n(usage.completion_tokens)
+  const total = n(usage.total_tokens) || input + output
+  if (!total) return ''
+  const cached = n(usage.prompt_cache_hit_tokens)
+  const calls = n(usage.calls)
+  const parts = [
+    `${t('msg_usage_total')} ${total.toLocaleString()}`,
+    `${t('msg_usage_in')} ${input.toLocaleString()}`,
+    `${t('msg_usage_out')} ${output.toLocaleString()}`,
+  ]
+  if (cached && input) parts.push(`${t('msg_usage_cached')} ${Math.round((cached * 100) / input)}%`)
+  if (calls > 1) parts.push(tf('msg_usage_calls', { n: calls }))
+  return parts.join(' · ')
+}
+
+const MessageBubble: React.FC<MessageBubbleProps> = ({
+  message,
+  onRegenerate,
+  onEdit,
+  onDelete,
+  onMediaLoad,
+  turnSeq = null,
+}) => {
   const isUser = message.role === 'user'
   const [copied, setCopied] = useState(false)
   const preview = useWorkspaceStore((s) => s.preview)
   const openLightbox = useLightboxStore((s) => s.open)
+  // Show the speaking Agent's own face on assistant bubbles. A teammate's turn
+  // is tagged with its author (`extras.agent_id`); untagged replies are the
+  // conversation owner's, and the owner is always the active Agent (opening a
+  // chat activates its owner; switching Agents on a chat that has messages
+  // starts a new one), so falling back to it never rewrites who spoke in past
+  // turns. An Agent with no face of its own falls back to the brand one, which
+  // is what a lone default Agent has always worn.
+  const activeAgentId = useAgentStore((s) => s.activeAgentId)
+  const speakerId = (message.extras?.agent_id as string) || activeAgentId
+  // Subscribed rather than read once: a memoized bubble only re-renders on
+  // its own changes, so an edited name or avatar must reach it directly.
+  const speaker = useAgentStore((s) => (speakerId ? s.agents.find((a) => a.id === speakerId) : undefined))
+  // In a group conversation several Agents answer, so each reply is labelled
+  // with its speaker's name (as in the web console). A solo chat keeps the
+  // plain bubble — the face alone says who it is.
+  const shared = useSessionSettingsStore(selectSharedConversation)
+  const speakerName = shared && speaker ? speaker.name || speaker.id : ''
 
   const copy = () => {
     navigator.clipboard.writeText(message.content)
@@ -58,7 +114,7 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
   // Open a sent file: prefer the local path via Electron (Finder / default
   // app); fall back to the served URL in a browser when unavailable.
   const openAttachment = (att: { abs_path?: string; preview_url?: string; file_path: string }) => {
-    if (att.abs_path && window.electronAPI?.openPath) {
+    if (att.abs_path && window.electronAPI?.openPath && !apiClient.isRemote()) {
       window.electronAPI.openPath(att.abs_path)
       return
     }
@@ -110,7 +166,9 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
           </div>
         )}
         <div className="max-w-[75%] rounded-2xl rounded-br-md px-4 py-2.5 bg-bubble-user text-bubble-user-text">
-          <div className="text-sm whitespace-pre-wrap break-words">{message.content}</div>
+          <div className="text-sm whitespace-pre-wrap break-words">
+            <MentionText text={message.display || message.content} onAccent />
+          </div>
         </div>
         <div className="flex items-center gap-0.5 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <span className="text-[11px] text-content-tertiary mr-1">{fmtTime(message.timestamp)}</span>
@@ -132,10 +190,20 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
 
   const hasSteps = !!(message.steps && message.steps.length > 0)
   const hasLiveReasoning = !!(message.reasoning && message.isStreaming)
+  const status = message.runState || (message.isCancelled ? 'cancelled' : null)
+
+  const carded = new Set((message.artifacts || []).map((a) => a.abs_path))
+  const isLocalFile = (att: Attachment) => att.file_type === 'file' && !!att.abs_path
+  const sentFiles = (message.attachments || []).filter((a) => isLocalFile(a) && !carded.has(a.abs_path!))
+  const sentMedia = (message.attachments || []).filter((a) => !isLocalFile(a))
 
   return (
     <div className="group flex gap-3 px-4 sm:px-6 py-2">
-      {product.slots?.AssistantAvatar ? (
+      {speaker ? (
+        <div className="mt-1">
+          <AgentAvatar agent={speaker} size={28} shape="square" />
+        </div>
+      ) : product.slots?.AssistantAvatar ? (
         <div className="w-7 h-7 rounded-lg flex-shrink-0 mt-1 overflow-hidden">
           <product.slots.AssistantAvatar />
         </div>
@@ -143,6 +211,9 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
         <img src="./logo.jpg" alt="Agent" className="w-7 h-7 rounded-lg flex-shrink-0 mt-1" />
       )}
       <div className="flex-1 min-w-0 max-w-[calc(100%-2.5rem)]">
+        {speakerName && (
+          <div className="text-[11px] font-medium text-content-tertiary mb-1 ml-1 truncate">{speakerName}</div>
+        )}
         <div className="inline-block w-full rounded-2xl border border-default bg-surface px-4 py-3">
           {message.kind === 'evolution' && (
             <div className="inline-flex items-center gap-1 mb-1.5 text-[11px] text-content-tertiary">
@@ -152,9 +223,10 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
           )}
 
           {/* Steps area (thinking / tools / intermediate content), web-aligned:
-              muted, separated from the final answer by a dashed divider. */}
-          {(hasSteps || hasLiveReasoning) && (
-            <div className="mb-2.5 pb-2 border-b border-dashed border-default">
+              muted, separated from the final answer by a dashed divider, which
+              a reply closed without an answer has no use for. */}
+          {(hasSteps || hasLiveReasoning || status) && (
+            <div className={status && !message.content ? '' : 'mb-2.5 pb-2 border-b border-dashed border-default'}>
               {hasSteps && <MessageSteps steps={message.steps!} />}
               {/* Live reasoning is the current, not-yet-committed thinking, so it
                   must render after all committed steps (tools/thinking), not at
@@ -162,6 +234,11 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
               {hasLiveReasoning && (
                 <div className={hasSteps ? 'mt-1' : ''}>
                   <ThinkingStep content={message.reasoning!} streaming />
+                </div>
+              )}
+              {status && (
+                <div className={hasSteps || hasLiveReasoning ? 'mt-1' : ''}>
+                  <ReplyStatus kind={status} />
                 </div>
               )}
             </div>
@@ -174,15 +251,30 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
           {message.artifacts && message.artifacts.length > 0 && (
             <div className="flex flex-col items-start">
               {message.artifacts.map((a) => (
-                <FileCard key={a.abs_path || a.rel_path} meta={a} />
+                <FileCard key={a.abs_path || a.rel_path} meta={a} turnSeq={turnSeq} />
               ))}
             </div>
           )}
 
-          {/* Media attachments sent via the `send` tool (images / files). */}
-          {message.attachments && message.attachments.length > 0 && (
+          {/* Local files sent via the `send` tool open in the preview panel like
+              the files written this turn; a file already carded is shown once. */}
+          {sentFiles.length > 0 && (
+            <div className="flex flex-col items-start">
+              {sentFiles.map((att) => (
+                <FileCard
+                  key={att.abs_path}
+                  meta={{ file_name: att.file_name, rel_path: att.file_name, abs_path: att.abs_path }}
+                  turnSeq={turnSeq}
+                  openLocallyIfDenied
+                />
+              ))}
+            </div>
+          )}
+
+          {/* Media attachments sent via the `send` tool (images / videos / remote files). */}
+          {sentMedia.length > 0 && (
             <div className="flex flex-wrap gap-2 mt-2">
-              {message.attachments.map((att, i) => {
+              {sentMedia.map((att, i) => {
                 const url = apiClient.getFileUrl(att.preview_url || att.file_path)
                 if (att.file_type === 'image') {
                   return (
@@ -234,7 +326,6 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
             <span className="inline-block w-[6px] h-[14px] bg-accent ml-0.5 align-middle animate-blink" />
           )}
 
-          {message.isCancelled && <div className="text-xs text-warning mt-1">{t('msg_cancelled')}</div>}
           {message.error && <div className="text-xs text-danger mt-1">{message.error}</div>}
         </div>
 
@@ -245,6 +336,13 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
             <HoverAction onClick={copy} title={t('msg_copy')}>
               {copied ? <Check size={13} /> : <Copy size={13} />}
             </HoverAction>
+            {usageLabel(message.usage) && (
+              <Tooltip label={usageLabel(message.usage)}>
+                <span className="inline-flex items-center justify-center w-7 h-7 rounded-md cursor-pointer transition-colors text-content-tertiary hover:text-content hover:bg-surface-2">
+                  <ChartColumn size={13} />
+                </span>
+              </Tooltip>
+            )}
             {onRegenerate && (
               <HoverAction onClick={() => onRegenerate(message.id)} title={t('msg_regenerate')}>
                 <RefreshCw size={13} />
@@ -257,4 +355,6 @@ const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onRegenerate, on
   )
 }
 
-export default MessageBubble
+// Memoized: a streaming turn commits every frame, and re-rendering every
+// bubble of a long session on each commit froze the window.
+export default React.memo(MessageBubble)

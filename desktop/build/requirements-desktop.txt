@@ -10,6 +10,13 @@
 # small. That bundle relies on `requests` and `pycryptodome` below rather than
 # shipping its own copies.
 
+# cryptography (pulled in by dashscope) stopped shipping macOS x86_64 wheels at
+# 49.0. A source build links the runner's Homebrew OpenSSL, and PyInstaller then
+# bundles it beside Python's older libssl.3.dylib under the same name, so the
+# extension fails to load on users' machines. Wheels link OpenSSL statically;
+# forcing them makes pip settle on the newest version that has one per arch.
+--only-binary=cryptography
+
 # ---- core ----
 numpy>=1.21
 # aiohttp<3.10 has no prebuilt wheels for Python 3.13+ (would need MSVC to build).
@@ -21,15 +28,18 @@ Pillow
 python-dotenv>=1.0.0
 PyYAML>=6.0
 croniter>=2.0.0
+# zoneinfo is stdlib from 3.9 (the Win7 build runs 3.8); Windows has no system tz database
+backports.zoneinfo; python_version < "3.9"
+tzdata; sys_platform == "win32"
 click>=8.0
 qrcode
 json-repair
 
 # ---- web framework (web channel) ----
-# web.py 0.62 fails to build on Python 3.13+ (cgi removed); use the GitHub fix.
-web.py; python_version < "3.13"
-web.py @ git+https://github.com/webpy/webpy.git ; python_version >= "3.13"
-legacy-cgi; python_version >= "3.13"
+# web.py 0.62 (the last release supporting Python < 3.10) imports the stdlib cgi
+# module removed in 3.13; 0.76 dropped it but requires 3.10+.
+web.py; python_version < "3.10"
+web.py>=0.76; python_version >= "3.10"
 
 # ---- AI model SDKs ----
 zai-sdk

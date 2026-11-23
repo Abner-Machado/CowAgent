@@ -1,6 +1,6 @@
 ---
 title: vision - Image Understanding
-description: Analyze image content (recognition, description, OCR, etc.)
+description: "The vision tool analyzes local images or image URLs for descriptions, OCR and object recognition, using a multimodal main model first and falling back to other configured vision models automatically."
 ---
 
 Analyze local images or image URLs using Vision API. Supports content description, text extraction (OCR), object recognition, and more.
@@ -19,17 +19,17 @@ If the current provider fails, the tool automatically tries the next one until i
 | Provider | Vision Model | Notes |
 | --- | --- | --- |
 | OpenAI / Compatible | Main model | All OpenAI-protocol-compatible multimodal models |
-| Qwen (DashScope) | Main model | e.g. qwen3.7-plus, etc. |
+| Qwen (DashScope) | Main model | e.g. qwen3.8-flash, qwen3.7-plus, etc. |
 | Claude | Main model | Anthropic native image format |
 | Gemini | Main model | inlineData format |
 | Doubao | Main model | doubao-seed-2-1 series natively supported |
 | Kimi (Moonshot) | Main model | kimi-k2.6, kimi-k2.5 natively supported |
 | ERNIE | Main model | Defaults to the multimodal main model (e.g. `ernie-5.1`); falls back to `ernie-4.5-turbo-vl` when the main model is not multimodal |
-| ZhipuAI | glm-5v-turbo | Always uses the dedicated vision model |
-| MiniMax | MiniMax-Text-01 | Always uses the dedicated vision model |
+| ZhipuAI | Main model / glm-5v-turbo | glm-5.3-flash is used directly; text-only chat models fall back to glm-5v-turbo |
+| MiniMax | MiniMax-M3 | Uses the selected native multimodal model |
 
 <Note>
-  ZhipuAI and MiniMax text models do not support image understanding, so their dedicated vision models are always used automatically.
+  ZhipuAI and MiniMax text-only models do not support image understanding; MiniMax-M3 is selected automatically for native multimodal input.
 </Note>
 
 > When `use_linkai=true`, LinkAI's multimodal model is used by default.

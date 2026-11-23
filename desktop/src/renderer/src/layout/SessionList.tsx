@@ -12,15 +12,22 @@ import {
   Folder,
   House,
   GripVertical,
+  Loader2,
+  PenLine,
 } from 'lucide-react'
 import { t, getLang } from '../i18n'
 import { useSessionStore, DEFAULT_SPACE_KEY } from '../store/sessionStore'
 import { useUIStore } from '../store/uiStore'
 import { useWorkspaceStore } from '../store/workspaceStore'
+import { useChatStore } from '../store/chatStore'
+import { useUnreadStore } from '../store/unreadStore'
+import { clearDraft, useDraftIds } from '../store/draftStore'
 import { usePlatform } from '../hooks/usePlatform'
 import type { SessionItem } from '../types'
 import apiClient from '../api/client'
 import Tooltip from '../components/Tooltip'
+import NewChatMenu from '../components/NewChatMenu'
+import AgentAvatar from '../components/AgentAvatar'
 import { Modal, Btn, TextInput } from '../pages/settings/primitives'
 
 const COLLAPSED_KEY = 'cow_collapsed_projects'
@@ -178,6 +185,19 @@ const SessionList: React.FC = () => {
   const [deleteSessionTarget, setDeleteSessionTarget] = useState<SessionItem | null>(null)
   const [busy, setBusy] = useState(false)
   const activeRef = useRef<HTMLDivElement>(null)
+  const unread = useUnreadStore((s) => s.unread)
+  const drafts = useDraftIds((s) => s.ids)
+  // Sessions with a reply in progress, as a joined string so streamed deltas
+  // (which update the chat store every frame) don't re-render the list.
+  const runningKey = useChatStore((s) =>
+    Object.keys(s.sessions)
+      .filter((id) => {
+        const r = s.sessions[id]
+        return r.isStreaming || r.messages[r.messages.length - 1]?.runState === 'running'
+      })
+      .join('\n')
+  )
+  const running = useMemo(() => new Set(runningKey ? runningKey.split('\n') : []), [runningKey])
 
   useEffect(() => {
     loadSessions(1)
@@ -231,6 +251,7 @@ const SessionList: React.FC = () => {
   // null for the default workspace), triggered by the "+" on a group header.
   // Auto-expands the sidebar + group so the new session is immediately visible.
   const newChatInSpace = async (spaceKey: string) => {
+    if (!(await useWorkspaceStore.getState().guardUnsavedEdit())) return
     const id = newSession()
     setSessionsCollapsed(false)
     const isDefault = spaceKey === DEFAULT_SPACE_KEY
@@ -309,7 +330,7 @@ const SessionList: React.FC = () => {
   }
 
   return (
-    <div className="w-[240px] flex-shrink-0 flex flex-col h-full bg-surface border-r border-default">
+    <div className="session-list w-[240px] flex-shrink-0 flex flex-col h-full bg-surface border-r border-default">
       <div className="flex items-center justify-between px-2 h-[44px] flex-shrink-0 titlebar-drag border-b border-default">
         <Tooltip label={t('session_history')}>
           <button
@@ -319,20 +340,25 @@ const SessionList: React.FC = () => {
             <History size={16} />
           </button>
         </Tooltip>
-        <button
-          onClick={() => {
-            // Inherit the current session's project; fall back to default.
-            const inherited = useSessionStore.getState().currentProject()
-            const id = newSession()
-            addOptimistic(id, inherited)
-            expandSpace(inherited ? inherited.path : DEFAULT_SPACE_KEY)
-            if (inherited) apiClient.selectProject(id, inherited.path).catch(() => {})
+        <NewChatMenu
+          align="end"
+          onStarted={() => {
+            const project = useSessionStore.getState().currentProject()
+            expandSpace(project ? project.path : DEFAULT_SPACE_KEY)
           }}
-          className={`titlebar-no-drag inline-flex items-center gap-1.5 px-2.5 h-7 rounded-btn text-[12px] font-medium text-accent hover:bg-accent-soft cursor-pointer transition-colors ${trafficDrop}`}
         >
-          <Plus size={15} />
-          {t('session_new')}
-        </button>
+          {({ onClick, open }) => (
+            <button
+              onClick={onClick}
+              className={`titlebar-no-drag inline-flex items-center gap-1.5 px-2.5 h-7 rounded-btn text-[12px] font-medium text-accent cursor-pointer transition-colors ${
+                open ? 'bg-accent-soft' : 'hover:bg-accent-soft'
+              } ${trafficDrop}`}
+            >
+              <Plus size={15} />
+              {t('session_new')}
+            </button>
+          )}
+        </NewChatMenu>
       </div>
 
       <div
@@ -351,6 +377,9 @@ const SessionList: React.FC = () => {
 
         {groups.map((group) => {
           const isCollapsed = group.isProject && collapsed.has(group.key)
+          // A collapsed group hints that something inside is running or new.
+          const hiddenActivity =
+            isCollapsed && group.items.some((s) => running.has(s.session_id) || unread[s.session_id])
           return (
             <div key={group.key} className="mb-1.5">
               {group.isProject ? (
@@ -412,6 +441,9 @@ const SessionList: React.FC = () => {
                   <span className="flex-1 min-w-0 truncate text-[12px] font-medium text-content-secondary">
                     {group.label}
                   </span>
+                  {hiddenActivity && (
+                    <span className="shrink-0 w-1.5 h-1.5 rounded-full bg-accent group-hover/header:invisible" />
+                  )}
                   <span className="ml-auto text-[11px] text-content-disabled tabular-nums group-hover/header:invisible">
                     {group.items.length}
                   </span>
@@ -461,6 +493,11 @@ const SessionList: React.FC = () => {
                 group.items.map((s) => {
                   const isActive = s.session_id === activeId
                   const isEditing = editingId === s.session_id
+                  const isRunning = running.has(s.session_id)
+                  const isUnread = !isRunning && !!unread[s.session_id]
+                  // The open conversation's draft is right there in the composer.
+                  const hasDraft = !isRunning && !isUnread && !isActive && !!drafts[s.session_id]
+                  const hasStatus = isRunning || isUnread || hasDraft
                   return (
                     <div
                       key={s.session_id}
@@ -483,13 +520,32 @@ const SessionList: React.FC = () => {
                           className="flex-1 min-w-0 bg-inset border border-strong rounded px-1.5 py-0.5 text-[13px] text-content focus:outline-none focus:border-accent"
                         />
                       ) : (
-                        <span
-                          className={`flex-1 min-w-0 truncate text-[13px] pr-5 group-hover:pr-0 ${
-                            isActive ? 'text-accent font-medium' : 'text-content-secondary'
-                          }`}
-                        >
-                          {s.title || s.session_id}
-                        </span>
+                        <>
+                          {/* Faces mark a group conversation, the way a group chat
+                              is distinguishable from a direct one. Solo chats stay
+                              plain rows. At most three faces; "+N" caps a larger group. */}
+                          {s.participants && s.participants.length > 1 && (
+                            <span className="flex items-center -space-x-1.5 shrink-0 mr-0.5">
+                              {s.participants.slice(0, 3).map((p) => (
+                                <span key={p.id} className="ring-2 ring-surface rounded-full">
+                                  <AgentAvatar agent={p} size={16} />
+                                </span>
+                              ))}
+                              {s.participants.length > 3 && (
+                                <span className="text-[10px] text-content-tertiary pl-2">+{s.participants.length - 3}</span>
+                              )}
+                            </span>
+                          )}
+                          <span
+                            className={`flex-1 min-w-0 truncate text-[13px] ${
+                              hasStatus && s.pinned ? 'pr-9' : 'pr-5'
+                            } group-hover:pr-0 ${
+                              isActive ? 'text-accent font-medium' : 'text-content-secondary'
+                            }`}
+                          >
+                            {s.title || s.session_id}
+                          </span>
+                        </>
                       )}
 
                       {isEditing ? (
@@ -546,11 +602,30 @@ const SessionList: React.FC = () => {
                           </IconBtn>
                         </div>
                       )}
-                      {s.pinned && !isEditing && (
-                        <Pin
-                          size={11}
-                          className="absolute right-2 top-1/2 -translate-y-1/2 text-accent fill-accent pointer-events-none group-hover:hidden"
-                        />
+                      {/* Trailing status: run state, then the pin at the far
+                          right. Gives way to the action buttons on hover. */}
+                      {!isEditing && (hasStatus || s.pinned) && (
+                        <span className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-2 pointer-events-none group-hover:hidden">
+                          {isRunning ? (
+                            <Loader2
+                              size={12}
+                              aria-label={t('session_running')}
+                              className="animate-spin text-accent"
+                            />
+                          ) : isUnread ? (
+                            <span
+                              aria-label={t('session_unread')}
+                              className="w-2 h-2 mx-0.5 rounded-full bg-accent"
+                            />
+                          ) : hasDraft ? (
+                            <PenLine
+                              size={12}
+                              aria-label={t('session_draft')}
+                              className="text-content-tertiary"
+                            />
+                          ) : null}
+                          {s.pinned && <Pin size={11} className="text-accent fill-accent" />}
+                        </span>
                       )}
                     </div>
                   )
@@ -620,7 +695,12 @@ const SessionList: React.FC = () => {
             <Btn
               variant="danger"
               onClick={async () => {
-                if (deleteSessionTarget) await remove(deleteSessionTarget.session_id)
+                if (deleteSessionTarget) {
+                  const sid = deleteSessionTarget.session_id
+                  await remove(sid)
+                  clearDraft(sid)
+                  useUnreadStore.getState().clear(sid)
+                }
                 setDeleteSessionTarget(null)
               }}
             >

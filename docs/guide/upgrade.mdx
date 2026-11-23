@@ -1,6 +1,6 @@
 ---
 title: Upgrade
-description: How to upgrade CowAgent
+description: "Upgrade CowAgent to the latest version: run cow update to pull code, update dependencies, reinstall the CLI and restart, or check for updates and upgrade in one click from the web console."
 ---
 
 ## Recommended: One-line upgrade
@@ -22,6 +22,33 @@ The command runs the following automatically:
 <Note>
   If the Cow CLI is not installed, `./run.sh update` performs the same operations.
 </Note>
+
+
+## Web console one-click update
+
+Source installs can also upgrade from the Web console without opening a terminal.
+
+1. Click the version string in the left sidebar footer to open the pop-up menu. Opening it does **not** contact GitHub.
+2. Click **Check for update** to fetch version info — the only network request. If a newer version exists, the same row turns into **Update now** with a small red dot.
+3. Click **Update now**. The console reuses the same path as `cow update` (`git pull`, dependency install, CLI reinstall) and then restarts the service. The **Release notes** entry opens the GitHub releases page for the full changelog.
+
+The update only touches the git checkout. User data lives outside the repo (`agent_workspace`, default `~/cow`) and `config.json` is git-ignored, so `git pull` never overwrites them — no backup is taken. The updater records the current git commit; if the new code fails to import, it resets the checkout to that commit and leaves the running process untouched.
+
+After a successful update the console reconnects on its own and shows the new version.
+
+<Note>
+  Docker images and the packaged desktop app cannot use this button. Docker stays on `docker compose pull`; the desktop client keeps its built-in updater. On Windows, run `cow update` in a terminal — the Web console cannot restart that process from inside itself.
+</Note>
+
+### Rollback
+
+If a successful update misbehaves, reset to the previous commit:
+
+```bash
+cow stop
+git reset --hard <previous-commit>   # recorded in tmp/web-update-status.json
+cow start
+```
 
 ## Manual upgrade
 
@@ -57,7 +84,7 @@ sudo docker compose up -d
 ```
 
 <Tip>
-  Back up `config.json` before upgrading. For Docker deployments, mount the workspace directory as a volume to persist data across upgrades.
+  Back up `config.json` before upgrading. Settings and channel logins live in the mounted `./cow-data` directory and the workspace in `./cow`, so recreating the container keeps them. Environment variables given a value in `docker-compose.yml` override the same settings from the console on every start.
 </Tip>
 
 ## Desktop client upgrade

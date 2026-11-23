@@ -28,11 +28,11 @@ if "web" not in sys.modules:
 
 
 def _catalog_with(config):
-    from channel.web import web_channel
+    from channel.web.api import sessions as sessions_api
 
-    with patch.object(web_channel, "conf", return_value=config), \
+    with patch.object(sessions_api, "conf", return_value=config), \
             patch("models.custom_provider.conf", return_value=config):
-        return web_channel._session_model_catalog()
+        return sessions_api._session_model_catalog()
 
 
 class TestSessionModelCatalog(unittest.TestCase):

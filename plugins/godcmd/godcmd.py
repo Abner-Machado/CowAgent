@@ -1,18 +1,17 @@
 # encoding:utf-8
 
-import json
 import os
-import random
-import string
+import secrets
 import logging
 from typing import Tuple
 
-import bridge.bridge
 import plugins
+from agent.guest.access import LoginLimiter
 from bridge.bridge import Bridge
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from common import const
+from common.atomic_write import write_json_atomic
 from config import conf, load_config, global_config
 from plugins import *
 
@@ -172,6 +171,20 @@ def get_help_text(isadmin, isgroup):
     return help_text
 
 
+# Written to config.json when it is missing or incomplete, and used as the
+# fallback for a config that is empty or only half-filled in.
+DEFAULT_CONFIG = {"password": "", "admin_users": []}
+
+# Unambiguous symbols only (no 0/O, 1/I): the password is read from a log
+# line and typed back in a chat window.
+_TEMP_PASSWORD_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+
+def _generate_temp_password(length: int = 6) -> str:
+    """A temp admin password for first runs with no password configured."""
+    return "".join(secrets.choice(_TEMP_PASSWORD_ALPHABET) for _ in range(length))
+
+
 @plugins.register(
     name="Godcmd",
     desire_priority=999,
@@ -186,13 +199,25 @@ class Godcmd(Plugin):
 
         config_path = os.path.join(os.path.dirname(__file__), "config.json")
         gconf = super().load_config()
-        if not gconf:
-            if not os.path.exists(config_path):
-                gconf = {"password": "", "admin_users": []}
-                with open(config_path, "w") as f:
-                    json.dump(gconf, f, indent=4)
+        # A config.json that exists but is empty or half-filled in used to reach
+        # gconf["password"]/["admin_users"] as {} and raise KeyError.
+        # `activate_plugins` answers a plugin that fails to initialise by
+        # disabling it and *persisting* enabled=false, so the command plugin
+        # stayed off across restarts even after the file was put right. Fill in
+        # the documented defaults and write the repaired config out instead.
+        if not isinstance(gconf, dict) or not all(k in gconf for k in DEFAULT_CONFIG):
+            gconf = {**DEFAULT_CONFIG, **(gconf if isinstance(gconf, dict) else {})}
+            try:
+                write_json_atomic(config_path, gconf)
+            except OSError as e:
+                # Repairing the file on disk is a convenience; the defaults above
+                # are enough to run. Raising here would reach activate_plugins,
+                # which persists enabled=false — the very outcome this fallback
+                # exists to avoid — so a plugin directory that is read-only
+                # (packaged builds) or a full disk must not take the plugin down.
+                logger.warning(f"[Godcmd] cannot write {config_path}: {e}")
         if gconf["password"] == "":
-            self.temp_password = "".join(random.sample(string.digits, 4))
+            self.temp_password = _generate_temp_password()
             logger.info("[Godcmd] 因未设置口令，本次的临时口令为%s。" % self.temp_password)
         else:
             self.temp_password = None
@@ -206,6 +231,9 @@ class Godcmd(Plugin):
         self.password = gconf["password"]
         self.admin_users = gconf["admin_users"]
         global_config["admin_users"] = self.admin_users
+        # Per-sender lockout only: a plugin-wide cap would let anyone lock
+        # the real admin out of #auth.
+        self._auth_limiter = LoginLimiter(per_profile=False)
         self.isrunning = True  # 机器人是否运行中
 
         self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
@@ -224,7 +252,7 @@ class Godcmd(Plugin):
             if len(content) == 1:
                 reply = Reply()
                 reply.type = ReplyType.ERROR
-                reply.content = f"空指令，输入#help查看指令列表\n"
+                reply.content = "空指令，输入#help查看指令列表\n"
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -278,6 +306,8 @@ class Godcmd(Plugin):
                             Bridge().reset_bot()
                             model = conf().get("model") or const.GPT35
                             ok, result = True, "模型设置为: " + str(model)
+                    else:
+                        ok, result = False, "只能指定一个模型名称"
                 elif cmd == "id":
                     ok, result = True, user
                 elif cmd == "set_openai_api_key":
@@ -292,7 +322,7 @@ class Godcmd(Plugin):
                         user_data = conf().get_user_data(user)
                         user_data.pop("openai_api_key")
                         ok, result = True, "你的OpenAI私有api_key已清除"
-                    except Exception as e:
+                    except Exception:
                         ok, result = False, "你没有设置私有api_key"
                 elif cmd == "set_gpt_model":
                     if len(args) == 1:
@@ -312,14 +342,16 @@ class Godcmd(Plugin):
                         user_data = conf().get_user_data(user)
                         user_data.pop("gpt_model")
                         ok, result = True, "你的GPT模型已重置"
-                    except Exception as e:
+                    except Exception:
                         ok, result = False, "你没有设置私有GPT模型"
                 elif cmd == "reset":
                     if bottype in [const.OPEN_AI, const.OPENAI, const.CHATGPT, const.CHATGPTONAZURE, const.LINKAI, const.BAIDU, const.QIANFAN, const.XUNFEI, const.QWEN, const.QWEN_DASHSCOPE, const.GEMINI, const.ZHIPU_AI, const.CLAUDEAPI]:
                         bot.sessions.clear_session(session_id)
                         if Bridge().chat_bots.get(bottype):
                             Bridge().chat_bots.get(bottype).sessions.clear_session(session_id)
-                        channel.cancel_session(session_id)
+                        channel.cancel_session(
+                            session_id, agent_id=e_context["context"].get("agent_id")
+                        )
                         ok, result = True, "会话已重置"
                     else:
                         ok, result = False, "当前对话机器人不支持重置会话"
@@ -378,11 +410,16 @@ class Godcmd(Plugin):
                             if len(args) != 2:
                                 ok, result = False, "请提供插件名和优先级"
                             else:
-                                ok = PluginManager().set_plugin_priority(args[0], int(args[1]))
-                                if ok:
-                                    result = "插件" + args[0] + "优先级已设置为" + args[1]
+                                try:
+                                    priority = int(args[1])
+                                except ValueError:
+                                    ok, result = False, f"优先级 {args[1]} 无效, 应为整数"
                                 else:
-                                    result = "插件不存在"
+                                    ok = PluginManager().set_plugin_priority(args[0], priority)
+                                    if ok:
+                                        result = "插件" + args[0] + "优先级已设置为" + args[1]
+                                    else:
+                                        result = "插件不存在"
                         elif cmd == "reloadp":
                             if len(args) != 1:
                                 ok, result = False, "请提供插件名"
@@ -452,16 +489,23 @@ class Godcmd(Plugin):
         if len(args) != 1:
             return False, "请提供口令"
 
+        wait = self._auth_limiter.locked_for("godcmd", userid)
+        if wait:
+            return False, f"尝试次数过多，请 {wait} 秒后再试"
+
         password = args[0]
         if password == self.password:
+            self._auth_limiter.succeeded("godcmd", userid)
             self.admin_users.append(userid)
             global_config["admin_users"].append(userid)
             return True, "认证成功"
-        elif password == self.temp_password:
+        elif self.temp_password and password.upper() == self.temp_password:
+            self._auth_limiter.succeeded("godcmd", userid)
             self.admin_users.append(userid)
             global_config["admin_users"].append(userid)
             return True, "认证成功，请尽快设置口令"
         else:
+            self._auth_limiter.failed("godcmd", userid)
             return False, "认证失败"
 
     def get_help_text(self, isadmin=False, isgroup=False, **kwargs):

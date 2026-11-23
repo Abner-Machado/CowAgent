@@ -21,12 +21,29 @@ import requests
 
 from bridge.reply import Reply, ReplyType
 from common.log import logger
+from common.media_download import MAX_FILE_BYTES, MediaTooLargeError, save_response
+from common.tmp_dir import TmpDir
 from config import conf
-from models.custom_provider import _find_provider_by_id, get_custom_providers, parse_custom_bot_type
+from models.custom_provider import (
+    _find_provider_by_id, get_custom_providers, parse_custom_bot_type, resolve_custom_headers,
+)
 from voice.voice import Voice
+
+# Bound every outbound call. A vendor that stalls would otherwise leave the
+# request waiting forever: nothing is raised, nothing is logged, the turn never
+# finishes and the user never gets a reply. ASR uploads a file and TTS
+# synthesises a clip, so this uses the longer read timeout that mimo and linkai
+# also apply to the same two endpoints.
+REQUEST_TIMEOUT = (5, 120)
 
 
 class CustomVoice(Voice):
+    # Used when the matching config key is empty. Custom vendors have no
+    # defaults; subclasses for a known endpoint set them.
+    DEFAULT_ASR_MODEL = ""
+    DEFAULT_TTS_MODEL = ""
+    DEFAULT_VOICE = "alloy"
+
     def __init__(self, voice_type: str):
         self.voice_type = voice_type
 
@@ -46,10 +63,17 @@ class CustomVoice(Voice):
             return entry.get("api_key", ""), entry.get("api_base") or ""
         return conf().get("custom_api_key", ""), conf().get("custom_api_base") or ""
 
+    def _extra_headers(self) -> dict:
+        try:
+            return resolve_custom_headers(self.voice_type)
+        except Exception as e:
+            logger.warning(f"[Custom] failed to resolve provider headers: {e}")
+            return {}
+
     def voiceToText(self, voice_file):
         try:
             api_key, api_base = self._resolve_credentials()
-            model = (conf().get("voice_to_text_model") or "").strip()
+            model = (conf().get("voice_to_text_model") or self.DEFAULT_ASR_MODEL).strip()
             if not api_base or not model:
                 logger.error(
                     f"[Custom] voiceToText missing config: api_base={bool(api_base)}, "
@@ -60,15 +84,16 @@ class CustomVoice(Voice):
             with open(voice_file, "rb") as f:
                 response = requests.post(
                     url,
-                    headers={"Authorization": "Bearer " + api_key},
+                    headers={"Authorization": "Bearer " + api_key, **self._extra_headers()},
                     files={"file": f},
                     data={"model": model},
+                    timeout=REQUEST_TIMEOUT,
                 )
             try:
                 data = response.json()
             except ValueError:
                 data = {"raw": response.text[:200]}
-            if response.status_code != 200 or "text" not in data:
+            if response.status_code != 200 or not isinstance(data, dict) or not isinstance(data.get("text"), str):
                 logger.error(
                     f"[Custom] voiceToText failed: status={response.status_code}, resp={data}"
                 )
@@ -82,7 +107,7 @@ class CustomVoice(Voice):
     def textToVoice(self, text):
         try:
             api_key, api_base = self._resolve_credentials()
-            model = (conf().get("text_to_voice_model") or "").strip()
+            model = (conf().get("text_to_voice_model") or self.DEFAULT_TTS_MODEL).strip()
             if not api_base or not model:
                 logger.error(
                     f"[Custom] textToVoice missing config: api_base={bool(api_base)}, "
@@ -95,22 +120,31 @@ class CustomVoice(Voice):
                 headers={
                     "Authorization": "Bearer " + api_key,
                     "Content-Type": "application/json",
+                    **self._extra_headers(),
                 },
                 json={
                     "model": model,
                     "input": text,
-                    "voice": conf().get("tts_voice_id") or "alloy",
+                    "voice": conf().get("tts_voice_id") or self.DEFAULT_VOICE,
                 },
+                timeout=REQUEST_TIMEOUT,
+                stream=True,
             )
             if response.status_code != 200:
                 logger.error(
                     f"[Custom] textToVoice failed: status={response.status_code}, "
                     f"resp={response.text[:200]}"
                 )
+                response.close()
                 return Reply(ReplyType.ERROR, "遇到了一点小问题，请稍后再问我吧")
-            file_name = "tmp/" + datetime.datetime.now().strftime("%Y%m%d%H%M%S") + str(random.randint(0, 1000)) + ".mp3"
-            with open(file_name, "wb") as f:
-                f.write(response.content)
+            file_name = TmpDir().path() + datetime.datetime.now().strftime("%Y%m%d%H%M%S") + str(random.randint(0, 1000)) + ".mp3"
+            try:
+                save_response(response, file_name, MAX_FILE_BYTES)
+            except MediaTooLargeError:
+                logger.error(
+                    f"[Custom] textToVoice audio too large: over {MAX_FILE_BYTES} bytes"
+                )
+                return Reply(ReplyType.ERROR, "遇到了一点小问题，请稍后再问我吧")
             logger.info("[Custom] textToVoice success")
             return Reply(ReplyType.VOICE, file_name)
         except Exception as e:

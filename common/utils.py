@@ -1,11 +1,13 @@
+import hmac
 import io
 import os
 import re
 import sys
-from contextvars import ContextVar
 from typing import Optional
 from urllib.parse import urlparse
 from common.log import logger
+from common.markdown_fence import transform_outside_fences
+from common.deployment import is_desktop
 
 def fsize(file):
     if isinstance(file, io.BytesIO):
@@ -25,10 +27,10 @@ def fsize(file):
 def compress_imgfile(file, max_size):
     if fsize(file) <= max_size:
         return file
-    from PIL import Image
+    from PIL import Image, ImageOps
     file.seek(0)
     img = Image.open(file)
-    rgb_image = img.convert("RGB")
+    rgb_image = ImageOps.exif_transpose(img).convert("RGB")
     quality = 95
     min_quality = 10
     while True:
@@ -43,6 +45,8 @@ def compress_imgfile(file, max_size):
 
 
 def split_string_by_utf8_length(string, max_length, max_split=0):
+    if max_length <= 0:
+        raise ValueError("max_length must be positive")
     encoded = string.encode("utf-8")
     start, end = 0, 0
     result = []
@@ -54,13 +58,17 @@ def split_string_by_utf8_length(string, max_length, max_split=0):
         # 如果当前字节不是 UTF-8 编码的开始字节，则向前查找直到找到开始字节为止
         while end < len(encoded) and (encoded[end] & 0b11000000) == 0b10000000:
             end -= 1
+        if end == start:
+            raise ValueError("max_length cannot fit the next UTF-8 character")
         result.append(encoded[start:end].decode("utf-8"))
         start = end
     return result
 
 
 def get_path_suffix(path):
-    path = urlparse(path).path
+    # Local filenames may legitimately contain URL query/fragment characters.
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", path):
+        path = urlparse(path).path
     return os.path.splitext(path)[-1].lstrip('.')
 
 
@@ -78,11 +86,67 @@ def convert_webp_to_png(webp_image):
         raise
 
 
+# An inline code span on one line (a backtick run closed by the next run of the
+# same length), a ** or a line break.
+_BOLD_TOKEN = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)|\*\*|\n")
+
+
 def remove_markdown_symbol(text: str):
     # 移除markdown格式，目前先移除**
+    # Code blocks and inline code keep their **, as in {**a, **b} or **kwargs.
     if not text:
         return text
-    return re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    return transform_outside_fences(text, _remove_bold)
+
+
+def _remove_bold(text: str) -> str:
+    # As in Markdown, ** opens bold only before a non-space character and
+    # closes it only after one, so the operator in "2 ** 10" is not taken for
+    # bold, and a closing ** pairs with the nearest opening ** before it. Pairs
+    # are only looked for within one line.
+    paired, stars, openers = set(), [], []  # stars: each ** of the line
+    for token in _BOLD_TOKEN.finditer(text):
+        start = token.start()
+        if token.group(1):  # inline code
+            continue
+        if token.group() == "\n":
+            if openers:  # a ** after a colon may still close one of them
+                _pair_after_colon(text, stars, paired)
+            stars.clear()
+            openers.clear()
+            continue
+        stars.append(start)
+        can_close = start > 0 and not text[start - 1].isspace()
+        can_open = start + 2 < len(text) and not text[start + 2].isspace()
+        if can_close and openers and openers[-1] + 2 < start:  # and not empty
+            paired.update((openers.pop(), start))
+        elif can_open:
+            openers.append(start)
+    if openers:
+        _pair_after_colon(text, stars, paired)
+    # Drop the ** of each pair.
+    parts, last = [], 0
+    for start in sorted(paired):
+        parts.append(text[last:start])
+        last = start + 2
+    return "".join(parts) + text[last:]
+
+
+def _pair_after_colon(text: str, stars: list, paired: set) -> None:
+    # Models also write "**Note: **text", with the space inside the bold. So
+    # once a line is paired, a ** left over after a colon and spaces or tabs
+    # closes the nearest leftover ** before it that can open.
+    openers = []
+    for start in stars:
+        if start in paired:
+            continue
+        before = start
+        while before > 0 and text[before - 1] in " \t":
+            before -= 1
+        if openers and before > 0 and text[before - 1] in ":：":
+            paired.update((openers.pop(), start))
+        elif start + 2 < len(text) and not text[start + 2].isspace():
+            openers.append(start)
 
 
 def expand_path(path: str) -> str:
@@ -122,6 +186,19 @@ def expand_path(path: str) -> str:
                 expanded = os.path.join(home, path[2:])
     
     return expanded
+
+
+def constant_time_equals(left: str, right: str) -> bool:
+    """Timing-safe string comparison that answers False instead of raising.
+
+    ``hmac.compare_digest`` raises on non-ASCII ``str``, so request-supplied
+    values are compared as UTF-8 bytes; ``surrogatepass`` also covers the lone
+    surrogates JSON and query strings can carry.
+    """
+    return hmac.compare_digest(
+        left.encode("utf-8", "surrogatepass"),
+        right.encode("utf-8", "surrogatepass"),
+    )
 
 
 def is_cloud_deployment() -> bool:
@@ -232,7 +309,7 @@ def get_client_source() -> str:
     explicit = (os.environ.get("COW_CLIENT_SOURCE") or "").strip()
     if explicit:
         return explicit
-    if os.environ.get("COW_DESKTOP") == "1":
+    if is_desktop():
         return "desktop"
     return "open-source"
 
@@ -249,25 +326,44 @@ def _client_os() -> str:
     return p or ""
 
 
-_run_id: "ContextVar[Optional[str]]" = ContextVar("agent_run_id", default=None)
-
-
 def set_agent_run_id(run_id: Optional[str]):
+    """Set the ambient run id. Kept for callers that only need the run id and
+    do not carry a full RuntimeIdentity; it writes the single source of truth,
+    ``RuntimeIdentity.run_id``, so this value and the identity never diverge.
+
+    Returns a token accepted by ``clear_agent_run_id``.
+    """
+    from common.runtime_identity import current_identity, _current
+
     value = str(run_id).strip() if run_id is not None and str(run_id).strip() else None
-    return _run_id.set(value)
+    return _current.set(current_identity().derive(run_id=value))
 
 
 def clear_agent_run_id(token) -> None:
+    from common.runtime_identity import _current
+
     try:
-        _run_id.reset(token)
+        _current.reset(token)
     except Exception:
         pass
 
 
 def current_agent_run_id() -> Optional[str]:
-    """Current run id: in-process ContextVar first, else the value passed to a
-    child process via the COW_AGENT_RUN_ID env var."""
-    return _run_id.get() or (os.environ.get("COW_AGENT_RUN_ID") or "").strip() or None
+    """Current run id: the ambient ``RuntimeIdentity`` first, else the value
+    passed to a child process via the COW_AGENT_RUN_ID env var.
+
+    One source of truth: subagents and delegated work set the run id through
+    ``RuntimeIdentity`` (via ``identity_scope``), and this reads the same field
+    so the id carried on state paths matches the one tagged onto outbound
+    requests via the ``X-Agent-Run-Id`` header.
+    """
+    from common.runtime_identity import current_identity
+
+    return (
+        current_identity().run_id
+        or (os.environ.get("COW_AGENT_RUN_ID") or "").strip()
+        or None
+    )
 
 
 def apply_client_source(headers: dict) -> dict:
@@ -306,3 +402,48 @@ def get_cloud_headers(api_key: str) -> dict:
         pass
     apply_client_source(headers)
     return apply_cloud_user(headers)
+
+
+_TAIL_CHUNK_BYTES = 8192
+
+
+def tail_lines(path, limit, end_offset=None):
+    """Return the last *limit* lines of *path*, without reading the whole file.
+
+    Lines keep their trailing newline (the last one may have none).
+    An optional byte offset limits replay to an already captured file boundary.
+    """
+    if limit <= 0:
+        return []
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        remaining = f.tell()
+        if end_offset is not None:
+            remaining = min(remaining, end_offset)
+        blocks = []
+        newlines = 0
+        while remaining > 0 and newlines <= limit:
+            read_size = min(_TAIL_CHUNK_BYTES, remaining)
+            remaining -= read_size
+            f.seek(remaining)
+            block = f.read(read_size)
+            newlines += block.count(b"\n")
+            blocks.append(block)
+        data = b"".join(reversed(blocks))
+    return [
+        line.decode("utf-8", errors="replace")
+        for line in data.splitlines(keepends=True)[-limit:]
+    ]
+
+
+# requests quotes the full URL, query included, in the exceptions it raises.
+_SECRET_QUERY_RE = re.compile(
+    r"((?:access_token|refresh_token|api_key|apikey|client_secret|client_id"
+    r"|app_secret|app_key|secret|token|password)=)[^&\s\"')\]]+",
+    re.IGNORECASE,
+)
+
+
+def scrub_secrets(text) -> str:
+    """Mask credential query values in *text* before it is logged or shown."""
+    return _SECRET_QUERY_RE.sub(r"\1***", str(text))

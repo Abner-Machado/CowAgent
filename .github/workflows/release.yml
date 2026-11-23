@@ -9,8 +9,8 @@ name: Release Desktop
 #
 # Full flow:
 #   1. (this workflow) build + upload to R2 + D1 as unpublished.
-#   2. (local) download the mac dmgs, run desktop/build/notarize-dmg.sh to
-#      notarize + staple + re-upload the stapled dmgs to R2.
+#   2. (local, manual) download the mac dmgs, notarize + staple them, then
+#      re-upload the stapled dmgs to R2.
 #   3. (Publish Desktop workflow) flip D1 is_latest=1 and attach GitHub
 #      Release assets — makes the version live on the site.
 #
@@ -42,7 +42,7 @@ jobs:
       matrix:
         include:
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             platform: mac
             arch: arm64
             eb_flags: --mac --arm64
@@ -84,6 +84,14 @@ jobs:
         with:
           node-version: "20"
 
+      # The backend reports cli/VERSION, not package.json; stamp the same
+      # version so the bundled backend can't lag behind the installer.
+      - name: Write version into cli/VERSION
+        shell: bash
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: bash desktop/build/stamp-backend-version.sh "$VER"
+
       - name: Build Python backend (PyInstaller)
         shell: bash
         run: |
@@ -95,6 +103,12 @@ jobs:
             --noconfirm \
             --distpath desktop/build/dist \
             --workpath desktop/build/build-work
+
+      - name: Verify bundled backend version
+        shell: bash
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: bash desktop/build/stamp-backend-version.sh --verify "$VER"
 
       # PyInstaller follows whatever arch the host Python is, so a translated
       # toolchain would hand us a backend for the wrong arch. Shipping that in
@@ -110,6 +124,26 @@ jobs:
           echo "backend arch: $got (want $want)"
           if [ "$got" != "$want" ]; then
             echo "::error::backend is $got but this job targets $want"
+            exit 1
+          fi
+
+      # The bundle carries a single libssl.3.dylib (Python's own). An extension
+      # linked against a different OpenSSL resolves to that copy at runtime and
+      # fails with missing symbols, so only statically linked builds may ship.
+      - name: Verify no extension links a foreign OpenSSL
+        if: matrix.platform == 'mac'
+        shell: bash
+        run: |
+          internal=desktop/build/dist/cowagent-backend/_internal
+          bad=""
+          while IFS= read -r -d '' so; do
+            case "$so" in */python3.*/lib-dynload/*) continue ;; esac
+            if otool -L "$so" | tail -n +2 | grep -Eq 'lib(ssl|crypto)\.[0-9.]+dylib'; then
+              bad="$bad ${so#$internal/}"
+            fi
+          done < <(find "$internal" -name '*.so' -print0)
+          if [ -n "$bad" ]; then
+            echo "::error::extensions dynamically linked to OpenSSL:$bad"
             exit 1
           fi
 
@@ -383,7 +417,7 @@ jobs:
           # This build job ALWAYS registers rows as unpublished (is_latest=0), so
           # /download/<p>/latest keeps serving the previous release and the new
           # version stays invisible on the site. macOS dmgs still need to be
-          # notarized+stapled locally (build/notarize-dmg.sh) before they're
+          # notarized+stapled locally before they're
           # safe to ship. Promotion to latest happens later, only after
           # notarization, via the separate "Publish Desktop" workflow.
           echo "==> Registering $VER as unpublished (is_latest=0)."

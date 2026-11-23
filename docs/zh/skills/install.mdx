@@ -1,9 +1,16 @@
 ---
 title: 安装技能
-description: 通过命令一键安装来自多种来源的技能
+description: "通过统一的 install 命令一键安装来自 Cow 技能广场、GitHub、ClawHub 或任意 URL（zip 包、SKILL.md 链接）的技能，也可以在 Web 控制台和桌面客户端中从市场安装或本地上传并预览。"
 ---
 
 CowAgent 支持通过统一的 `install` 命令安装来自 [Cow 技能广场](https://skills.cowagent.ai/)、GitHub、ClawHub、LinkAI 以及任意 URL 上的技能。在对话中使用 `/skill install`，在终端中使用 `cow skill install`。
+
+也可以在 Web 控制台和桌面客户端的「能力」页面添加技能。点击 **添加技能** 后：
+
+- **从市场安装**：选择 Cow Skill Hub 或 ClawHub 并填写技能名称，或选择 GitHub 并填写仓库 / 目录地址。
+- **本地上传**：拖入 `.zip` / `.tar.gz` 压缩包、`SKILL.md` 或整个技能文件夹。
+
+技能会先被获取下来供你预览（`SKILL.md` 内容、文件列表，以及是否会覆盖已安装的同名技能），确认后才会安装。
 
 ## 从Cow技能广场安装
 
@@ -32,15 +39,22 @@ CowAgent 支持通过统一的 `install` 命令安装来自 [Cow 技能广场](h
 /skill install clawhub:<name>
 ```
 
+ClawHub 的技能名只在同一发布者下唯一，多个发布者同名时需要带上发布者，或直接使用技能页面地址：
+
+```text
+/skill install clawhub:steipete/gog
+/skill install https://clawhub.ai/steipete/skills/gog
+```
+
 ## 从 LinkAI 安装
 
-[LinkAI](https://link-ai.tech/console) 上的所有公开资源 (1w+个应用/工作流/插件) ，以及自己创建的资源 (应用/工作流/知识库/数据库/插件) 都可以通过命令一键安装：
+[LinkAI](https://link-ai.tech/console?utm_source=cowagent&utm_medium=docs&utm_campaign=skills-install) 上的所有公开资源 (1w+个应用/工作流/插件) ，以及自己创建的资源 (应用/工作流/知识库/数据库/插件) 都可以通过命令一键安装：
 
 ```text
 /skill install linkai:<code>
 ```
 
-> LinkAI平台上创建的所有应用、工作流、知识库、数据库、插件都有唯一的code，可在[控制台](https://link-ai.tech/console)各资源页面中进行获取并填写到命令中
+> LinkAI平台上创建的所有应用、工作流、知识库、数据库、插件都有唯一的code，可在[控制台](https://link-ai.tech/console?utm_source=cowagent&utm_medium=docs&utm_campaign=skills-install)各资源页面中进行获取并填写到命令中
 
 ## 从 URL 安装
 

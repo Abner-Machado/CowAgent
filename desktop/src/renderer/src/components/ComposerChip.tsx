@@ -13,6 +13,9 @@ interface ComposerChipProps {
   /** Model menu sits on the right of the composer row. */
   align?: 'start' | 'end'
   menuClassName?: string
+  /** Render the trigger as icon-only (label kept for the tooltip/aria), to keep
+   *  the composer row compact. The chevron is dropped too. */
+  labelHidden?: boolean
   children: React.ReactNode
 }
 
@@ -31,6 +34,7 @@ const ComposerChip: React.FC<ComposerChipProps> = ({
   disabled,
   align = 'start',
   menuClassName,
+  labelHidden,
   children,
 }) => {
   const rootRef = useRef<HTMLDivElement>(null)
@@ -58,8 +62,10 @@ const ComposerChip: React.FC<ComposerChipProps> = ({
           }`}
         >
           <span className="shrink-0">{icon}</span>
-          <span className="composer-chip-label truncate">{label}</span>
-          <ChevronDown size={11} className={`opacity-60 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+          {!labelHidden && <span className="composer-chip-label truncate">{label}</span>}
+          {!labelHidden && (
+            <ChevronDown size={11} className={`opacity-60 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+          )}
         </button>
       </Tooltip>
 

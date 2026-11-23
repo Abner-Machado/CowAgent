@@ -1,0 +1,79 @@
+---
+title: Delegation
+description: "Delegation lets one agent hand a task to a standing teammate in a team conversation and wait for the answer, guarded by membership, allowlists, cycle and depth limits, task size and time budget."
+---
+
+Delegation lets one Agent ask another for help. Unlike a [sub agent](/multi-agent/subagent), the target is not created for the occasion: it is a standing peer with its own workspace, memory, skills, sessions and scheduler. It answers from its own environment, and the answer comes back to the Agent that asked, never to the user.
+
+<Note>
+  The `agent_delegate` tool only appears in a team conversation — two or more enabled Agents with teammates in the room. A single-Agent install never sees it.
+</Note>
+
+## Sub Agent or Peer
+
+| | Sub agent | Delegation |
+| --- | --- | --- |
+| Lifetime | Created for one task, then gone | Standing Agent, configured up front |
+| Workspace | Shares the caller's | Its own |
+| Memory | None of its own | Its own |
+| Identity | Anonymous | Appears in the Agent list, can own channels |
+| Result | Returned inline | Returned inline |
+
+Use a sub agent to parallelise your own work. Delegate when the task belongs to somebody else — the Agent that owns the codebase, the knowledge base or the customer relationship.
+
+## Delegation Is Synchronous
+
+Delegating hands a task over and waits for the teammate's answer, then returns it. The call blocks until the teammate is done (or the time budget runs out), so there is nothing to poll and no handle to track:
+
+```
+agent_delegate(agent_id="research", task="...")
+  -> { status: "done", content: "..." }
+```
+
+Under the hood the run is still recorded in the target's workspace, with the asking run as its parent, so a chain of delegations stays walkable from either end.
+
+## The Teammates You Can Reach
+
+The Agents you may delegate to are the teammates in the current conversation — exactly the roster the **team conversation** section of your context lists, IDs and all. Delegation stays inside the team the user set up; it can never hand work to an Agent outside the room, even one the allowlist would otherwise permit. Aim at someone who is not a teammate and the tool refuses, naming the teammates you can actually reach.
+
+## Parameters
+
+`agent_id` — the teammate's ID (the `@id` shown for them in the team conversation section). `task` — a self-contained brief the teammate can act on without seeing this conversation.
+
+## Guards
+
+Delegation is between full Agents, so it is fenced in:
+
+- **Membership** — the target must be a teammate in this conversation
+- **Allowlist** — who may ask whom. Unset means any Agent may delegate to any other
+- **Cycles** — an Agent already in the chain cannot be delegated to again
+- **Depth** — how many hops one chain may take
+- **Size** — the largest task text accepted
+- **Time budget** — the longest a delegated run may take before it is given up on
+
+## Configuration
+
+```json
+{
+  "agent_delegation": {
+    "enabled": true,
+    "allowed_targets": {
+      "assistant": ["research", "support"],
+      "research": []
+    },
+    "max_depth": 3,
+    "timeout_seconds": 600,
+    "max_message_chars": 8000
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Set to `false`, or the whole block to `false`, to withhold the tool |
+| `allowed_targets` | unset | Maps a source Agent ID to the IDs it may reach; `"*"` allows any. Unset allows every pair. Targets are further bounded to the current conversation's teammates |
+| `max_depth` | `3` | Delegation hops in one chain (1-8) |
+| `timeout_seconds` | `600` | Budget for one delegated run (0.01-3600); a local run is cancelled when it expires |
+| `max_message_chars` | `8000` | Size limit for one delegated task |
+
+An Agent listed with an empty array, like `"research"` above, can be delegated to but cannot delegate onward.

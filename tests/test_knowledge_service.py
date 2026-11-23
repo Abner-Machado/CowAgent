@@ -1,8 +1,11 @@
 import asyncio
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from agent.memory.storage import MemoryChunk, MemoryStorage
 from agent.knowledge.service import KnowledgeService
@@ -225,6 +228,153 @@ def test_create_document_writes_and_syncs(tmp_path):
     assert manager.synced == 1
 
 
+def test_update_document_rewrites_and_reindexes(tmp_path):
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    page = tmp_path / "knowledge/notes/a.md"
+    page.write_text("# Old\nBody", encoding="utf-8")
+
+    result = svc.dispatch("update_document", {
+        "path": "notes/a.md", "content": "# New\nBody",
+    })
+
+    assert result["code"] == 200
+    assert page.read_text(encoding="utf-8") == "# New\nBody"
+    # Dropping the old key and flagging the index is what lets the edited page
+    # be re-embedded instead of answering searches with its pre-edit text.
+    assert manager.storage.deleted == ["knowledge/notes/a.md"]
+    assert manager.dirty == 1
+    assert manager.synced == 1
+    # The H1 is the page's title, so the regenerated index links the new one.
+    assert "[New](./notes/a.md)" in (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+
+
+def test_update_document_survives_an_index_that_will_not_open(tmp_path):
+    """The page is on disk before the index is touched. A broken index - an old
+    SQLite meeting a database from a newer one, a lock held by the Agent - must
+    not report a save that landed as a failure, which would also send the user
+    back to retry against an mtime the save itself moved."""
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    page = tmp_path / "knowledge/notes/a.md"
+    page.write_text("# Old\nBody", encoding="utf-8")
+
+    def refuse():
+        raise sqlite3.OperationalError("no such tokenizer: trigram")
+
+    manager.mark_dirty = refuse
+
+    result = svc.dispatch("update_document", {"path": "notes/a.md", "content": "# New\nBody"})
+
+    assert result["code"] == 200
+    assert page.read_text(encoding="utf-8") == "# New\nBody"
+    assert manager.synced == 0
+
+
+class GatedMemoryManager(FakeMemoryManager):
+    """A sync that blocks until the test lets it through, so the test can look
+    at the world while a reindex is in flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+        self.started = threading.Event()
+
+    async def sync(self):
+        self.started.set()
+        self.gate.wait(timeout=5)
+        self.synced += 1
+
+
+def test_background_reindex_answers_before_the_index_is_touched(tmp_path):
+    """The reindex is a full scan, possibly an embedding call, possibly a wait
+    on the index the Agent is using. None of that is the save's business."""
+    (tmp_path / "knowledge/notes").mkdir(parents=True)
+    page = tmp_path / "knowledge/notes/a.md"
+    page.write_text("# Old\nBody", encoding="utf-8")
+    manager = GatedMemoryManager()
+    svc = KnowledgeService(str(tmp_path), manager, reindex_in_background=True)
+
+    result = svc.dispatch("update_document", {"path": "notes/a.md", "content": "# New\nBody"})
+
+    # Answered with the file written and index.md rebuilt, sync still pending.
+    assert result["code"] == 200
+    assert page.read_text(encoding="utf-8") == "# New\nBody"
+    assert "[New](./notes/a.md)" in (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+    assert manager.started.wait(timeout=5)
+    assert manager.synced == 0
+
+    manager.gate.set()
+    KnowledgeService.wait_for_reindex(timeout=5)
+    assert manager.storage.deleted == ["knowledge/notes/a.md"]
+    assert manager.synced == 1
+
+
+def test_background_reindex_coalesces_a_burst_of_saves(tmp_path):
+    """Ctrl+S three times must not sync three times, nor sync the same index
+    from three threads at once: the paths pile up and the running worker takes
+    them in one pass after the current one."""
+    (tmp_path / "knowledge/notes").mkdir(parents=True)
+    for name in ("a", "b", "c"):
+        (tmp_path / f"knowledge/notes/{name}.md").write_text(f"# {name}", encoding="utf-8")
+    manager = GatedMemoryManager()
+    svc = KnowledgeService(str(tmp_path), manager, reindex_in_background=True)
+
+    svc.dispatch("update_document", {"path": "notes/a.md", "content": "# a2"})
+    assert manager.started.wait(timeout=5)
+    # Two more land while the first sync is blocked.
+    svc.dispatch("update_document", {"path": "notes/b.md", "content": "# b2"})
+    svc.dispatch("update_document", {"path": "notes/c.md", "content": "# c2"})
+
+    manager.gate.set()
+    KnowledgeService.wait_for_reindex(timeout=5)
+    assert sorted(manager.storage.deleted) == [
+        "knowledge/notes/a.md", "knowledge/notes/b.md", "knowledge/notes/c.md",
+    ]
+    assert manager.synced == 2
+
+
+def test_update_document_refuses_protected_and_missing_pages(tmp_path):
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/index.md").write_text("index", encoding="utf-8")
+
+    protected = svc.dispatch("update_document", {"path": "index.md", "content": "hacked"})
+    assert protected["code"] == 403
+    assert (tmp_path / "knowledge/index.md").read_text(encoding="utf-8") == "index"
+
+    missing = svc.dispatch("update_document", {"path": "notes/gone.md", "content": "x"})
+    assert missing["code"] == 404
+    assert manager.synced == 0
+
+
+def test_update_document_reports_a_concurrent_agent_write_as_conflict(tmp_path):
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    page = tmp_path / "knowledge/notes/a.md"
+    page.write_text("# A", encoding="utf-8")
+    stale_mtime = page.stat().st_mtime - 10
+
+    result = svc.dispatch("update_document", {
+        "path": "notes/a.md", "content": "# Mine", "expected_mtime": stale_mtime,
+    })
+
+    assert result["code"] == 409
+    assert result["payload"] == {"conflict": True}
+    assert page.read_text(encoding="utf-8") == "# A"
+    assert manager.synced == 0
+
+
+def test_read_file_reports_editability_for_the_console_editor(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/index.md").write_text("index", encoding="utf-8")
+    (tmp_path / "knowledge/a.md").write_text("# A", encoding="utf-8")
+
+    page = svc.dispatch("read", {"path": "a.md"})["payload"]
+    assert page["editable"] is True
+    assert page["mtime"] == (tmp_path / "knowledge/a.md").stat().st_mtime
+    assert svc.dispatch("read", {"path": "index.md"})["payload"]["editable"] is False
+
+
 def test_import_documents_supports_md_txt_and_rename_conflicts(tmp_path):
     svc, manager = service(tmp_path)
     (tmp_path / "knowledge/notes").mkdir()
@@ -298,6 +448,173 @@ def test_import_documents_rejects_large_files_and_batches(tmp_path):
     assert manager.synced == 0
 
 
+def test_delete_documents_rebuilds_index(tmp_path):
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    (tmp_path / "knowledge/notes/a.md").write_text("# A\n", encoding="utf-8")
+    (tmp_path / "knowledge/notes/b.md").write_text("# B\n", encoding="utf-8")
+    svc.dispatch("create_document", {"path": "notes/a.md", "content": "# A\n"})
+
+    index = tmp_path / "knowledge/index.md"
+    svc.rebuild_index_md()
+    assert "[A](./notes/a.md)" in index.read_text(encoding="utf-8")
+
+    svc.dispatch("delete_documents", {"paths": ["notes/a.md"]})
+
+    content = index.read_text(encoding="utf-8")
+    assert "notes/a.md" not in content
+    assert "[B](./notes/b.md)" in content
+
+
+def test_index_summaries_survive_rebuild(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    (tmp_path / "knowledge/notes/a.md").write_text("# A\n", encoding="utf-8")
+    index = tmp_path / "knowledge/index.md"
+    index.write_text(
+        "# 知识库目录\n\n## notes\n"
+        "- [A](./notes/a.md) — what A is about\n",
+        encoding="utf-8",
+    )
+
+    svc.dispatch("create_document", {"path": "notes/b.md", "content": "# B\n"})
+
+    content = index.read_text(encoding="utf-8")
+    assert "[A](./notes/a.md) — what A is about" in content
+    assert "[B](./notes/b.md)" in content
+    # Documents that never had a summary keep the plain one-line form.
+    assert "[B](./notes/b.md) —" not in content
+
+
+def test_encoded_paths_keep_their_summary_across_rebuild(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/notes").mkdir()
+    (tmp_path / "knowledge/notes/训练记录 07.md").write_text("# 训练记录 07\n", encoding="utf-8")
+    index = tmp_path / "knowledge/index.md"
+    index.write_text(
+        "# 知识库目录\n\n## notes\n"
+        "- [训练记录 07](./notes/%E8%AE%AD%E7%BB%83%E8%AE%B0%E5%BD%95%2007.md) — 每周训练记录\n",
+        encoding="utf-8",
+    )
+
+    svc.rebuild_index_md()
+
+    assert "— 每周训练记录" in index.read_text(encoding="utf-8")
+
+
+def test_rename_and_move_rebuild_index(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/old").mkdir()
+    (tmp_path / "knowledge/notes").mkdir()
+    (tmp_path / "knowledge/old/a.md").write_text("# A\n", encoding="utf-8")
+    index = tmp_path / "knowledge/index.md"
+
+    svc.dispatch("rename_category", {"path": "old", "new_path": "new"})
+    content = index.read_text(encoding="utf-8")
+    assert "## new" in content and "old/" not in content
+
+    svc.dispatch("move_documents", {"paths": ["new/a.md"], "target_category": "notes"})
+    content = index.read_text(encoding="utf-8")
+    assert "[A](./notes/a.md)" in content
+    assert "new/a.md" not in content
+
+
+def test_missing_document_partial_delete_keeps_index_consistent(tmp_path):
+    svc, manager = service(tmp_path)
+    (tmp_path / "knowledge/a.md").write_text("# A\n", encoding="utf-8")
+    svc.dispatch("create_document", {"path": "a.md", "content": "# A\n"})
+
+    result = svc.dispatch("delete_documents", {"paths": ["a.md", "gone.md"]})
+
+    assert result["payload"]["deleted"] == 1
+    assert "a.md" not in (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+    # Both the removed and the already-absent path clear their index rows.
+    assert manager.storage.deleted == ["knowledge/a.md", "knowledge/gone.md"]
+
+
+def test_delete_batch_with_rejected_path_deletes_nothing(tmp_path):
+    svc, manager = service(tmp_path)
+    svc.dispatch("create_document", {"path": "notes/a.md", "content": "# A\n"})
+
+    for bad in ["index.md", "../evil.md"]:
+        result = svc.dispatch("delete_documents", {"paths": ["notes/a.md", bad]})
+        assert result["code"] == 403
+
+    assert (tmp_path / "knowledge/notes/a.md").exists()
+    assert "[A](./notes/a.md)" in (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+    assert manager.storage.deleted == []
+
+
+def test_delete_failing_mid_batch_still_rebuilds_index(tmp_path):
+    svc, manager = service(tmp_path)
+    svc.dispatch("create_document", {"path": "notes/a.md", "content": "# A\n"})
+    (tmp_path / "knowledge/notes/dir.md").mkdir()
+
+    result = svc.dispatch("delete_documents", {"paths": ["notes/a.md", "notes/dir.md"]})
+
+    assert result["code"] == 403
+    assert not (tmp_path / "knowledge/notes/a.md").exists()
+    assert "notes/a.md" not in (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+    assert manager.storage.deleted == ["knowledge/notes/a.md"]
+
+
+def test_move_failing_mid_batch_still_rebuilds_index(tmp_path):
+    svc, manager = service(tmp_path)
+    svc.dispatch("create_document", {"path": "src/a.md", "content": "# A\n"})
+    svc.dispatch("create_document", {"path": "src/b.md", "content": "# B\n"})
+    (tmp_path / "knowledge/dst").mkdir()
+    real_link = os.link
+
+    def fail_on_second(src, dst):
+        if str(src).endswith("b.md"):
+            raise PermissionError(dst)
+        return real_link(src, dst)
+
+    with patch("agent.knowledge.service.os.link", side_effect=fail_on_second):
+        result = svc.dispatch("move_documents", {
+            "paths": ["src/a.md", "src/b.md"], "target_category": "dst",
+        })
+
+    assert result["code"] == 500
+    content = (tmp_path / "knowledge/index.md").read_text(encoding="utf-8")
+    assert "[A](./dst/a.md)" in content and "src/a.md" not in content
+    assert "[B](./src/b.md)" in content
+    assert manager.storage.deleted == ["knowledge/src/a.md"]
+
+
+def test_summaries_follow_moved_and_renamed_documents(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/old").mkdir()
+    (tmp_path / "knowledge/notes").mkdir()
+    (tmp_path / "knowledge/old/a.md").write_text("# A\n", encoding="utf-8")
+    (tmp_path / "knowledge/old/b.md").write_text("# B\n", encoding="utf-8")
+    index = tmp_path / "knowledge/index.md"
+    index.write_text(
+        "# 知识库目录\n\n## old\n"
+        "- [A](old/a.md) — about A\n"
+        "- [B](old/b.md) — about B\n",
+        encoding="utf-8",
+    )
+
+    svc.dispatch("move_documents", {"paths": ["old/a.md"], "target_category": "notes"})
+    svc.dispatch("rename_category", {"path": "old", "new_path": "new"})
+
+    content = index.read_text(encoding="utf-8")
+    assert "[A](./notes/a.md) — about A" in content
+    assert "[B](./new/b.md) — about B" in content
+
+
+def test_double_hyphen_summary_separator(tmp_path):
+    svc, _ = service(tmp_path)
+    (tmp_path / "knowledge/a.md").write_text("# A\n", encoding="utf-8")
+    index = tmp_path / "knowledge/index.md"
+    index.write_text("# 知识库目录\n\n- [A](./a.md) -- about A\n", encoding="utf-8")
+
+    svc.rebuild_index_md()
+
+    assert "- [A](./a.md) — about A\n" in index.read_text(encoding="utf-8")
+
+
 def test_build_graph_resolves_encoded_and_anchored_links(tmp_path):
     svc, _ = service(tmp_path)
     root = tmp_path / "knowledge"
@@ -318,3 +635,95 @@ def test_build_graph_resolves_encoded_and_anchored_links(tmp_path):
     assert ("concepts/health.md", "sources/训练记录 07.md") in edges
     assert ("concepts/health.md", "concepts/rag.md") in edges
     assert len(edges) == 2
+
+
+def test_build_graph_accepts_link_forms_the_viewer_opens(tmp_path):
+    svc, _ = service(tmp_path)
+    root = tmp_path / "knowledge"
+    for d in ("a", "b", "c", "d"):
+        (root / d).mkdir()
+    (root / "b/rooted.md").write_text("# Rooted", encoding="utf-8")
+    (root / "c/slashed.md").write_text("# Slashed", encoding="utf-8")
+    (root / "d/bare.md").write_text("# Bare", encoding="utf-8")
+    (root / "a/dup.md").write_text("# Dup A", encoding="utf-8")
+    (root / "b/dup.md").write_text("# Dup B", encoding="utf-8")
+    (root / "a/page.md").write_text(
+        "\ufeff# Page\n"
+        "- [r](b/rooted.md)\n"
+        "- [s](/c/slashed.md)\n"
+        "- [k](knowledge/c/slashed.md)\n"
+        "- [n](bare.md)\n"
+        "- [ambiguous](../missing/dup.md)\n",
+        encoding="utf-8",
+    )
+
+    graph = svc.build_graph()
+    edges = {(l["source"], l["target"]) for l in graph["links"]}
+    assert edges == {
+        ("a/page.md", "b/rooted.md"),
+        ("a/page.md", "c/slashed.md"),
+        ("a/page.md", "d/bare.md"),
+    }
+    labels = {n["id"]: n["label"] for n in graph["nodes"]}
+    assert labels["a/page.md"] == "Page"
+
+
+def test_build_graph_keeps_links_under_symlinked_knowledge_dir(tmp_path):
+    real = tmp_path / "real"
+    (real / "notes").mkdir(parents=True)
+    (real / "notes/a.md").write_text("# A\n[B](./b.md)\n", encoding="utf-8")
+    (real / "notes/b.md").write_text("# B\n", encoding="utf-8")
+    (tmp_path / "ws").mkdir()
+    try:
+        (tmp_path / "ws/knowledge").symlink_to(real, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    svc = KnowledgeService(str(tmp_path / "ws"), FakeMemoryManager())
+
+    edges = {(l["source"], l["target"]) for l in svc.build_graph()["links"]}
+    assert edges == {("notes/a.md", "notes/b.md")}
+
+
+def test_windows_reserved_device_names_are_rejected(tmp_path):
+    # Path validation already rejects Windows-illegal punctuation; reserved
+    # device names (CON, NUL, COM1, ...) have to be rejected too, or a
+    # document or category that saves on POSIX fails or hits a device on Windows.
+    svc, _manager = service(tmp_path)
+
+    for path in ("CON.md", "nul.md", "COM1.md", "LPT9.md", "AUX.md"):
+        result = svc.dispatch("create_document", {"path": path, "content": "# x\n"})
+        assert result["code"] == 403, path
+        assert not (tmp_path / "knowledge" / path).exists(), path
+
+    for path in ("NUL", "con", "COM2"):
+        result = svc.dispatch("create_category", {"path": path})
+        assert result["code"] == 403, path
+        assert not (tmp_path / "knowledge" / path).exists(), path
+
+    result = svc.dispatch("create_document", {"path": "PRN/notes.md", "content": "# x\n"})
+    assert result["code"] == 403
+    assert not (tmp_path / "knowledge/PRN").exists()
+
+    assert svc.dispatch("create_category", {"path": "notes"})["payload"]["created"]
+    result = svc.dispatch("rename_category", {"path": "notes", "new_path": "PRN"})
+    assert result["code"] == 403
+    assert (tmp_path / "knowledge/notes").is_dir()
+    assert not (tmp_path / "knowledge/PRN").exists()
+
+    imported = svc.dispatch("import_documents", {
+        "target_category": "notes",
+        "files": [{"filename": "CON.md", "content": b"# x"}],
+        "conflict_strategy": "overwrite",
+    })
+    assert imported["code"] == 200
+    assert imported["payload"]["imported"] == 0
+    assert imported["payload"]["failed"] == 1
+    assert not (tmp_path / "knowledge/notes/CON.md").exists()
+
+    # Nearby ordinary names, including COM10 (not a reserved device), stay valid.
+    for path in ("console.md", "COM10.md"):
+        created = svc.dispatch("create_document", {"path": path, "content": "# ok\n"})
+        assert created["code"] == 200, path
+        assert (tmp_path / "knowledge" / path).read_text(encoding="utf-8") == "# ok\n"
+    category = svc.dispatch("create_category", {"path": "convention"})
+    assert category["payload"]["created"] is True

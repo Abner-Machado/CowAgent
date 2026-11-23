@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback, useEffect, forwardRef, useImperativeHandle } from 'react'
+import React, { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo, forwardRef, useImperativeHandle } from 'react'
 import {
   Plus,
   Paperclip,
@@ -6,14 +6,15 @@ import {
   X,
   File as FileIcon,
   Loader2,
-  Trash2,
   AtSign,
   Folder,
   Mic
 } from 'lucide-react'
 import { t } from '../i18n'
-import type { Attachment, WorkspaceEntry } from '../types'
-import { chatDraft } from '../store/draftStore'
+import { product } from '@product'
+import type { Attachment, WorkspaceEntry, AgentBadge } from '../types'
+import AgentAvatar from './AgentAvatar'
+import { getDraft, setDraft, PREFILL_EVENT } from '../store/draftStore'
 import apiClient from '../api/client'
 import { PaperPlaneIcon } from './icons'
 import { WORKSPACE_DRAG_TYPE } from './FileTree'
@@ -21,8 +22,11 @@ import { iconFor, colorFor } from '../lib/fileKind'
 import WorkspaceSelector from './WorkspaceSelector'
 import PermissionSelector from './PermissionSelector'
 import ModelSelector from './ModelSelector'
+import AgentSelector from './AgentSelector'
+import { useAgentStore, selectMultiAgent } from '../store/agentStore'
 import Tooltip from './Tooltip'
-import { useSessionSettingsStore } from '../store/sessionSettingsStore'
+import ContextUsagePopover from './ContextUsagePopover'
+import { useSessionSettingsStore, selectSharedConversation } from '../store/sessionSettingsStore'
 
 export type ChatInputHandle = (text: string, attachments: Attachment[]) => void
 
@@ -47,27 +51,63 @@ interface ChatInputProps {
   onClearContext: () => void
   isStreaming: boolean
   sessionId: string
+  // Navigate to the Agent config (used by the context pie's "Config" action).
+  onAdjustContext: () => void
+  // Transient toast surface owned by the page.
+  onToast?: (msg: string) => void
 }
 
 const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput(
-  { onSend, onNewChat, onStop, onClearContext, isStreaming, sessionId },
+  { onSend, onNewChat, onStop, onClearContext, isStreaming, sessionId, onAdjustContext, onToast },
   ref
 ) {
-  // Restore the draft saved in `chatDraft` on mount (lazy init: the very first
-  // render must already show it, otherwise the write-through effect below would
+  // Restore this session's draft on mount (lazy init: the very first render
+  // must already show it, otherwise the write-through effect below would
   // overwrite the saved draft with the initial empty state).
-  const [text, setText] = useState(() => chatDraft.text)
-  const [attachments, setAttachments] = useState(() => chatDraft.attachments)
+  const [text, setText] = useState(() => getDraft(sessionId).text)
+  const [attachments, setAttachments] = useState(() => getDraft(sessionId).attachments)
+  // Session the input currently holds the draft of. Lags `sessionId` by one
+  // effect on a switch, so the write-through never files text under the wrong
+  // conversation.
+  const draftSidRef = useRef(sessionId)
+  // Show the Agent picker only when the install runs a team. Single-Agent
+  // clients never see it, keeping the composer row identical to before.
+  const multiAgent = useAgentStore(selectMultiAgent)
+  // A group conversation has several Agents, each answering on its own model, so
+  // there's no single per-session model to pin — hide the chip, like the web.
+  const sharedConversation = useSessionSettingsStore(
+    (s) => (s.sessionId === sessionId ? selectSharedConversation(s) : false)
+  )
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState('')
+  // Locks the composer while a synchronous context compaction runs.
+  const [compacting, setCompacting] = useState(false)
+  // Bumped when a turn finishes so the context pie refetches fresh usage.
+  const [ctxRefreshKey, setCtxRefreshKey] = useState(0)
+  const wasStreamingRef = useRef(isStreaming)
   const [dragOver, setDragOver] = useState(false)
   const [slashOpen, setSlashOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
-  // `@` workspace-file picker
+  // `@` picker: Agent mentions (group chats only) come first, then workspace
+  // files. Agents are matched locally against the session roster; files are
+  // fetched from the backend as the user types.
   const [mentionItems, setMentionItems] = useState<WorkspaceEntry[]>([])
+  const [mentionAgents, setMentionAgents] = useState<AgentBadge[]>([])
   const [mentionIndex, setMentionIndex] = useState(0)
   const mentionStartRef = useRef(-1)
   const mentionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Everyone addressable with @ in the current group chat, the owner included:
+  // there it is one voice among several, and @ is how the user picks it back
+  // out after a teammate has been speaking.
+  const team = useSessionSettingsStore((s) => (s.sessionId === sessionId ? s.cfg?.team : undefined))
+  const mentionRoster = useMemo<AgentBadge[]>(() => {
+    if (!sharedConversation) return []
+    const roster: AgentBadge[] = []
+    for (const m of [team?.owner, ...(team?.members || [])]) {
+      if (m && !roster.some((a) => a.id === m.id)) roster.push(m)
+    }
+    return roster
+  }, [sharedConversation, team])
   const composingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -130,6 +170,11 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   const startRecording = async () => {
     let stream: MediaStream
     try {
+      const granted = await window.electronAPI?.requestMicAccess?.()
+      if (granted === false) {
+        flashMicError(t('mic_permission_denied'))
+        return
+      }
       stream = await navigator.mediaDevices.getUserMedia({ audio: true })
     } catch (e) {
       // Surface the concrete failure name so a denied/missing-device/insecure
@@ -210,6 +255,18 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     useSessionSettingsStore.getState().setOpenMenu(null)
   }, [sessionId])
 
+  // Refresh the context pie when a turn finishes (streaming true -> false) so
+  // the indicator tracks usage in real time, matching the web console.
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) setCtxRefreshKey((k) => k + 1)
+    wasStreamingRef.current = isStreaming
+  }, [isStreaming])
+
+  // Also refresh when switching conversations.
+  useEffect(() => {
+    setCtxRefreshKey((k) => k + 1)
+  }, [sessionId])
+
   // Local actions ('new'/'clear') plus completion commands handled by backend
   // command plugins (cow_cli/godcmd). Commands ending with a space expect an
   // argument, so selecting them keeps focus in the input instead of sending.
@@ -221,8 +278,13 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     { cmd: '/context', desc: t('slash_context') },
     { cmd: '/compact', desc: t('slash_compact') },
     { cmd: '/skill list', desc: t('slash_skill_list') },
-    { cmd: '/skill search ', desc: t('slash_skill_search') },
-    { cmd: '/skill install ', desc: t('slash_skill_install') },
+    // An upload-only product still searches and installs from its own catalogue.
+    ...(product.skills?.uploadOnly && !product.skills?.Market
+      ? []
+      : [
+          { cmd: '/skill search ', desc: t('slash_skill_search') },
+          { cmd: '/skill install ', desc: t('slash_skill_install') },
+        ]),
     { cmd: '/memory dream ', desc: t('slash_memory_dream') },
     { cmd: '/knowledge', desc: t('slash_knowledge') },
     { cmd: '/knowledge list', desc: t('slash_knowledge_list') },
@@ -238,7 +300,8 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
   // 180px). Keep overflow hidden until we hit the cap, so an empty/short input
   // never shows a scrollbar (matches the web console behavior).
   const autoSize = (el: HTMLTextAreaElement | null) => {
-    if (!el) return
+    // A hidden textarea has no width, so its scrollHeight would be meaningless.
+    if (!el || el.clientWidth === 0) return
     el.style.height = '48px'
     const h = Math.min(el.scrollHeight, 200)
     el.style.height = h + 'px'
@@ -252,21 +315,70 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     el.style.overflowY = 'hidden'
   }
 
-  // Sync the height once on mount so the very first render matches the 42px
-  // single-line height instead of the browser's default textarea size.
-  useEffect(() => {
+  // Fit the height to the content before paint whenever the text changes, so
+  // a draft swapped in on session switch never shows at a stale height.
+  useLayoutEffect(() => {
     autoSize(textareaRef.current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [text])
+
+  // Line wrapping depends on the width, which changes when side panels open or
+  // close or the composer becomes visible again.
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    let width = el.clientWidth
+    const ro = new ResizeObserver(() => {
+      if (el.clientWidth === width) return
+      width = el.clientWidth
+      autoSize(el)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Write the input through to `chatDraft` on every change so it survives this
-  // component unmounting when the user navigates to another page (chat route
-  // unmounts ChatPage; see store/draftStore.ts). Sending clears the input, which
+  // Switching conversations swaps in the draft of the one being opened; what
+  // was typed in the previous one is already saved under its id.
+  useEffect(() => {
+    if (draftSidRef.current === sessionId) return
+    draftSidRef.current = sessionId
+    const draft = getDraft(sessionId)
+    setText(draft.text)
+    setAttachments(draft.attachments)
+    setSlashOpen(false)
+    closeMention()
+    requestAnimationFrame(() => autoSize(textareaRef.current))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
+
+  // Write the input through to the session's draft on every change so it
+  // survives switching sessions, navigating to another page (the chat route
+  // unmounts ChatPage) and restarting. Sending clears the input, which
   // therefore also clears the saved draft.
   useEffect(() => {
-    chatDraft.text = text
-    chatDraft.attachments = attachments
+    setDraft(draftSidRef.current, { text, attachments })
   }, [text, attachments])
+
+  // Text handed over by another surface (e.g. "create a theme with the Agent").
+  // A prefill for another session is already in its draft and loads on switch.
+  useEffect(() => {
+    const onPrefill = (e: Event) => {
+      const { sid, text: prefill } = (e as CustomEvent<{ sid: string; text: string }>).detail
+      if (sid !== draftSidRef.current) return
+      setText(prefill)
+      setAttachments([])
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (el) {
+          el.focus()
+          autoSize(el)
+        }
+      })
+    }
+    window.addEventListener(PREFILL_EVENT, onPrefill)
+    return () => window.removeEventListener(PREFILL_EVENT, onPrefill)
+  }, [])
 
   // Allow the parent to load a draft (e.g. when editing a past user message).
   useImperativeHandle(ref, () => (draft: string, atts: Attachment[]) => {
@@ -319,12 +431,41 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     resetHeight()
   }, [text, attachments, isStreaming, onSend])
 
-  const mentionOpen = mentionStartRef.current >= 0 && mentionItems.length > 0
+  // The picker shows agents (group chats) then files; either being non-empty
+  // keeps it open. `mentionCount` is the combined length for keyboard nav.
+  const mentionCount = mentionAgents.length + mentionItems.length
+  const mentionOpen = mentionStartRef.current >= 0 && mentionCount > 0
 
   const closeMention = () => {
     mentionStartRef.current = -1
     setMentionItems([])
+    setMentionAgents([])
     setMentionIndex(0)
+  }
+
+  // Insert "@name " where the mention was typed, so the backend's leading-@
+  // rule routes the turn to that Agent (matches the web console).
+  const acceptAgentMention = (index: number) => {
+    const agent = mentionAgents[index]
+    const el = textareaRef.current
+    if (!agent || !el) return
+    const caret = el.selectionStart
+    const insert = `@${agent.name || agent.id} `
+    const next = text.slice(0, mentionStartRef.current) + insert + text.slice(caret)
+    const caretAfter = mentionStartRef.current + insert.length
+    setText(next)
+    closeMention()
+    requestAnimationFrame(() => {
+      el.focus()
+      el.selectionStart = el.selectionEnd = caretAfter
+      autoSize(el)
+    })
+  }
+
+  // One list, agents first. Accept whichever row the combined index lands on.
+  const acceptMentionAt = (index: number) => {
+    if (index < mentionAgents.length) acceptAgentMention(index)
+    else acceptMention(index - mentionAgents.length)
   }
 
   /** Reference an existing workspace file or folder in place, not as an upload. */
@@ -367,17 +508,17 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     if (mentionOpen) {
       if (e.key === 'ArrowDown') {
         e.preventDefault()
-        setMentionIndex((i) => (i + 1) % mentionItems.length)
+        setMentionIndex((i) => (i + 1) % mentionCount)
         return
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault()
-        setMentionIndex((i) => (i - 1 + mentionItems.length) % mentionItems.length)
+        setMentionIndex((i) => (i - 1 + mentionCount) % mentionCount)
         return
       }
       if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
         e.preventDefault()
-        acceptMention(mentionIndex)
+        acceptMentionAt(mentionIndex)
         return
       }
       if (e.key === 'Escape') {
@@ -431,14 +572,22 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
       return
     }
     mentionStartRef.current = e.target.selectionStart - match[1].length - 1
+    const query = match[1]
+    // Agents match locally and update instantly (no request), so the group
+    // roster shows the moment "@" is typed.
+    const q = query.toLowerCase()
+    const matchedAgents = mentionRoster.filter(
+      (a) => !q || (a.name || a.id).toLowerCase().includes(q) || a.id.toLowerCase().includes(q)
+    )
+    setMentionAgents(matchedAgents)
+    setMentionIndex(0)
     mentionTimerRef.current = setTimeout(async () => {
       try {
-        const res = await apiClient.workspaceSearch(match[1], 12, sessionId)
+        const res = await apiClient.workspaceSearch(query, 12, sessionId)
         if (mentionStartRef.current < 0) return
         setMentionItems(res.results || [])
-        setMentionIndex(0)
       } catch {
-        closeMention()
+        setMentionItems([])
       }
     }, 160)
   }
@@ -450,20 +599,25 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     // Report per-file outcomes: a silent failure here is indistinguishable from
     // the file picker never opening, which makes the feature look broken.
     const failed: string[] = []
+    const sid = draftSidRef.current
     try {
       for (const file of files) {
         try {
-          const result = await apiClient.uploadFile(file, sessionId)
+          const result = await apiClient.uploadFile(file, sid)
           if (result.status === 'success') {
-            setAttachments((prev) => [
-              ...prev,
-              {
-                file_path: result.file_path,
-                file_name: result.file_name,
-                file_type: result.file_type as Attachment['file_type'],
-                preview_url: result.preview_url,
-              },
-            ])
+            const att: Attachment = {
+              file_path: result.file_path,
+              file_name: result.file_name,
+              file_type: result.file_type as Attachment['file_type'],
+              preview_url: result.preview_url,
+            }
+            // The user may have switched conversations while this uploaded.
+            if (draftSidRef.current === sid) {
+              setAttachments((prev) => [...prev, att])
+            } else {
+              const draft = getDraft(sid)
+              setDraft(sid, { text: draft.text, attachments: [...draft.attachments, att] })
+            }
           } else {
             failed.push(`${file.name}: ${result.message || 'unknown error'}`)
           }
@@ -584,14 +738,16 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
     }
   }, [])
 
-  const canSend = !isStreaming && (!!text.trim() || attachments.length > 0)
+  const canSend = !isStreaming && !compacting && (!!text.trim() || attachments.length > 0)
 
   return (
-    <div className="flex-shrink-0 border-t border-default bg-surface px-4 py-3">
+    <div className="composer-bar flex-shrink-0 border-t border-default bg-surface px-4 py-3">
       {/* One tall rounded card holds the textarea on top and a toolbar row
-          (chips + actions) at the bottom, matching the web console composer. */}
+          (chips + actions) at the bottom, matching the web console composer.
+          Kept at max-w-3xl: the transcript can use the wide pane, the input
+          stays a comfortable writing width. */}
       <div
-        className={`max-w-3xl mx-auto relative rounded-2xl border bg-inset transition-colors ${
+        className={`composer-card max-w-3xl mx-auto relative rounded-2xl border bg-inset transition-colors ${
           dragOver ? 'border-accent ring-2 ring-accent/30' : 'border-strong focus-within:border-accent'
         }`}
       >
@@ -646,10 +802,29 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
           </div>
         )}
 
-        {/* Workspace file picker (@) */}
+        {/* @ picker: group-chat Agents first, then workspace files — one flat
+            list so an Agent reads like any other pick. */}
         {mentionOpen && (
           <div className="absolute bottom-full left-0 right-0 mb-1.5 max-h-72 overflow-y-auto rounded-xl border border-default bg-elevated shadow-xl z-30 p-1.5">
-            {mentionItems.map((item, i) => {
+            {mentionAgents.map((a, i) => (
+              <button
+                key={`agent:${a.id}`}
+                onMouseEnter={() => setMentionIndex(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  acceptAgentMention(i)
+                }}
+                className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-left cursor-pointer transition-colors ${
+                  i === mentionIndex ? 'bg-accent-soft' : 'hover:bg-surface-2'
+                }`}
+              >
+                <AgentAvatar agent={a} size={20} />
+                <span className="text-[13px] text-content shrink-0 max-w-[55%] truncate">{a.name || a.id}</span>
+                <span className="flex-1 min-w-0 text-[11px] text-content-tertiary text-right truncate">{a.id}</span>
+              </button>
+            ))}
+            {mentionItems.map((item, j) => {
+              const i = mentionAgents.length + j
               const Icon = iconFor(item.kind)
               return (
                 <button
@@ -657,7 +832,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                   onMouseEnter={() => setMentionIndex(i)}
                   onMouseDown={(e) => {
                     e.preventDefault()
-                    acceptMention(i)
+                    acceptMention(j)
                   }}
                   className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-lg text-left cursor-pointer transition-colors ${
                     i === mentionIndex ? 'bg-accent-soft' : 'hover:bg-surface-2'
@@ -695,7 +870,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                       </button>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-1.5 pl-2 pr-1 py-1 bg-inset border border-default rounded-lg text-[11px] text-content-secondary max-w-[160px]">
+                    <div className="flex items-center gap-1.5 pl-2 pr-1 py-1 bg-surface border border-default rounded-lg text-[11px] text-content-secondary max-w-[160px]">
                       {att.file_type === 'workspace_ref' ? (
                         att.is_dir ? (
                           <Folder size={11} className="text-accent shrink-0" />
@@ -742,9 +917,14 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
             onPaste={handlePaste}
             onCompositionStart={() => (composingRef.current = true)}
             onCompositionEnd={() => (composingRef.current = false)}
-            placeholder={t('input_placeholder')}
+            placeholder={
+              compacting
+                ? t('ctx_compacting')
+                : t(sharedConversation ? 'input_placeholder_team' : 'input_placeholder')
+            }
             rows={1}
-            className="w-full px-4 pt-3 pb-0 bg-transparent text-content placeholder:text-content-tertiary focus:outline-none text-sm leading-relaxed resize-none overflow-y-hidden"
+            disabled={compacting}
+            className="w-full px-4 pt-3 pb-0 bg-transparent text-content placeholder:text-content-tertiary focus:outline-none text-sm leading-relaxed resize-none overflow-y-hidden disabled:opacity-60 disabled:cursor-not-allowed"
           />
           {micError && (
             // Transient error tip above the input, mirroring the web console.
@@ -760,29 +940,36 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
             The middle chip group shrinks/truncates so a narrow composer (right
             panel open) never overflows the card. */}
         <div className="composer-toolbar flex items-center gap-1 px-2 pb-1 pt-2 min-w-0">
+          {/* The composer's "+" is a quick new chat: it opens a fresh
+              conversation owned by the current Agent right away, no picker
+              (matches the web console). Choosing a different Agent or starting a
+              group lives in the session-list "+" menu instead. */}
           <Tooltip label={t('session_new')}>
             <button
               onClick={onNewChat}
-              className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn text-content-secondary hover:text-accent hover:bg-accent-soft cursor-pointer transition-colors"
+              className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn cursor-pointer transition-colors text-content-secondary hover:text-accent hover:bg-accent-soft"
             >
-              <Plus size={17} />
-            </button>
-          </Tooltip>
+              <Plus size={18} />
+          </button>
+        </Tooltip>
+          {/* Context pie sits second (mirrors the web console), always visible
+              as a mini donut; hover/click opens the usage card with actions. */}
+          <ContextUsagePopover
+            sessionId={sessionId}
+            isStreaming={isStreaming}
+            refreshKey={ctxRefreshKey}
+            onClearContext={onClearContext}
+            onAdjust={onAdjustContext}
+            onCompactingChange={setCompacting}
+            onToast={onToast}
+          />
           <Tooltip label={t('chat_attach')}>
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={uploading}
               className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn text-content-secondary hover:text-accent hover:bg-accent-soft cursor-pointer transition-colors disabled:opacity-50"
             >
-              {uploading ? <Loader2 size={17} className="animate-spin" /> : <Paperclip size={17} />}
-            </button>
-          </Tooltip>
-          <Tooltip label={t('chat_clear_context')}>
-            <button
-              onClick={onClearContext}
-              className="shrink-0 w-8 h-8 flex items-center justify-center rounded-btn text-content-secondary hover:text-danger hover:bg-danger-soft cursor-pointer transition-colors"
-            >
-              <Trash2 size={17} />
+              {uploading ? <Loader2 size={16} className="animate-spin" /> : <Paperclip size={16} />}
             </button>
           </Tooltip>
 
@@ -795,9 +982,14 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
           </div>
 
           <div className="flex items-center gap-1 shrink-0 pl-1">
-            <div className="max-w-[200px] min-w-0">
-              <ModelSelector sessionId={sessionId} />
-            </div>
+            {!sharedConversation && (
+              <div className="max-w-[200px] min-w-0">
+                <ModelSelector sessionId={sessionId} />
+              </div>
+            )}
+            {/* Agent picker sits on the far right, avatar-only, as the identity
+                the reply comes from. Only in multi-Agent mode. */}
+            {multiAgent && <AgentSelector sessionId={sessionId} />}
             {micSupported && (
               <Tooltip
                 label={
@@ -833,7 +1025,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
               <Tooltip label={t('msg_stop')}>
                 <button
                   onClick={onStop}
-                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset cursor-pointer transition-colors"
+                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-surface-2 text-content hover:bg-inset-2 cursor-pointer transition-colors relative -top-px"
                 >
                   <Square size={14} className="fill-current" />
                 </button>
@@ -843,7 +1035,7 @@ const ChatInput = forwardRef<ChatInputHandle, ChatInputProps>(function ChatInput
                 <button
                   onClick={handleSubmit}
                   disabled={!canSend}
-                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-accent text-white hover:bg-accent-hover disabled:bg-surface-2 disabled:text-content-disabled disabled:cursor-not-allowed cursor-pointer transition-none [&_*]:transition-none"
+                  className="flex-shrink-0 w-9 h-9 flex items-center justify-center rounded-btn bg-accent text-white hover:bg-accent-hover disabled:bg-surface-2 disabled:text-content-disabled disabled:cursor-not-allowed cursor-pointer transition-none [&_*]:transition-none relative -top-px"
                 >
                   <PaperPlaneIcon size={14} />
                 </button>

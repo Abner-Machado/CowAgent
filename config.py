@@ -1,16 +1,19 @@
 # encoding:utf-8
 
 import ast
-import copy
+import hashlib
 import json
 import logging
 import os
 import pickle
+import re
 import sys
 import time
 
 from common.log import logger
 from common import i18n
+from cli.config_json import deep_merge_dicts as _deep_merge_dicts, merge_duplicate_keys
+from common.deployment import is_app_bundled
 
 # All available config keys are listed in this dict (use lowercase keys).
 # The values here are placeholders only; the program does NOT read them.
@@ -25,7 +28,12 @@ available_setting = {
     "open_ai_api_key": "",  # openai api key
     # openai api base; when use_azure_chatgpt is true, set the matching api base
     "open_ai_api_base": "https://api.openai.com/v1",
+    # openai api protocol: "auto" (Responses only for models that require it), "chat" (/chat/completions) or "responses" (/responses)
+    "open_ai_api_type": "auto",
     "claude_api_base": "https://api.anthropic.com/v1",  # claude api base
+    # Prompt cache TTL for the system prompt + tools in agent mode: "1h" or "5m".
+    # Use "5m" if the endpoint rejects the 1h TTL; the conversation always uses 5m.
+    "claude_cache_ttl": "1h",
     "gemini_api_base": "https://generativelanguage.googleapis.com",  # gemini api base
     "custom_api_key": "",  # custom OpenAI-compatible provider api key (used when bot_type is "custom"); legacy single-provider field
     "custom_api_base": "",  # custom OpenAI-compatible provider api base (used when bot_type is "custom"); legacy single-provider field
@@ -34,8 +42,26 @@ available_setting = {
     "custom_providers": [],
     "proxy": "",  # proxy used by openai
     # chatgpt model; when use_azure_chatgpt is true, this is the Azure model deployment name
-    "model": "deepseek-v4-flash",  # options: gpt-4o, gpt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini, etc. See common/const.py for the full list
+    "model": "deepseek-flash",  # options: gpt-4o, gpt-4o-mini, gpt-4-turbo, claude-3-sonnet, wenxin, moonshot, qwen-turbo, xunfei, glm-4, minimax, gemini, etc. See common/const.py for the full list
     "bot_type": "",  # optional; for OpenAI-compatible third-party services set "openai" or "custom" (in custom mode switching model won't auto-switch bot_type). See common/const.py for bot names; inferred from model name if left empty
+    # Fallback chat models, tried in order after the primary one has failed
+    # permanently for a turn (all retries exhausted). Opt-in: an empty `chain`
+    # disables the switch and the error surfaces as before.
+    #
+    # The chain is ordered and unbounded: a turn walks it from the front, and
+    # the number of models the user lists *is* the number of switches on offer
+    # — there is no separate cap to raise. Each entry needs both a provider and
+    # a model; an entry missing either is skipped, and an entry equal to the
+    # primary model (or to an earlier link) is skipped too, so a misconfigured
+    # chain can never bounce a turn back onto the model that just failed.
+    # {"enabled": bool, "chain": [{"provider": str, "model": str}, ...]}
+    "chat_fallback": {
+        "enabled": False,
+        # Each item: {"provider": "openai", "model": "gpt-4o-mini"}.
+        # `provider` is a provider id as used by `bot_type`
+        # (e.g. "openai", "qianfan", "custom:<id>").
+        "chain": [],
+    },
     "use_azure_chatgpt": False,  # whether to use Azure chatgpt
     "azure_deployment_id": "",  # azure model deployment name
     "azure_api_version": "",  # azure api version
@@ -117,6 +143,9 @@ available_setting = {
     "embedding_provider": "",  # explicitly set the provider: openai / linkai / dashscope / doubao / zhipu (aligned with bot_type naming)
     "embedding_model": "",     # leave empty to use the provider's default model
     "embedding_dimensions": 0, # leave empty/0 to use the provider's default dimension (1024 recommended for consistency)
+    # Memory rerank config (optional, off by default)
+    "rerank_provider": "",  # leave empty to disable; "local" runs a cross-encoder via sentence-transformers (install it yourself)
+    "rerank_model": "",     # leave empty to use the provider's default model (local: BAAI/bge-reranker-base)
     # voice config
     "speech_recognition": True,  # whether to enable speech recognition
     "group_speech_recognition": False,  # whether to enable group speech recognition
@@ -209,6 +238,7 @@ available_setting = {
     "weixin_base_url": "https://ilinkai.weixin.qq.com",  # Weixin ilink API base URL
     "weixin_cdn_base_url": "https://novac2c.cdn.weixin.qq.com/c2c",  # CDN base URL
     "weixin_credentials_path": "~/.weixin_cow_credentials.json",  # credentials file path
+    "weixin_proxy": "",  # optional proxy for QR login, for networks that cannot log in directly
     # custom trigger words for chatgpt commands
     "clear_memory_commands": ["#清除记忆"],  # session-reset command; must start with #
     # channel config
@@ -236,6 +266,8 @@ available_setting = {
     "modelscope_base_url": "https://api-inference.modelscope.cn/v1/chat/completions",
     # LinkAI platform config
     "use_linkai": False,
+    "cowagent_api_key": "",
+    "cowagent_api_base": "",  # empty means const.COWAGENT_API_BASE_CN
     "linkai_api_key": "",
     "linkai_app_code": "",
     "linkai_api_base": "https://api.link-ai.tech",
@@ -253,8 +285,24 @@ available_setting = {
     "web_host": "",  # Web console bind address; empty means auto
     "web_port": 9899,
     "web_password": "",  # Web console password; empty means no authentication required
+    "web_allowed_hosts": [],  # When set and web_password is empty, only these host names (plus localhost, IPs and web_public_url) are served
+    "web_allowed_origins": [],  # Other sites allowed to send write requests, e.g. "https://my.dashboard.com"
+    "web_https_enabled": False,  # Serve the web console over HTTPS directly; needs web_ssl_certfile + web_ssl_keyfile
+    "web_ssl_certfile": "",  # PEM certificate file for direct HTTPS (full chain recommended)
+    "web_ssl_keyfile": "",  # PEM private key file for direct HTTPS
+    "external_api_enabled": False,  # serve the OpenAI-compatible /v1 chat API
+    "external_api_token": "",  # API key for the /v1 chat API; kept while the API is off
     "web_session_expire_days": 30,  # Auth session expiry in days
     "web_file_serve_root": "~",  # Root dir the /api/file endpoint may serve; "/" allows the whole filesystem
+    # Guest share: public chat pages (/share/<token>) backed by guest profiles in
+    # <workspace>/guests/. Off by default, and refused while web_password is
+    # empty, because the console on the same port would be open to visitors.
+    "guest_share": {
+        "enabled": False,
+    },
+    "web_public_url": "",  # Address shown in API examples, share links and embed code; empty uses the page's own
+    "device_name": "",  # Name other devices show for this one; empty uses the computer's name
+    "websites_base_url": "",  # Public URL prefix a static server exposes the Agent's websites/ dir at; empty disables published links
     "mcp_oauth_redirect_base": "",  # Base URL for MCP OAuth callback (e.g. http://your-ip:9899); empty uses local web console
     "agent": True,  # whether to enable Agent mode
     "agent_workspace": "~/cow",  # agent workspace path, used to store skills, memory, etc.
@@ -262,20 +310,32 @@ available_setting = {
     # synthesizes one "default" agent from agent_workspace and behaves exactly
     # as before. Each configured workspace is a complete CowAgent workspace.
     "agents": [],
-    # Agent handling conversations with no explicit binding. Defaults to the
-    # first configured agent when unset.
+    # Agent handling conversations that no channel instance binds. Defaults to
+    # the first configured agent when unset. When no agents list is configured,
+    # also sets the built-in single agent's id.
     "default_agent_id": "",
+    # Optional display name for the built-in single agent.
+    "default_agent_name": "",
+    # Optional description for the built-in single agent. Teammates see it on
+    # the roster of a shared conversation and use it to route work.
+    "default_agent_description": "",
     # Routes inbound conversations to an agent. Each entry needs channel_type
     # and agent_id; add conversation_id to bind one chat rather than the whole
     # channel. Unbound conversations go to default_agent_id.
     "agent_bindings": [],
-    "agent_max_context_tokens": 64000,  # max context tokens in Agent mode
+    # Manual cap on the Agent-mode input budget, used to control cost / token
+    # burn: history is compacted once the prompt reaches this many tokens, even
+    # when the model's window is far larger. Defaults to 200000. This value is
+    # still clamped below the effective model's window (window - output
+    # reserve), so a small-window model is never asked for more than it allows.
+    # Set 0 to disable the manual cap and follow the model window instead.
+    "agent_max_context_tokens": 200000,
     "agent_max_context_turns": 30,  # max context memory turns in Agent mode
-    "agent_max_steps": 30,  # max decision steps per run in Agent mode
+    "agent_max_steps": 100,  # max decision steps per run in Agent mode
     # Default permission mode for sessions that have not picked one of their own:
     # "read-only" | "workspace-write" | "full-access". Kept at full-access so an
     # existing install behaves exactly as before an upgrade. Only a fresh desktop
-    # client (COW_DESKTOP=1 with no config.json yet) is tightened to the stricter
+    # or mobile client (no config.json yet) is tightened to the stricter
     # workspace-write in load_config(); docker/source stay at full-access.
     "agent_permission_mode": "full-access",
     # In-process sub agents: the Agent hands a self-contained task to a
@@ -288,6 +348,21 @@ available_setting = {
         "max_concurrent": 3,     # parallel sub agents per spawn call (range 1-10)
         "timeout_seconds": 300,  # budget for one spawn call (range 10-3600)
     },
+    # Delegation between configured agents. Unlike a sub agent, the target is a
+    # standing peer that answers in its own workspace. The call is synchronous:
+    # the delegating Agent waits for the teammate's result. The tool only
+    # appears in a team conversation (two+ enabled agents with members). Set to
+    # false to withhold it entirely.
+    "agent_delegation": {
+        "enabled": True,
+        # {"<source>": ["<target>", ...]} or "*" for any. Unset means every
+        # agent may delegate to every other one. Targets are further bounded to
+        # the teammates in the current conversation.
+        "allowed_targets": None,
+        "max_depth": 3,               # delegation hops in one chain (range 1-8)
+        "timeout_seconds": 600,       # budget for one delegated run (range 0.01-3600)
+        "max_message_chars": 8000,    # size limit for one delegated task
+    },
     "enable_thinking": False,  # Enable deep-thinking mode for thinking-capable models
     "reasoning_effort": "high",  # Provider-native reasoning depth; allowed values depend on the active provider/model
     "reasoning_effort_by_model": {},  # Per-model effort intent: {"<provider>:<model>": "<value>"}; overrides the global key per model
@@ -299,6 +374,11 @@ available_setting = {
     # Deep Dream: nightly memory distillation into MEMORY.md + dream diary.
     "deep_dream_enabled": True,             # scheduled deep dream switch; manual /memory dream is unaffected
     "skill": {},  # Per-skill runtime config; nested keys flatten to SKILL_<NAME>_<KEY> env vars at startup
+    # Registry that installs by bare name, skill search and skill list --remote
+    # use; empty means the default Skill Hub. It must speak the same API. The key,
+    # if set, is sent as a bearer token to this registry only.
+    "skill_hub_url": "",
+    "skill_hub_api_key": "",
     "mcp_servers": [],  # MCP server list; each entry supports type "stdio" (local process) or "sse" (remote URL)
     # On-demand MCP tool retrieval: when many MCP tools are connected, inject
     # only the most query-relevant ones instead of all of them. Built-in tools
@@ -337,7 +417,7 @@ class Config(dict):
         
         try:
             return self[key]
-        except KeyError as e:
+        except KeyError:
             return default
         except Exception as e:
             raise e
@@ -359,7 +439,7 @@ class Config(dict):
             with open(os.path.join(get_appdata_dir(), "user_datas.pkl"), "rb") as f:
                 self.user_datas = pickle.load(f)
                 logger.debug("[Config] User datas loaded.")
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             logger.debug("[Config] User datas file not found, ignore.")
         except Exception as e:
             logger.warning("[Config] User datas error: {}".format(e))
@@ -369,9 +449,19 @@ class Config(dict):
         try:
             # SECURITY: pickle.dump output should only be loaded by this same
             # process. See note on load_user_datas() above.
-            with open(os.path.join(get_appdata_dir(), "user_datas.pkl"), "wb") as f:
-                pickle.dump(self.user_datas, f)
-                logger.info("[Config] User datas saved.")
+            #
+            # Serialize fully in memory and swap the file atomically. This
+            # runs on SIGTERM, and the update relay SIGKILLs the process a
+            # fixed grace period later (cli/commands/process.py) — a pickle
+            # truncated mid-dump would make load_user_datas fall back to {}
+            # on the next start and silently wipe all plugin/session user data.
+            from common.atomic_write import write_bytes_atomic
+
+            write_bytes_atomic(
+                os.path.join(get_appdata_dir(), "user_datas.pkl"),
+                pickle.dumps(self.user_datas),
+            )
+            logger.info("[Config] User datas saved.")
         except Exception as e:
             logger.info("[Config] User datas error: {}".format(e))
 
@@ -379,20 +469,29 @@ class Config(dict):
 config = Config()
 
 
-def _mask_value(val):
-    """Mask a sensitive string value, keeping first 3 and last 3 chars."""
-    if not isinstance(val, str) or len(val) <= 8:
+_SENSITIVE_KEY_PARTS = ("key", "secret", "token", "password", "passwd", "cookie", "authorization")
+_FULLY_MASKED_KEY_PARTS = ("password", "passwd")
+
+
+def _mask_value(val, full=False):
+    """Mask a sensitive string value, keeping first 3 and last 3 chars of a
+    long one. Short values and passwords are hidden entirely, since a few
+    characters of them is most of the secret."""
+    if not isinstance(val, str) or not val:
         return val
+    if full or len(val) <= 8:
+        return "*" * 8
     return val[0:3] + "*" * 5 + val[-3:]
 
 
 def _mask_sensitive_recursive(obj):
-    """Recursively mask values whose keys contain 'key' or 'secret'."""
+    """Recursively mask string values whose keys name a credential."""
     if isinstance(obj, dict):
         masked = {}
         for k, v in obj.items():
-            if ("key" in k or "secret" in k) and isinstance(v, str):
-                masked[k] = _mask_value(v)
+            name = str(k).lower()
+            if isinstance(v, str) and any(p in name for p in _SENSITIVE_KEY_PARTS):
+                masked[k] = _mask_value(v, full=any(p in name for p in _FULLY_MASKED_KEY_PARTS))
             else:
                 masked[k] = _mask_sensitive_recursive(v)
         return masked
@@ -436,6 +535,55 @@ def _quarantine_corrupted_config(config_path):
         logger.warning("[INIT] failed to back up corrupted config: {}".format(e))
 
 
+# Config keys mirrored into environment variables at startup so that
+# subprocesses (e.g. shell skill scripts) can read them directly.
+CONFIG_TO_ENV = {
+    "open_ai_api_key": "OPENAI_API_KEY",
+    "open_ai_api_base": "OPENAI_API_BASE",
+    "cowagent_api_key": "COWAGENT_API_KEY",
+    "cowagent_api_base": "COWAGENT_API_BASE",
+    "linkai_api_key": "LINKAI_API_KEY",
+    "linkai_api_base": "LINKAI_API_BASE",
+    "claude_api_key": "CLAUDE_API_KEY",
+    "claude_api_base": "CLAUDE_API_BASE",
+    "gemini_api_key": "GEMINI_API_KEY",
+    "gemini_api_base": "GEMINI_API_BASE",
+    "minimax_api_key": "MINIMAX_API_KEY",
+    "minimax_api_base": "MINIMAX_API_BASE",
+    "deepseek_api_key": "DEEPSEEK_API_KEY",
+    "deepseek_api_base": "DEEPSEEK_API_BASE",
+    "mimo_api_key": "MIMO_API_KEY",
+    "mimo_api_base": "MIMO_API_BASE",
+    "qianfan_api_key": "QIANFAN_API_KEY",
+    "qianfan_api_base": "QIANFAN_API_BASE",
+    "zhipu_ai_api_key": "ZHIPU_AI_API_KEY",
+    "zhipu_ai_api_base": "ZHIPU_AI_API_BASE",
+    "moonshot_api_key": "MOONSHOT_API_KEY",
+    "moonshot_api_base": "MOONSHOT_API_BASE",
+    "ark_api_key": "ARK_API_KEY",
+    "ark_api_base": "ARK_API_BASE",
+    "dashscope_api_key": "DASHSCOPE_API_KEY",
+    "dashscope_api_base": "DASHSCOPE_API_BASE",
+    # Channel credentials (used by skills that check env vars)
+    "feishu_app_id": "FEISHU_APP_ID",
+    "feishu_app_secret": "FEISHU_APP_SECRET",
+    "dingtalk_client_id": "DINGTALK_CLIENT_ID",
+    "dingtalk_client_secret": "DINGTALK_CLIENT_SECRET",
+    "wechatmp_app_id": "WECHATMP_APP_ID",
+    "wechatmp_app_secret": "WECHATMP_APP_SECRET",
+    "wechatcomapp_agent_id": "WECHATCOMAPP_AGENT_ID",
+    "wechatcomapp_secret": "WECHATCOMAPP_SECRET",
+    "wechatcom_corp_id": "WECHATCOM_CORP_ID",
+    "wechat_kf_corp_id": "WECHAT_KF_CORP_ID",
+    "wechat_kf_secret": "WECHAT_KF_SECRET",
+    "wechat_kf_token": "WECHAT_KF_TOKEN",
+    "wechat_kf_aes_key": "WECHAT_KF_AES_KEY",
+    "qq_app_id": "QQ_APP_ID",
+    "qq_app_secret": "QQ_APP_SECRET",
+    "weixin_token": "WEIXIN_TOKEN",
+}
+
+
 def load_config():
     global config
 
@@ -464,18 +612,18 @@ def load_config():
     # otherwise silently drop all but the last occurrence.
     #
     # Self-heal a corrupted user config.json instead of crashing on startup —
-    # but ONLY for the packaged desktop client (COW_DESKTOP=1). A truncated or
+    # but ONLY for the packaged desktop and mobile clients. A truncated or
     # invalid file (e.g. a bad write during a previous update) would otherwise
-    # make json.loads raise and strand the desktop app on "Initialization
+    # make json.loads raise and strand the app on "Initialization
     # Failed" forever, with no way for an end user to recover short of manually
     # deleting the file. Source deployments deliberately keep the original
     # behavior (raise): a developer editing config.json wants a clear error to
     # fix, not to have their file silently backed up and replaced by defaults.
-    desktop_mode = os.environ.get("COW_DESKTOP") == "1"
+    bundled_mode = is_app_bundled()
     try:
         config = Config(json.loads(config_str, object_pairs_hook=_merge_duplicate_keys))
     except ValueError as parse_err:
-        if not desktop_mode or config_path != user_config_path:
+        if not bundled_mode or config_path != user_config_path:
             # Source run, or the bundled template itself is broken (a packaging
             # bug we can't heal by falling back further) — surface it.
             raise
@@ -502,8 +650,11 @@ def load_config():
     # only missing namespaces are filled in from the legacy section.
     _merge_legacy_namespace(config, legacy="tool",  canonical="tools")
     _merge_legacy_namespace(config, legacy="skill", canonical="skills")
+    # A backup model configured before the fallback chain must survive the
+    # upgrade, so normalize it into the current shape before anything reads it.
+    _migrate_chat_fallback(config)
 
-    # Fresh desktop installs default to the stricter "workspace-write"; every
+    # Fresh desktop and mobile installs default to the stricter "workspace-write"; every
     # other case keeps the template's "full-access". A packaged client only
     # lacks config.json on its very first launch (config_path fell back to the
     # bundled template) — once the user configures anything (e.g. a model) the
@@ -511,7 +662,7 @@ def load_config():
     # never silently tightened by an upgrade. Non-desktop (docker, source) is
     # untouched. Placed before the env override so AGENT_PERMISSION_MODE still
     # wins if explicitly set.
-    if os.environ.get("COW_DESKTOP") == "1" and config_path != user_config_path:
+    if is_app_bundled() and config_path != user_config_path:
         config["agent_permission_mode"] = "workspace-write"
 
     # override config with environment variables.
@@ -521,8 +672,13 @@ def load_config():
         # skip comment fields starting with an underscore
         if name.startswith("_"):
             continue
+        # A blank value is a placeholder (docker-compose lists every key as
+        # ''), not a request to wipe what the user saved in config.json.
+        if value == "":
+            continue
         if name in available_setting:
-            logger.info("[INIT] override config by environ args: {}={}".format(name, value))
+            logger.info("[INIT] override config by environ args: {}={}".format(
+                name, drag_sensitive({name: value})[name]))
             try:
                 # SECURITY: Use ast.literal_eval instead of eval().
                 # ast.literal_eval only parses Python literals (strings, numbers,
@@ -534,12 +690,22 @@ def load_config():
                 # strings, but also TypeError/RecursionError on malformed input
                 # (e.g. unhashable dict keys); catch broadly to avoid crashing
                 # startup, and fall back to treating the value as a plain string.
+                # Numeric keys reject it instead: a string there fails much later.
                 if value.lower() == "false":
                     config[name] = False
                 elif value.lower() == "true":
                     config[name] = True
+                elif type(available_setting[name]) in (int, float):
+                    logger.warning("[INIT] ignoring environment override {}: not a {}".format(
+                        name, type(available_setting[name]).__name__))
                 else:
                     config[name] = value
+
+    # An endpoint with a default is never meant to be empty: some readers
+    # fill an empty base from another vendor's.
+    for name, default in available_setting.items():
+        if name.endswith("_api_base") and isinstance(default, str) and default and config.get(name) == "":
+            config[name] = default
 
     if config.get("debug", False):
         logger.setLevel(logging.DEBUG)
@@ -589,56 +755,20 @@ def load_config():
     # Sync selected config values to environment variables so that
     # subprocesses (e.g. shell skill scripts) can access them directly.
     # Existing env vars are NOT overwritten (env takes precedence).
-    _CONFIG_TO_ENV = {
-        "open_ai_api_key": "OPENAI_API_KEY",
-        "open_ai_api_base": "OPENAI_API_BASE",
-        "linkai_api_key": "LINKAI_API_KEY",
-        "linkai_api_base": "LINKAI_API_BASE",
-        "claude_api_key": "CLAUDE_API_KEY",
-        "claude_api_base": "CLAUDE_API_BASE",
-        "gemini_api_key": "GEMINI_API_KEY",
-        "gemini_api_base": "GEMINI_API_BASE",
-        "minimax_api_key": "MINIMAX_API_KEY",
-        "minimax_api_base": "MINIMAX_API_BASE",
-        "deepseek_api_key": "DEEPSEEK_API_KEY",
-        "deepseek_api_base": "DEEPSEEK_API_BASE",
-        "mimo_api_key": "MIMO_API_KEY",
-        "mimo_api_base": "MIMO_API_BASE",
-        "qianfan_api_key": "QIANFAN_API_KEY",
-        "qianfan_api_base": "QIANFAN_API_BASE",
-        "zhipu_ai_api_key": "ZHIPU_AI_API_KEY",
-        "zhipu_ai_api_base": "ZHIPU_AI_API_BASE",
-        "moonshot_api_key": "MOONSHOT_API_KEY",
-        "moonshot_api_base": "MOONSHOT_API_BASE",
-        "ark_api_key": "ARK_API_KEY",
-        "ark_api_base": "ARK_API_BASE",
-        "dashscope_api_key": "DASHSCOPE_API_KEY",
-        "dashscope_api_base": "DASHSCOPE_API_BASE",
-        # Channel credentials (used by skills that check env vars)
-        "feishu_app_id": "FEISHU_APP_ID",
-        "feishu_app_secret": "FEISHU_APP_SECRET",
-        "dingtalk_client_id": "DINGTALK_CLIENT_ID",
-        "dingtalk_client_secret": "DINGTALK_CLIENT_SECRET",
-        "wechatmp_app_id": "WECHATMP_APP_ID",
-        "wechatmp_app_secret": "WECHATMP_APP_SECRET",
-        "wechatcomapp_agent_id": "WECHATCOMAPP_AGENT_ID",
-        "wechatcomapp_secret": "WECHATCOMAPP_SECRET",
-        "wechatcom_corp_id": "WECHATCOM_CORP_ID",
-        "wechat_kf_corp_id": "WECHAT_KF_CORP_ID",
-        "wechat_kf_secret": "WECHAT_KF_SECRET",
-        "wechat_kf_token": "WECHAT_KF_TOKEN",
-        "wechat_kf_aes_key": "WECHAT_KF_AES_KEY",
-        "qq_app_id": "QQ_APP_ID",
-        "qq_app_secret": "QQ_APP_SECRET",
-        "weixin_token": "WEIXIN_TOKEN",
-    }
     injected = 0
-    for conf_key, env_key in _CONFIG_TO_ENV.items():
-        if env_key not in os.environ:
+    for conf_key, env_key in CONFIG_TO_ENV.items():
+        if not os.environ.get(env_key):
             val = config.get(conf_key, "")
             if val:
                 os.environ[env_key] = str(val)
                 injected += 1
+
+    # Skill scripts only see the environment, so hand them the same base the
+    # runtime falls back to when cowagent_api_base is unset.
+    if config.get("cowagent_api_key") and not os.environ.get("COWAGENT_API_BASE"):
+        from models.cowagent_provider import default_cowagent_api_base
+        os.environ["COWAGENT_API_BASE"] = default_cowagent_api_base()
+        injected += 1
 
     injected += _sync_skill_config_to_env(config.get("skills", {}))
     injected += sync_image_generation_custom_provider_env(config)
@@ -649,45 +779,50 @@ def load_config():
     config.load_user_datas()
 
 
-def _deep_merge_dicts(base: dict, incoming: dict) -> dict:
-    """Recursively merge ``incoming`` into ``base`` (incoming wins on leaves)."""
-    for key, val in incoming.items():
-        if (
-            key in base
-            and isinstance(base[key], dict)
-            and isinstance(val, dict)
-        ):
-            _deep_merge_dicts(base[key], val)
-        else:
-            base[key] = val
-    return base
-
-
 def _merge_duplicate_keys(pairs):
-    """object_pairs_hook for json.loads: deep-merge duplicate top-level keys
-    (lists concat, dicts merge, scalars take the latter) instead of dropping."""
-    out = {}
-    duplicates = []
-    for key, val in pairs:
-        if key not in out:
-            out[key] = val
-            continue
-        duplicates.append(key)
-        prev = out[key]
-        if isinstance(prev, dict) and isinstance(val, dict):
-            _deep_merge_dicts(prev, val)
-        elif isinstance(prev, list) and isinstance(val, list):
-            prev.extend(val)
-        else:
-            out[key] = val
-    if duplicates:
+    """Merge duplicate keys with the app's existing diagnostic behavior."""
+    def report_duplicates(unique):
         # logger may not be wired yet — fall back to print so we never lose the warning.
-        unique = sorted(set(duplicates))
         try:
             logger.warning("[INIT] config.json has duplicate keys (merged): %s", unique)
         except Exception:
             print("[INIT] config.json has duplicate keys (merged):", unique)
-    return out
+
+    return merge_duplicate_keys(pairs, on_duplicates=report_duplicates)
+
+
+def _migrate_chat_fallback(cfg) -> None:
+    """Upgrade the single-model ``chat_fallback`` to the chain shape.
+
+    Before the fallback chain, ``chat_fallback`` held one ``provider`` and one
+    ``model`` (plus a ``max_switches`` cap). An existing config with a backup
+    model configured would otherwise load as an empty chain — silently
+    disabling a safety net the user had turned on — so fold those fields into
+    a one-entry chain here. ``max_switches`` is dropped rather than carried
+    over: the chain length is the new bound, and the old counter never
+    actually bounded anything (the fallback was already sticky for a run).
+    """
+    raw = cfg.get("chat_fallback")
+    if not isinstance(raw, dict):
+        return
+    chain = raw.get("chain")
+    if isinstance(chain, list):
+        raw.pop("max_switches", None)
+        return
+    provider = (raw.get("provider") or "").strip()
+    model = (raw.get("model") or "").strip()
+    entry = []
+    if provider and model:
+        entry = [{"provider": provider, "model": model}]
+    raw.pop("provider", None)
+    raw.pop("model", None)
+    raw.pop("max_switches", None)
+    raw["chain"] = entry
+    if entry:
+        logger.warning(
+            "[INIT] chat_fallback.provider/model is deprecated; migrated into "
+            "chat_fallback.chain. Please rewrite it as a list in config.json."
+        )
 
 
 def _merge_legacy_namespace(cfg, legacy: str, canonical: str) -> None:
@@ -859,6 +994,49 @@ def get_data_root():
     return get_root()
 
 
+def get_device_base_dir() -> str:
+    """Where every instance on this machine keeps its device directory."""
+    return os.path.join(os.path.expanduser(os.environ.get("COW_DATA_DIR") or "~/.cow"), "device")
+
+
+def source_instance_key(root: str) -> str:
+    """Folder name for a source deployment at ``root``: readable, and unique
+    to the path."""
+    real = os.path.realpath(root)
+    name = re.sub(r"[^A-Za-z0-9._-]", "", os.path.basename(real))[:40] or "cow"
+    digest = hashlib.sha256(real.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return f"{name}-{digest}"
+
+
+def get_device_dir(create: bool = True):
+    """Directory for who this install is and who may sign in to it: its device
+    id, the paired devices, the session key and the running console's local key.
+
+    It sits under COW_DATA_DIR when set. A source deployment keeps it out of the
+    project directory, under ~/.cow/device, in a folder of its own per project:
+    two checkouts, or a checkout beside the desktop app, are separate instances
+    with their own devices and keys.
+    """
+    data_dir = os.environ.get("COW_DATA_DIR")
+    if data_dir:
+        path = os.path.join(os.path.expanduser(data_dir), "device")
+    else:
+        path = os.path.join(get_device_base_dir(), source_instance_key(get_root()))
+    if create:
+        # An unwritable home must not stop the server: what lives here then
+        # stays in memory until a restart.
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        except OSError as e:
+            if path not in _unwritable_device_dirs:
+                _unwritable_device_dirs.add(path)
+                logger.warning(f"[Config] Could not create device directory {path}: {e}")
+    return path
+
+
+_unwritable_device_dirs = set()
+
+
 def read_file(path):
     with open(path, mode="r", encoding="utf-8-sig") as f:
         return f.read()
@@ -872,28 +1050,39 @@ def get_appdata_dir():
     data_path = os.path.join(get_data_root(), conf().get("appdata_dir", ""))
     if not os.path.exists(data_path):
         logger.info("[INIT] data path not exists, create it: {}".format(data_path))
-        os.makedirs(data_path)
+        os.makedirs(data_path, exist_ok=True)
     return data_path
 
 
-def get_weixin_credentials_path():
+def get_weixin_credentials_path(instance_id: str = ""):
     """Resolve the Weixin credentials (token) file path.
 
     Honors an explicit ``weixin_credentials_path`` from config. Otherwise the
     packaged desktop build (COW_DATA_DIR set) keeps it under the data dir
     (~/.cow) so all user data stays together, while source deployments retain
     the legacy ~/.weixin_cow_credentials.json default unchanged.
+
+    ``instance_id`` isolates the credentials file when several Weixin instances
+    run in one process, each logged into a different account: their tokens must
+    not share (and overwrite) one file. Empty (the single-instance default)
+    keeps the legacy path byte-for-byte, so existing installs are untouched.
     """
     configured = conf().get("weixin_credentials_path")
     if configured:
-        return os.path.expanduser(configured)
-    if os.environ.get("COW_DATA_DIR"):
-        return os.path.join(get_data_root(), "weixin_credentials.json")
-    return os.path.expanduser("~/.weixin_cow_credentials.json")
+        base = os.path.expanduser(configured)
+    elif os.environ.get("COW_DATA_DIR"):
+        base = os.path.join(get_data_root(), "weixin_credentials.json")
+    else:
+        base = os.path.expanduser("~/.weixin_cow_credentials.json")
+    if not instance_id:
+        return base
+    root, ext = os.path.splitext(base)
+    return f"{root}.{instance_id}{ext or '.json'}"
 
 
 def subscribe_msg():
-    trigger_prefix = conf().get("single_chat_prefix", [""])[0]
+    prefixes = conf().get("single_chat_prefix") or [""]
+    trigger_prefix = prefixes[0]
     msg = conf().get("subscribe_msg", "")
     return msg.format(trigger_prefix=trigger_prefix)
 

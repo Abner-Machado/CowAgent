@@ -366,8 +366,7 @@ detect_python_command() {
             minor_version=$($cmd -c 'import sys; print(sys.version_info[1])' 2>/dev/null)
             
             if [[ "$major_version" == "3" ]]; then
-                # Supported range is 3.7+. On 3.13+ web.py is installed from a
-                # pinned GitHub commit (see requirements.txt), which needs git.
+                # Supported range is 3.7+.
                 if (( minor_version >= 7 )); then
                     PYTHON_CMD=$cmd
                     PYTHON_VERSION="${major_version}.${minor_version}"
@@ -383,14 +382,6 @@ detect_python_command() {
         exit 1
     fi
 
-    # On 3.13+, web.py is pulled from GitHub via pip, which requires git.
-    if [[ "$major_version" == "3" ]] && (( minor_version >= 13 )); then
-        if ! command -v git &> /dev/null; then
-            echo -e "${YELLOW}⚠️  Python $PYTHON_VERSION detected. Installing web.py from GitHub requires git, which was not found.${NC}"
-            echo -e "${YELLOW}    Please install git, or use Python 3.12 where web.py installs directly from PyPI.${NC}"
-        fi
-    fi
-    
     # Export for global use
     export PYTHON_CMD
     export PYTHON_VERSION
@@ -596,16 +587,16 @@ select_model() {
     title="$(t "选择 AI 模型" "Select AI Model")"
     # The 12th option is "skip" -> configure later in the web console.
     select_menu sel "$title" \
-        "DeepSeek (deepseek-v4-flash, deepseek-v4-pro, etc.)" \
-        "Claude (claude-opus-5, claude-sonnet-5, etc.)" \
-        "OpenAI (gpt-5.6-luna, etc.)" \
-        "Gemini (gemini-3.7-flash, gemini-3.6-flash, etc.)" \
-        "MiniMax (MiniMax-M3, etc.)" \
-        "GLM (glm-5.3, etc.)" \
-        "Qwen (qwen3.8-max, qwen3.7-plus, etc.)" \
-        "Kimi (kimi-k3, etc.)" \
+        "DeepSeek (deepseek-flash, deepseek-v4-pro, etc.)" \
+        "Claude (claude-opus-5-5, claude-sonnet-5-5, etc.)" \
+        "OpenAI (gpt-6.2-sol, gpt-6.2-astra, etc.)" \
+        "Gemini (gemini-4-argon, gemini-3.8-flash, etc.)" \
+        "MiniMax (MiniMax-M3.1-Flash, MiniMax-M3, etc.)" \
+        "GLM (glm-5.3-flash, glm-5.3, etc.)" \
+        "Qwen (qwen3.8-flash, qwen3.8-max, etc.)" \
+        "Kimi (kimi-k3.1-pro, kimi-k3, etc.)" \
         "Doubao (doubao-seed-2.1, etc.)" \
-        "MiMo (mimo-v2.5-pro, etc.)" \
+        "MiMo (mimo-v2.6-pro, etc.)" \
         "LinkAI ($(t "一个 Key 接入所有模型" "access all models via one API"))" \
         "$(t "⏭  跳过（稍后在 Web 控制台配置）" "⏭  Skip (configure later in the web console)")"
     model_choice="$sel"
@@ -628,20 +619,20 @@ read_model_config() {
 # finish configuration in the web console after first start.
 configure_model() {
     case "$model_choice" in
-        1) read_model_config "DeepSeek" "deepseek-v4-flash" "DEEPSEEK_KEY" ;;
-        2) read_model_config "Claude" "claude-opus-5" "CLAUDE_KEY" ;;
-        3) read_model_config "OpenAI" "gpt-5.6-luna" "OPENAI_KEY" ;;
-        4) read_model_config "Gemini" "gemini-3.7-flash" "GEMINI_KEY" ;;
-        5) read_model_config "MiniMax" "MiniMax-M3" "MINIMAX_KEY" ;;
-        6) read_model_config "GLM" "glm-5.3" "ZHIPU_KEY" ;;
-        7) read_model_config "Qwen (DashScope)" "qwen3.8-max" "DASHSCOPE_KEY" ;;
-        8) read_model_config "Kimi (Moonshot)" "kimi-k3" "MOONSHOT_KEY" ;;
+        1) read_model_config "DeepSeek" "deepseek-flash" "DEEPSEEK_KEY" ;;
+        2) read_model_config "Claude" "claude-opus-5-5" "CLAUDE_KEY" ;;
+        3) read_model_config "OpenAI" "gpt-6.2-sol" "OPENAI_KEY" ;;
+        4) read_model_config "Gemini" "gemini-4-argon" "GEMINI_KEY" ;;
+        5) read_model_config "MiniMax" "MiniMax-M3.1-Flash" "MINIMAX_KEY" ;;
+        6) read_model_config "GLM" "glm-5.3-flash" "ZHIPU_KEY" ;;
+        7) read_model_config "Qwen (DashScope)" "qwen3.8-flash" "DASHSCOPE_KEY" ;;
+        8) read_model_config "Kimi (Moonshot)" "kimi-k3.1-pro" "MOONSHOT_KEY" ;;
         9) read_model_config "Doubao (Volcengine Ark)" "doubao-seed-2-1-pro-260628" "ARK_KEY" ;;
-        10) read_model_config "MiMo" "mimo-v2.5-pro" "MIMO_KEY" ;;
+        10) read_model_config "MiMo" "mimo-v2.6-pro" "MIMO_KEY" ;;
         11)
             # Show where to obtain a LinkAI key (zh users -> console page).
             echo -e "${CYAN}$(t "获取 LinkAI Key" "Get your LinkAI Key"): https://link-ai.tech/console/interface${NC}"
-            read_model_config "LinkAI" "deepseek-v4-flash" "LINKAI_KEY"
+            read_model_config "LinkAI" "deepseek-flash" "LINKAI_KEY"
             USE_LINKAI="true"
             ;;
         12)
@@ -702,7 +693,7 @@ configure_channel() {
             # no prompt; it can be changed later in the web console / config.
             CHANNEL_TYPE="web"
             WEB_PORT="9899"
-            ACCESS_INFO="$(t "Web 控制台地址" "Web console") : http://localhost:9899/chat"
+            ACCESS_INFO="$(t "Web 控制台地址" "Web console") : http://localhost:9899/"
             ;;
         weixin)
             # Weixin
@@ -880,9 +871,9 @@ base = {
     'linkai_api_key': e('LINKAI_KEY', ''),
     'linkai_app_code': '',
     'agent': True,
-    'agent_max_context_tokens': 50000,
-    'agent_max_context_turns': 20,
-    'agent_max_steps': 20,
+    'agent_max_context_tokens': 200000,
+    'agent_max_context_turns': 30,
+    'agent_max_steps': 100,
     # New installs opt into self-evolution; existing users (no key) keep the
     # code default (off) so an upgrade never silently changes their behavior.
     'self_evolution_enabled': True,
@@ -963,7 +954,7 @@ start_project() {
         local _port="${WEB_PORT:-9899}"
         echo ""
         echo -e "${YELLOW}${EMOJI_WARN} $(t "尚未配置模型，请在 Web 控制台完成配置" "Model not configured yet, please finish setup in the web console"):${NC}"
-        echo -e "${CYAN}   http://localhost:${_port}/chat${NC}"
+        echo -e "${CYAN}   http://localhost:${_port}/${NC}"
     fi
     echo ""
     echo -e "${CYAN}${BOLD}$(t "管理命令" "Management Commands"):${NC}"

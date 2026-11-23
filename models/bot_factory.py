@@ -4,10 +4,16 @@ channel factory
 from common import const
 
 
-def create_bot(bot_type):
+def create_bot(bot_type, credential_bot_type=None):
     """
     create a bot_type instance
     :param bot_type: bot type code
+    :param credential_bot_type: the provider whose credentials the instance
+        should use, when that differs from the globally configured one. A turn
+        routed to another provider (an engaged chat fallback) passes the
+        fallback's own ``custom:<id>`` so the instance sends that provider's
+        model id to that provider's api_base. ``None`` (every other caller)
+        keeps the historical behavior of reading the global ``bot_type``.
     :return: bot instance
     """
     if bot_type == const.BAIDU:
@@ -29,9 +35,17 @@ def create_bot(bot_type):
         from models.mimo.mimo_bot import MimoBot
         return MimoBot()
 
+    elif bot_type == const.CODEX:
+        from models.codex.codex_bot import CodexBot
+        return CodexBot()
+
     elif bot_type in (const.OPENAI, const.CHATGPT, const.CUSTOM) or bot_type.startswith("custom:"):  # OpenAI-compatible API
         from models.chatgpt.chat_gpt_bot import ChatGPTBot
-        return ChatGPTBot()
+        return ChatGPTBot(credential_bot_type)
+
+    elif bot_type == const.COWAGENT:  # OpenAI-compatible, with its own credentials
+        from models.chatgpt.chat_gpt_bot import ChatGPTBot
+        return ChatGPTBot(credential_bot_type or const.COWAGENT)
 
     elif bot_type == const.OPEN_AI:
         # OpenAI 官方对话模型API

@@ -11,17 +11,36 @@ from agent.tools.ls.ls import Ls
 from agent.tools.send.send import Send
 from agent.tools.search_files.search_files import SearchFiles
 
+from agent.tools.current_time.current_time import TimeTool
+
 # Import memory tools
 from agent.tools.memory.memory_search import MemorySearchTool
 from agent.tools.memory.memory_get import MemoryGetTool
 
 # Import self-evolution tools
 from agent.tools.evolution_undo.evolution_undo import EvolutionUndoTool
+from agent.tools.agent_delegate.agent_delegate import AgentDelegateTool
 
 # Import sub agent tools
 from agent.tools.subagent.subagent import SubagentTool
 
 # Import tools with optional dependencies
+_PIP_PACKAGES = {
+    "dotenv": "python-dotenv>=1.0.0",
+    "croniter": "croniter>=2.0.0",
+}
+
+
+def _install_hint(e: ImportError) -> str:
+    """Build a pip command for the module that actually failed to import."""
+    module = (getattr(e, "name", None) or "").split(".")[0]
+    package = _PIP_PACKAGES.get(module)
+    if package:
+        # Quoted so the shell does not treat ">=" as a redirect.
+        return f'pip install "{package}"'
+    return "pip install -r requirements.txt"
+
+
 def _import_optional_tools():
     """Import tools that have optional dependencies"""
     from common.log import logger
@@ -35,7 +54,7 @@ def _import_optional_tools():
         logger.error(
             f"[Tools] EnvConfig tool not loaded - missing dependency: {e}\n"
             f"  To enable environment variable management, run:\n"
-            f"    pip install python-dotenv>=1.0.0"
+            f"    {_install_hint(e)}"
         )
     except Exception as e:
         logger.error(f"[Tools] EnvConfig tool failed to load: {e}")
@@ -48,7 +67,7 @@ def _import_optional_tools():
         logger.error(
             f"[Tools] Scheduler tool not loaded - missing dependency: {e}\n"
             f"  To enable scheduled tasks, run:\n"
-            f"    pip install croniter>=2.0.0"
+            f"    {_install_hint(e)}"
         )
     except Exception as e:
         logger.error(f"[Tools] Scheduler tool failed to load: {e}")
@@ -124,6 +143,10 @@ _mcp_tools = _import_mcp_tools()
 McpTool = _mcp_tools.get('McpTool')
 McpClientRegistry = _mcp_tools.get('McpClientRegistry')
 
+from agent.tools.phone import (
+    PhoneCalendar, PhoneContacts, PhoneDevice, PhoneLocation, PhoneOpen, PhonePhotos, PhoneShare,
+)
+
 # Export all tools (including optional ones that might be None)
 __all__ = [
     'BaseTool',
@@ -139,6 +162,7 @@ __all__ = [
     'MemoryGetTool',
     'EvolutionUndoTool',
     'SubagentTool',
+    'AgentDelegateTool',
     'EnvConfig',
     'SchedulerTool',
     'WebSearch',
@@ -146,6 +170,14 @@ __all__ = [
     'Vision',
     'BrowserTool',
     'McpTool',
+    'TimeTool',
+    'PhoneOpen',
+    'PhoneLocation',
+    'PhoneCalendar',
+    'PhoneContacts',
+    'PhonePhotos',
+    'PhoneShare',
+    'PhoneDevice',
 ]
 
 """

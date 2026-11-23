@@ -62,6 +62,7 @@ class OpenAICompatibleBot:
                 'default_top_p': float,
                 'default_frequency_penalty': float,
                 'default_presence_penalty': float,
+                'api_type': str (optional, "auto" / "chat" / "responses"),
             }
         """
         raise NotImplementedError("Subclasses must implement get_api_config()")
@@ -91,6 +92,11 @@ class OpenAICompatibleBot:
             
             # Convert messages from Claude format to OpenAI format
             messages = self._convert_messages_to_openai_format(messages)
+            # "_"-prefixed keys are in-memory markers; strict endpoints reject them.
+            messages = [
+                {k: v for k, v in msg.items() if not k.startswith("_")}
+                for msg in messages
+            ]
             
             # Convert tools from Claude format to OpenAI format
             if tools:
@@ -108,6 +114,22 @@ class OpenAICompatibleBot:
             
             # Build request parameters
             model_name = kwargs.get("model", api_config.get('model', 'gpt-5.4'))
+
+            # Models like gpt-6-astra only support tool calling via the Responses
+            # API (Chat Completions rejects tools with a non-"none" reasoning
+            # effort, and Astra has no "none"). Route them through Responses and
+            # translate the result back to Chat-Completions shape. ``api_type``
+            # lets endpoints that no longer serve /chat/completions force it.
+            from models.openai import responses_adapter as responses_adapter
+            if responses_adapter.use_responses_api(model_name, api_config.get("api_type")):
+                return self._call_with_tools_responses(
+                    model_name=model_name,
+                    messages=messages,
+                    tools=tools,
+                    stream=stream,
+                    api_config=api_config,
+                    kwargs=kwargs,
+                )
             request_params = {
                 "model": model_name,
                 "messages": messages,
@@ -117,6 +139,14 @@ class OpenAICompatibleBot:
                 "presence_penalty": kwargs.get("presence_penalty", api_config.get('default_presence_penalty', 0.0)),
                 "stream": stream
             }
+            # Ask for a final usage chunk on streaming calls so the agent can
+            # surface a real prompt_tokens count (context-usage indicator)
+            # instead of the char-based estimate. Providers that don't support
+            # stream_options simply ignore it or omit the usage chunk, in which
+            # case the agent falls back to the estimate — so this is safe to
+            # always request on the OpenAI-compatible path.
+            if stream:
+                request_params["stream_options"] = {"include_usage": True}
             # GPT-5.x / o-series reasoning models only accept default
             # temperature/top_p and reject penalty params.
             is_gpt5_reasoning = self._is_gpt5_reasoning_model(model_name)
@@ -166,6 +196,114 @@ class OpenAICompatibleBot:
                     "status_code": 500
                 }
     
+    @classmethod
+    def _responses_reasoning_effort(cls, model_name, kwargs) -> Optional[str]:
+        """Pick the reasoning effort for a Responses request.
+
+        Responses-only models (gpt-6*) have no "none" tier, so they only get an
+        explicit effort. For GPT-5.x / o-series the effort follows the thinking
+        toggle: disabled -> "none" (same as the Chat Completions tool path),
+        enabled -> the configured effort, or the model default when unset.
+        """
+        from models.openai import responses_adapter
+
+        effort = kwargs.get("reasoning_effort")
+        if responses_adapter.is_responses_only_model(model_name):
+            return effort
+        thinking = kwargs.get("thinking")
+        if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            return effort
+        if cls._is_gpt5_reasoning_model(model_name):
+            return "none"
+        return None
+
+    def _responses_as_chat_completion(self, *, model, messages, api_key=None,
+                                      api_base=None, timeout=None, max_tokens=None) -> dict:
+        """Run a non-streaming, tool-less Responses request and return it in
+        Chat-Completions shape. Raises ``OpenAIHTTPError`` like
+        ``chat_completions`` so callers keep their existing error handling."""
+        from models.openai import responses_adapter
+
+        payload = responses_adapter.build_responses_payload(
+            model=model,
+            messages=messages,
+            max_output_tokens=max_tokens,
+            reasoning_effort=self._responses_reasoning_effort(model, {}),
+        )
+        response = self._get_http_client().responses(
+            api_key=api_key, api_base=api_base, timeout=timeout,
+            stream=False, **payload,
+        )
+        result = responses_adapter.responses_to_chat_completion(response)
+        if result.get("error"):
+            raise OpenAIHTTPError(result.get("status_code") or 500, response, result.get("message") or "")
+        return result
+
+    def _call_with_tools_responses(self, *, model_name, messages, tools, stream,
+                                   api_config, kwargs):
+        """Tool-calling path over the Responses API.
+
+        Used for Responses-only models (e.g. gpt-6-astra) and whenever
+        ``api_type`` is "responses". Builds a Responses request from the
+        already-converted OpenAI-shaped ``messages`` / ``tools`` and translates
+        the Responses output (sync) or SSE events (stream) back into
+        Chat-Completions shape so the agent consumes it identically to the
+        ``/chat/completions`` path.
+        """
+        from models.openai import responses_adapter
+
+        payload = responses_adapter.build_responses_payload(
+            model=model_name,
+            messages=messages,
+            tools=tools,
+            tool_choice=kwargs.get("tool_choice", "auto") if tools else None,
+            max_output_tokens=kwargs.get("max_tokens"),
+            reasoning_effort=self._responses_reasoning_effort(model_name, kwargs),
+            response_format=kwargs.get("response_format"),
+        )
+        api_key = api_config.get("api_key")
+        api_base = api_config.get("api_base")
+        timeout = kwargs.get("request_timeout") or kwargs.get("timeout")
+
+        if stream:
+            return self._handle_responses_stream(payload, api_key, api_base, timeout, model_name)
+        return self._handle_responses_sync(payload, api_key, api_base, timeout)
+
+    def _handle_responses_sync(self, payload, api_key, api_base, timeout):
+        from models.openai import responses_adapter
+        try:
+            client = self._get_http_client()
+            response = client.responses(
+                api_key=api_key, api_base=api_base, timeout=timeout,
+                stream=False, **payload,
+            )
+            return responses_adapter.responses_to_chat_completion(response)
+        except OpenAIHTTPError as e:
+            logger.error(f"[{self.__class__.__name__}] responses sync error: "
+                         f"HTTP {e.status_code}: {e.message}")
+            return {"error": True, "message": e.message, "status_code": e.status_code or 500}
+        except Exception as e:
+            logger.error(f"[{self.__class__.__name__}] responses sync error: {e}")
+            return {"error": True, "message": str(e), "status_code": 500}
+
+    def _handle_responses_stream(self, payload, api_key, api_base, timeout, model_name):
+        from models.openai import responses_adapter
+        try:
+            client = self._get_http_client()
+            events = client.responses(
+                api_key=api_key, api_base=api_base, timeout=timeout,
+                stream=True, **payload,
+            )
+            for chunk in responses_adapter.responses_stream_to_chat_chunks(events, model_name):
+                yield chunk
+        except OpenAIHTTPError as e:
+            logger.error(f"[{self.__class__.__name__}] responses stream error: "
+                         f"HTTP {e.status_code}: {e.message}")
+            yield {"error": True, "message": e.message, "status_code": e.status_code or 500}
+        except Exception as e:
+            logger.error(f"[{self.__class__.__name__}] responses stream error: {e}")
+            yield {"error": True, "message": str(e), "status_code": 500}
+
     def _get_http_client(self) -> OpenAIHTTPClient:
         """Build an HTTP client honoring the global proxy config.
 
@@ -341,7 +479,7 @@ class OpenAICompatibleBot:
                     for block in tool_results:
                         tool_call_id = block.get("tool_use_id") or ""
                         if not tool_call_id:
-                            logger.warning(f"[OpenAICompatible] tool_result missing tool_use_id, using empty string")
+                            logger.warning("[OpenAICompatible] tool_result missing tool_use_id, using empty string")
                         # Ensure content is a string (some providers require string content)
                         result_content = block.get("content", "")
                         if not isinstance(result_content, str):
@@ -425,15 +563,38 @@ class OpenAICompatibleBot:
             api_key = api_config.get("api_key", "")
             api_base = (api_config.get("api_base") or "https://api.openai.com/v1").rstrip("/")
 
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }]
+
+            from models.openai import responses_adapter
+            if responses_adapter.resolve_api_type(api_config.get("api_type")) == responses_adapter.API_TYPE_RESPONSES:
+                try:
+                    data = self._responses_as_chat_completion(
+                        model=vision_model, messages=messages, api_key=api_key,
+                        api_base=api_base, timeout=180,
+                    )
+                except OpenAIHTTPError as e:
+                    logger.error(f"[{self.__class__.__name__}] call_vision HTTP {e.status_code}: {e.message}")
+                    return {"error": True, "message": f"HTTP {e.status_code}: {e.message}"}
+                usage = data.get("usage", {})
+                return {
+                    "model": vision_model,
+                    "content": data["choices"][0]["message"].get("content") or "",
+                    "usage": {
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    },
+                }
+
             payload = {
                 "model": vision_model,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": question},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }],
+                "messages": messages,
             }
             headers = {
                 "Authorization": f"Bearer {api_key}",

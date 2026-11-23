@@ -10,7 +10,6 @@ Description:
 
 import http.client
 import json
-import time
 import requests
 import datetime
 import hashlib
@@ -20,6 +19,7 @@ import urllib.parse
 import uuid
 
 from common.log import logger
+from common.media_download import MAX_FILE_BYTES, MediaTooLargeError, save_response
 from common.tmp_dir import TmpDir
 
 
@@ -47,17 +47,21 @@ def text_to_speech_aliyun(url, text, appkey, token):
         "format": "wav"
     }
 
-    response = requests.post(url, headers=headers, data=json.dumps(data))
+    response = requests.post(url, headers=headers, data=json.dumps(data), timeout=(5, 60), stream=True)
 
     if response.status_code == 200 and response.headers['Content-Type'] == 'audio/mpeg':
-        output_file = TmpDir().path() + "reply-" + str(int(time.time())) + "-" + str(hash(text) & 0x7FFFFFFF) + ".wav"
+        output_file = TmpDir().path() + "reply-" + uuid.uuid4().hex + ".wav"
 
-        with open(output_file, 'wb') as file:
-            file.write(response.content)
+        try:
+            save_response(response, output_file, MAX_FILE_BYTES)
+        except MediaTooLargeError:
+            logger.debug(f"音频文件超出大小限制: over {MAX_FILE_BYTES} bytes")
+            return None
         logger.debug(f"音频文件保存成功，文件名：{output_file}")
     else:
         logger.debug("响应状态码: {}".format(response.status_code))
         logger.debug("响应内容: {}".format(response.text))
+        response.close()
         output_file = None
 
     return output_file
@@ -104,7 +108,7 @@ def speech_to_text_aliyun(url, audioContent, appkey, token):
         'Content-Length': len(audioContent)
         }
 
-    conn = http.client.HTTPSConnection(host)
+    conn = http.client.HTTPSConnection(host, timeout=60)
     conn.request(method='POST', url=request, body=audioContent, headers=httpHeaders)
 
     response = conn.getresponse()
@@ -207,10 +211,12 @@ class AliyunTokenGenerator:
         signature = self.sign_request(params)
         params['Signature'] = signature
 
-        # 构造请求URL
-        url = 'http://nls-meta.cn-shanghai.aliyuncs.com/?' + urllib.parse.urlencode(params)
+        # 构造请求URL：必须走https。该请求行里带着AccessKeyId和针对本次
+        # Timestamp/SignatureNonce算出的Signature，明文传输的话任何人截获后
+        # 原样重放就能换到Token，之后所有识别/合成请求的X-NLS-Token都是它。
+        url = 'https://nls-meta.cn-shanghai.aliyuncs.com/?' + urllib.parse.urlencode(params)
 
         # 发送请求
-        response = requests.get(url)
+        response = requests.get(url, timeout=(5, 60))
 
         return response.text

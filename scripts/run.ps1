@@ -530,33 +530,33 @@ function Add-ScriptsDirToPath {
 # Qwen, Doubao, Kimi, LinkAI, then Skip (11th option).
 # Each entry: Provider / default model name / config key field / optional base.
 $ModelChoices = @{
-    1  = @{ Provider = "DeepSeek";                Default = "deepseek-v4-flash";                   Field = "deepseek_api_key" }
-    2  = @{ Provider = "Claude";                  Default = "claude-opus-5";                       Field = "claude_api_key";    BaseField = "claude_api_base" }
-    3  = @{ Provider = "Gemini";                  Default = "gemini-3.1-pro-preview";              Field = "gemini_api_key";    BaseField = "gemini_api_base" }
-    4  = @{ Provider = "OpenAI";                  Default = "gpt-5.6-luna";                        Field = "open_ai_api_key";   BaseField = "open_ai_api_base" }
-    5  = @{ Provider = "MiniMax";                 Default = "MiniMax-M3";                          Field = "minimax_api_key" }
-    6  = @{ Provider = "GLM";                     Default = "glm-5.2";                             Field = "zhipu_ai_api_key" }
-    7  = @{ Provider = "Qwen (DashScope)";        Default = "qwen3.7-plus";                        Field = "dashscope_api_key" }
+    1  = @{ Provider = "DeepSeek";                Default = "deepseek-flash";                      Field = "deepseek_api_key" }
+    2  = @{ Provider = "Claude";                  Default = "claude-opus-5-5";                     Field = "claude_api_key";    BaseField = "claude_api_base" }
+    3  = @{ Provider = "Gemini";                  Default = "gemini-4-argon";                      Field = "gemini_api_key";    BaseField = "gemini_api_base" }
+    4  = @{ Provider = "OpenAI";                  Default = "gpt-6.2-sol";                         Field = "open_ai_api_key";   BaseField = "open_ai_api_base" }
+    5  = @{ Provider = "MiniMax";                 Default = "MiniMax-M3.1-Flash";                  Field = "minimax_api_key" }
+    6  = @{ Provider = "GLM";                     Default = "glm-5.3-flash";                       Field = "zhipu_ai_api_key" }
+    7  = @{ Provider = "Qwen (DashScope)";        Default = "qwen3.8-flash";                       Field = "dashscope_api_key" }
     8  = @{ Provider = "Doubao (Volcengine Ark)"; Default = "doubao-seed-2-1-pro-260628"; Field = "ark_api_key" }
-    9  = @{ Provider = "Kimi (Moonshot)";         Default = "kimi-k3";                             Field = "moonshot_api_key" }
-    10 = @{ Provider = "MiMo";                    Default = "mimo-v2.5-pro";                       Field = "mimo_api_key" }
-    11 = @{ Provider = "LinkAI";                  Default = "deepseek-v4-flash";                   Field = "linkai_api_key";    Linkai = $true }
+    9  = @{ Provider = "Kimi (Moonshot)";         Default = "kimi-k3.1-pro";                       Field = "moonshot_api_key" }
+    10 = @{ Provider = "MiMo";                    Default = "mimo-v2.6-pro";                       Field = "mimo_api_key" }
+    11 = @{ Provider = "LinkAI";                  Default = "deepseek-flash";                      Field = "linkai_api_key";    Linkai = $true }
 }
 
 function Select-Model {
     Write-Host ""
     $title = T "选择 AI 模型" "Select AI Model"
     $options = @(
-        "DeepSeek (deepseek-v4-flash, deepseek-v4-pro, etc.)",
-        "Claude (claude-opus-5, claude-sonnet-5, etc.)",
-        "Gemini (gemini-3.5-flash, gemini-3.1-pro-preview, etc.)",
-        "OpenAI (gpt-5.6-luna, etc.)",
-        "MiniMax (MiniMax-M3, etc.)",
-        "GLM (glm-5.2, etc.)",
-        "Qwen (qwen3.7-plus, qwen3.7-max, etc.)",
+        "DeepSeek (deepseek-flash, deepseek-v4-pro, etc.)",
+        "Claude (claude-opus-5-5, claude-sonnet-5-5, etc.)",
+        "Gemini (gemini-4-argon, gemini-3.8-flash, etc.)",
+        "OpenAI (gpt-6.2-sol, gpt-6.2-astra, etc.)",
+        "MiniMax (MiniMax-M3.1-Flash, MiniMax-M3, etc.)",
+        "GLM (glm-5.3-flash, glm-5.3, etc.)",
+        "Qwen (qwen3.8-flash, qwen3.8-max, etc.)",
         "Doubao (doubao-seed-2.1, etc.)",
-        "Kimi (kimi-k3, etc.)",
-        "MiMo (mimo-v2.5-pro, etc.)",
+        "Kimi (kimi-k3.1-pro, kimi-k3, etc.)",
+        "MiMo (mimo-v2.6-pro, etc.)",
         ("LinkAI (" + (T "一个 Key 接入所有模型" "access all models via one API") + ")"),
         (T "⏭  跳过（稍后在 Web 控制台配置）" "⏭  Skip (configure later in the web console)")
     )
@@ -642,7 +642,7 @@ function Configure-Channel {
             # Web (also the default when skipped). Default port, no prompt.
             $script:ChannelType = "web"
             $script:ChannelExtra["web_port"] = 9899
-            $script:AccessInfo = (T "Web 控制台地址" "Web console") + " : http://localhost:9899/chat"
+            $script:AccessInfo = (T "Web 控制台地址" "Web console") + " : http://localhost:9899/"
         }
         "weixin" {
             $script:ChannelType = "weixin"
@@ -746,9 +746,9 @@ function New-ConfigFile {
         linkai_api_key            = ""
         linkai_app_code           = ""
         agent                     = $true
-        agent_max_context_tokens  = 50000
-        agent_max_context_turns   = 20
-        agent_max_steps           = 20
+        agent_max_context_tokens  = 200000
+        agent_max_context_turns   = 30
+        agent_max_steps           = 100
         # New installs opt into self-evolution (matches run.sh).
         self_evolution_enabled    = $true
     }

@@ -1,0 +1,1215 @@
+/* Composer, attachments, context popover, drag-and-drop.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* Chat Input */
+/* Keep the placeholder on one line; ellipsize when the box is too narrow so it
+   never wraps and inflates the single-row height. Actual input can still wrap. */
+#chat-input::placeholder {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Attachment Preview Bar */
+/* Attachments sit on their own line at the top of the composer card, growing to
+   the full card width and scrolling horizontally so chips never wrap. */
+.attachment-preview {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0;
+    scrollbar-width: thin;
+}
+.attachment-preview::-webkit-scrollbar { height: 6px; }
+.attachment-preview::-webkit-scrollbar-thumb { background: rgb(var(--cw-slate-400) / 0.4); border-radius: 3px; }
+.attachment-preview.hidden { display: none; }
+
+/* ==========================================================================
+   Composer card
+   One rounded surface: attachments and text on top, session controls along the
+   bottom edge. The controls that used to sit above the input (workspace) and
+   inside it (optimize / mic) share that bottom row now, which is where working
+   agents put them - the box reads as "what you are about to send, and under
+   what settings".
+   The card is the positioning context for every popover inside it (slash,
+   mention, attach, workspace / permission / model menus), all of which open
+   upward from its top edge.
+   ========================================================================== */
+.composer-card {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    cursor: text;
+    padding: 10px 10px 8px;
+    border-radius: 18px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: rgb(var(--cw-slate-50));
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+.composer-card .attachment-preview,
+.composer-card .attach-menu,
+.composer-card .slash-menu,
+.composer-card .mention-menu,
+.composer-card .workspace-selector-menu,
+.composer-card .composer-menu {
+    cursor: default;
+}
+.composer-card:focus-within {
+    background: #fff;
+    border-color: rgb(var(--cw-primary-400));
+    box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0.12);
+}
+.dark .composer-card {
+    border-color: rgba(255, 255, 255, 0.12);
+    background: rgba(255, 255, 255, 0.04);
+}
+.dark .composer-card:focus-within {
+    background: rgba(255, 255, 255, 0.06);
+    border-color: rgb(var(--cw-primary-400));
+    box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0.14);
+}
+/* Drag-over highlight reuses the focus treatment. */
+.composer-card.drag-over { border-color: rgb(var(--cw-primary-400)); background: #fff; }
+
+.composer-textarea {
+    width: 100%;
+    min-height: 52px;
+    max-height: 220px;
+    padding: 2px 4px;
+    border: none;
+    background: transparent;
+    resize: none;
+    outline: none;
+    color: rgb(var(--cw-slate-800));
+    font-size: 14px;
+    line-height: 1.6;
+    overflow-y: hidden;
+}
+.composer-textarea::placeholder { color: rgb(var(--cw-slate-400)); }
+.dark .composer-textarea { color: rgb(var(--cw-slate-100)); }
+.dark .composer-textarea::placeholder { color: rgb(var(--cw-slate-500)); }
+
+.composer-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.composer-group {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
+}
+/* The left group owns the leftover width so its chips truncate instead of
+   pushing send off the card; the right group keeps its natural size. */
+.composer-group:first-child { flex: 1 1 auto; }
+.composer-group-end { flex: 0 0 auto; margin-left: auto; gap: 4px; }
+
+.composer-icon-btn {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: rgb(var(--cw-slate-400));
+    font-size: 14px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+.composer-icon-btn:hover { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.composer-icon-btn-warn:hover { background: #FEF3C7; color: #B45309; }
+.dark .composer-icon-btn:hover { background: rgb(var(--cw-primary-400) / 0.14); color: rgb(var(--cw-accent-ink)); }
+.dark .composer-icon-btn-warn:hover { background: rgba(245, 158, 11, 0.16); color: #FCD34D; }
+
+.composer-divider {
+    width: 1px;
+    height: 16px;
+    margin: 0 4px;
+    flex-shrink: 0;
+    background: rgb(var(--cw-slate-200));
+}
+.dark .composer-divider { background: rgba(255, 255, 255, 0.12); }
+
+.composer-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 168px;
+    min-width: 0;
+    padding: 4px 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    color: rgb(var(--cw-slate-500));
+    font-size: 12px;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+.composer-chip:hover { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.composer-chip.open { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); border-color: #BBF0CD; }
+.composer-chip > i { font-size: 11px; flex-shrink: 0; }
+.composer-chip-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.composer-chip-caret { font-size: 9px; opacity: 0.55; }
+/* Collapse a chip to just its icon (permission is always icon-only; the default
+   workspace collapses too). The name/state lives in the hover tooltip. */
+.composer-chip-icon-only .composer-chip-label,
+.composer-chip-icon-only .composer-chip-caret { display: none; }
+.dark .composer-chip { color: rgb(var(--cw-slate-400)); }
+.dark .composer-chip:hover,
+.dark .composer-chip.open { background: rgb(var(--cw-primary-400) / 0.14); color: rgb(var(--cw-accent-ink)); border-color: transparent; }
+
+/* Permission chip stays neutral like the other composer chips: the icon alone
+   distinguishes the mode, so an unrestricted session no longer shouts in a warm
+   colour. Only workspace-write keeps a subtle brand tint as the "safe default". */
+.composer-chip.perm-read-only { color: rgb(var(--cw-slate-500)); }
+.composer-chip.perm-workspace-write { color: rgb(var(--cw-slate-500)); }
+.composer-chip.perm-full-access { color: rgb(var(--cw-slate-500)); }
+.dark .composer-chip.perm-read-only { color: rgb(var(--cw-slate-400)); }
+.dark .composer-chip.perm-workspace-write { color: rgb(var(--cw-slate-400)); }
+.dark .composer-chip.perm-full-access { color: rgb(var(--cw-slate-400)); }
+
+/* Inline hint shown under a tool card that the permission gate refused.
+   Neutral, not alarming: it explains why nothing happened and offers the fix. */
+.perm-denied-hint {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 6px 0 10px;
+    padding: 8px 12px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 10px;
+    background: rgb(var(--cw-slate-50));
+    font-size: 13px;
+    color: rgb(var(--cw-slate-600));
+}
+.perm-denied-hint > i { font-size: 12px; color: rgb(var(--cw-slate-500)); flex-shrink: 0; }
+.perm-denied-text { flex: 1; min-width: 0; }
+.perm-denied-btn {
+    flex-shrink: 0;
+    padding: 4px 12px;
+    border: none;
+    border-radius: 8px;
+    background: rgb(var(--cw-primary-500));
+    color: #fff;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.12s ease;
+}
+.perm-denied-btn:hover { background: rgb(var(--cw-primary-600)); }
+.dark .perm-denied-hint {
+    border-color: rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.04);
+    color: rgb(var(--cw-slate-300));
+}
+.dark .perm-denied-hint > i { color: rgb(var(--cw-slate-400)); }
+
+.composer-send-btn {
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    border: none;
+    border-radius: 9px;
+    background: rgb(var(--cw-primary-400));
+    color: #fff;
+    cursor: pointer;
+    transition: background 0.12s ease, opacity 0.12s ease;
+}
+.composer-send-btn:hover:not(:disabled) { background: #35A55A; }
+.composer-send-btn:disabled { background: rgb(var(--cw-slate-300)); cursor: not-allowed; }
+.dark .composer-send-btn:disabled { background: rgb(var(--cw-slate-600)); }
+.composer-steer-btn {
+    background: transparent;
+    border: 1px solid #BBF0CD;
+    color: #35A55A;
+}
+.composer-steer-btn:hover:not(:disabled) { background: rgb(var(--cw-primary-50)); }
+.composer-steer-btn:disabled { background: transparent; border-color: rgb(var(--cw-slate-200)); color: rgb(var(--cw-slate-300)); }
+.dark .composer-steer-btn { border-color: rgb(var(--cw-primary-400) / 0.4); color: rgb(var(--cw-accent-ink)); }
+.dark .composer-steer-btn:hover:not(:disabled) { background: rgb(var(--cw-primary-400) / 0.14); }
+.dark .composer-steer-btn:disabled { border-color: rgba(255,255,255,0.12); color: rgb(var(--cw-slate-600)); }
+
+/* Compact attachment chips/thumbnails so adding one barely grows the card. */
+.composer-card .att-thumb { width: 34px; height: 34px; }
+.composer-card .att-chip { padding: 3px 24px 3px 8px; font-size: 11px; }
+.composer-card .att-remove { top: 1px; right: 1px; width: 15px; height: 15px; font-size: 8px; }
+.composer-card .att-chip .att-remove { top: 50%; right: 4px; transform: translateY(-50%); }
+
+/* Narrow viewports: chips keep their icon and drop the text label, so the row
+   still holds workspace / permission / model without wrapping. */
+@media (max-width: 640px) {
+    .composer-chip { max-width: none; padding: 4px 6px; }
+    .composer-chip-label { display: none; }
+    .composer-divider { margin: 0 2px; }
+}
+
+/* ==========================================================================
+   Composer popovers (permission + model), sharing the workspace menu's look
+   ========================================================================== */
+.composer-menu {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    width: 300px;
+    max-height: 380px;
+    overflow-y: auto;
+    padding: 6px;
+    border-radius: 12px;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.12), 0 2px 8px -2px rgba(0, 0, 0, 0.05);
+    z-index: 60;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.composer-menu.hidden { display: none; }
+.composer-menu-wide { width: 340px; left: auto; right: 0; }
+/* The Agent identity chip now sits on the far right of the toolbar, so its
+   menu is right-anchored to stay on-screen instead of overflowing left. */
+#composer-agent-menu { left: auto; right: 0; }
+/* The permission / model popups live at the card level, whose top edge is the
+   textarea - not the chip that opened them. Anchor them just above the toolbar
+   row instead, so they hug their trigger rather than floating over the input.
+   (The agent menu is nested in .composer-identity, so it keeps bottom:100%.) */
+#permission-selector-menu,
+#model-selector-menu {
+    bottom: calc(2rem + 14px);
+}
+.dark .composer-menu {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+.composer-menu-title {
+    padding: 6px 10px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgb(var(--cw-slate-400));
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.composer-menu-divider { height: 1px; margin: 5px 6px; background: #eef2f6; }
+.dark .composer-menu-divider { background: rgba(255, 255, 255, 0.08); }
+
+.composer-menu-item {
+    width: 100%;
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: rgb(var(--cw-slate-700));
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+}
+.composer-menu-item:hover { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.composer-menu-item.active { background: rgb(var(--cw-primary-50)); }
+/* Single-line Agent rows (avatar + name + trailing icon) center vertically;
+   only the multi-line permission rows need top alignment. */
+.composer-menu-item.agent-row { align-items: center; }
+.composer-menu-item.agent-row > i:last-child { margin-top: 0; }
+/* "Create Agent" row: a dashed circle stands in for the avatar so it lines up
+   with the Agent rows above while reading as an action, not a person. */
+.composer-menu-create-icon {
+    flex-shrink: 0;
+    width: 24px; height: 24px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 50%;
+    border: 1px dashed rgb(var(--cw-slate-300));
+    color: rgb(var(--cw-slate-400)); font-size: 11px;
+}
+.composer-menu-item.composer-menu-create:hover .composer-menu-create-icon {
+    border-color: rgb(var(--cw-primary-400)); color: rgb(var(--cw-primary-600));
+}
+.dark .composer-menu-create-icon { border-color: rgb(var(--cw-slate-600)); color: rgb(var(--cw-slate-400)); }
+.composer-menu-item > i:first-child {
+    width: 15px;
+    text-align: center;
+    color: rgb(var(--cw-slate-500));
+    flex-shrink: 0;
+    margin-top: 2px;
+}
+.composer-menu-item:hover > i:first-child { color: inherit; }
+.composer-menu-body { flex: 1; min-width: 0; }
+.composer-menu-name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.composer-menu-desc {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    line-height: 1.45;
+    color: rgb(var(--cw-slate-400));
+    white-space: normal;
+}
+.composer-menu-check { color: rgb(var(--cw-primary-600)); flex-shrink: 0; margin-top: 2px; }
+.dark .composer-menu-item { color: rgb(var(--cw-slate-300)); }
+.dark .composer-menu-item:hover,
+.dark .composer-menu-item.active { background: rgb(var(--cw-primary-400) / 0.14); color: rgb(var(--cw-accent-ink)); }
+.dark .composer-menu-desc { color: rgb(var(--cw-slate-500)); }
+.dark .composer-menu-check { color: rgb(var(--cw-accent-ink)); }
+/* A footnote at the bottom of the permission menu, for the one caveat that
+   belongs next to the choice: command interception is best effort. */
+.composer-menu-note {
+    padding: 6px 10px 4px;
+    font-size: 11px;
+    line-height: 1.5;
+    color: rgb(var(--cw-slate-400));
+}
+
+.attach-menu {
+    position: absolute;
+    left: 72px;
+    bottom: calc(100% + 6px);
+    min-width: 148px;
+    padding: 6px;
+    border-radius: 12px;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.1), 0 2px 8px -2px rgba(0, 0, 0, 0.04);
+    z-index: 55;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.attach-menu.hidden { display: none; }
+.attach-menu-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: rgb(var(--cw-slate-700));
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+}
+.attach-menu-item:hover {
+    background: rgb(var(--cw-primary-50));
+    color: rgb(var(--cw-primary-600));
+}
+.attach-menu-item i {
+    width: 14px;
+    text-align: center;
+    color: rgb(var(--cw-slate-500));
+}
+.attach-menu-item:hover i { color: inherit; }
+
+.att-thumb {
+    position: relative;
+    width: 64px; height: 64px;
+    border-radius: 8px;
+    overflow: hidden;
+    border: 1px solid rgb(var(--cw-slate-200));
+    flex-shrink: 0;
+}
+.dark .att-thumb { border-color: rgba(255,255,255,0.1); }
+.att-thumb img {
+    width: 100%; height: 100%;
+    object-fit: cover;
+}
+
+.att-chip {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 28px 6px 10px;
+    border-radius: 8px;
+    background: rgb(var(--cw-slate-100));
+    border: 1px solid rgb(var(--cw-slate-200));
+    font-size: 12px;
+    color: rgb(var(--cw-slate-600));
+    max-width: 180px;
+}
+.dark .att-chip { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: rgb(var(--cw-slate-400)); }
+.att-uploading { opacity: 0.6; pointer-events: none; }
+.att-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.att-remove {
+    position: absolute;
+    top: -4px; right: -4px;
+    width: 18px; height: 18px;
+    border-radius: 50%;
+    background: #ef4444;
+    color: #fff;
+    border: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.att-thumb:hover .att-remove,
+.att-chip:hover .att-remove { opacity: 1; }
+
+/* Drag-over highlight */
+.drag-over {
+    background: rgb(var(--cw-primary-400) / 0.08) !important;
+    border-color: rgb(var(--cw-primary-400)) !important;
+}
+
+/* User message attachments */
+.user-msg-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+.user-msg-image {
+    max-width: 200px;
+    max-height: 160px;
+    border-radius: 8px;
+    object-fit: cover;
+    cursor: pointer;
+}
+.user-msg-image:hover { opacity: 0.9; }
+.user-msg-file {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: rgba(255,255,255,0.15);
+    font-size: 12px;
+}
+.user-msg-file.is-openable {
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+.user-msg-file.is-openable:hover {
+    background: rgba(255,255,255,0.28);
+}
+
+/* Placeholder Cards */
+.placeholder-card {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.placeholder-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px -5px rgba(0, 0, 0, 0.1);
+}
+
+/* Slash Command Menu */
+.slash-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 320px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 12px;
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.1), 0 2px 8px -2px rgba(0, 0, 0, 0.04);
+    z-index: 50;
+    padding: 4px;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.slash-menu.hidden { display: none; }
+
+@keyframes slashMenuIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+.slash-menu-header {
+    padding: 6px 10px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgb(var(--cw-slate-400));
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.slash-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.12s ease;
+}
+.slash-menu-item:hover,
+.slash-menu-item.active {
+    background: rgb(var(--cw-primary-50));
+}
+.slash-menu-item .cmd {
+    font-size: 13px;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-700));
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+.slash-menu-item.active .cmd {
+    color: rgb(var(--cw-primary-600));
+}
+.slash-menu-item .desc {
+    font-size: 12px;
+    color: rgb(var(--cw-slate-400));
+    margin-left: 12px;
+    white-space: nowrap;
+}
+
+/* Dark mode */
+.dark .slash-menu {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.dark .slash-menu-header {
+    color: rgb(var(--cw-slate-500));
+}
+.dark .slash-menu-item:hover,
+.dark .slash-menu-item.active {
+    background: rgb(var(--cw-primary-400) / 0.1);
+}
+.dark .slash-menu-item .cmd {
+    color: rgb(var(--cw-slate-200));
+}
+.dark .slash-menu-item.active .cmd {
+    color: rgb(var(--cw-primary-400));
+}
+.dark .slash-menu-item .desc {
+    color: rgb(var(--cw-slate-500));
+}
+
+.dark .attach-menu {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.dark .attach-menu-item {
+    color: rgb(var(--cw-slate-200));
+}
+.dark .attach-menu-item i {
+    color: rgb(var(--cw-slate-400));
+}
+.dark .attach-menu-item:hover {
+    background: rgb(var(--cw-primary-400) / 0.1);
+    color: rgb(var(--cw-primary-400));
+}
+
+/* Context-usage popover on the clear-context button. A body-level fixed card
+   (like .cfg-tip-floating) that hosts an inline SVG donut, so it renders
+   regardless of the composer's overflow and only shows when data has loaded. */
+.ctx-usage-pop {
+    position: fixed;
+    width: 248px;
+    padding: 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    line-height: 1.4;
+    background: #ffffff;
+    color: rgb(var(--cw-slate-900));
+    border: 1px solid rgb(var(--cw-slate-200));
+    box-shadow: 0 12px 28px rgba(0,0,0,0.14);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s;
+    z-index: 9999;
+}
+.dark .ctx-usage-pop {
+    background: rgb(var(--cw-slate-800));
+    color: rgb(var(--cw-slate-100));
+    border-color: rgb(var(--cw-slate-700));
+}
+.ctx-usage-pop.show {
+    opacity: 1;
+}
+.ctx-usage-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+.ctx-usage-title {
+    font-weight: 600;
+}
+.ctx-usage-est {
+    font-size: 10px;
+    color: rgb(var(--cw-slate-500));
+}
+.dark .ctx-usage-est {
+    color: rgb(var(--cw-slate-400));
+}
+.ctx-usage-donut-wrap {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    margin-bottom: 8px;
+}
+.ctx-usage-donut-wrap svg {
+    display: block;
+}
+.ctx-usage-pct {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 14px;
+    font-weight: 600;
+}
+.ctx-usage-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    margin-bottom: 4px;
+}
+.ctx-usage-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+.ctx-usage-label {
+    flex: 1;
+    color: rgb(var(--cw-slate-600));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .ctx-usage-label {
+    color: rgb(var(--cw-slate-300));
+}
+.ctx-usage-val {
+    font-variant-numeric: tabular-nums;
+    color: rgb(var(--cw-slate-900));
+}
+.dark .ctx-usage-val {
+    color: rgb(var(--cw-slate-100));
+}
+.ctx-usage-foot {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgb(var(--cw-slate-200));
+    font-size: 10px;
+    color: rgb(var(--cw-slate-500));
+    font-variant-numeric: tabular-nums;
+}
+.dark .ctx-usage-foot {
+    border-top-color: rgb(var(--cw-slate-700));
+    color: rgb(var(--cw-slate-400));
+}
+.ctx-usage-empty {
+    color: rgb(var(--cw-slate-500));
+    text-align: center;
+    white-space: nowrap;
+}
+.dark .ctx-usage-empty {
+    color: rgb(var(--cw-slate-400));
+}
+/* Empty / error state: a single line, so the card hugs the text instead of
+   padding a fixed-width box around it. */
+.ctx-usage-pop--compact {
+    width: auto;
+    padding: 8px 12px;
+}
+
+/* Mini pie inside the composer button (replaces the trash icon once a session
+   has context). Sized to sit like an icon; inherits color for the empty ring. */
+.ctx-pie-mini {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    line-height: 0;
+}
+.ctx-pie-mini svg { display: block; }
+.ctx-pie-btn { position: relative; }
+
+/* The usage card is interactive now (buttons), so it must receive the pointer. */
+.ctx-usage-pop.show {
+    pointer-events: auto;
+}
+
+/* Action row at the bottom of the card. */
+.ctx-usage-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid rgb(var(--cw-slate-200));
+}
+.dark .ctx-usage-actions { border-top-color: rgb(var(--cw-slate-700)); }
+.ctx-act-btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 6px 4px;
+    font-size: 11px;
+    border-radius: 8px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: rgb(var(--cw-slate-50));
+    color: rgb(var(--cw-slate-700));
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s, color 0.12s;
+    white-space: nowrap;
+}
+.ctx-act-btn:hover {
+    background: #eef2f7;
+    border-color: rgb(var(--cw-slate-300));
+    color: rgb(var(--cw-slate-900));
+}
+.ctx-act-btn i { font-size: 11px; }
+.dark .ctx-act-btn {
+    background: rgba(255,255,255,0.04);
+    border-color: rgb(var(--cw-slate-700));
+    color: rgb(var(--cw-slate-300));
+}
+.dark .ctx-act-btn:hover {
+    background: rgba(255,255,255,0.08);
+    border-color: rgb(var(--cw-slate-600));
+    color: rgb(var(--cw-slate-100));
+}
+
+/* Loading overlay shown on the card while a synchronous compaction runs. */
+.ctx-usage-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.82);
+    color: rgb(var(--cw-slate-700));
+    font-size: 12px;
+    font-weight: 500;
+    backdrop-filter: blur(1px);
+}
+.dark .ctx-usage-loading {
+    background: rgb(var(--cw-slate-900) / 0.82);
+    color: rgb(var(--cw-slate-200));
+}
+.ctx-spinner {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 2px solid rgb(var(--cw-slate-500) / 0.35);
+    border-top-color: #10b981;
+    animation: ctx-spin 0.7s linear infinite;
+}
+@keyframes ctx-spin { to { transform: rotate(360deg); } }
+
+/* Composer input locked during compaction. */
+.ctx-input-locked {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* Brief highlight on the budget field when arriving from the "Budget" action. */
+.cfg-field-highlight {
+    border-color: #10b981 !important;
+    box-shadow: 0 0 0 3px rgba(16,185,129,0.25) !important;
+    transition: box-shadow 0.2s, border-color 0.2s;
+}
+
+/* Example cards: equal height via flex stretch + fixed 2-line description area */
+.example-card {
+    display: flex;
+    flex-direction: column;
+}
+.example-card > p {
+    flex: 1;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    min-height: 2.5em;  /* ~2 lines at text-sm leading-relaxed */
+}
+
+/* --------------------------------------------------------------------
+ * Voice pill — compact custom audio player used by mic uploads and TTS
+ * replies. Replaces the bulky native <audio controls> with a play/pause
+ * icon + thin progress bar + duration counter so it blends into chat
+ * bubbles without the chrome-grey browser default look.
+ * ------------------------------------------------------------------ */
+.voice-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 999px;
+    background: rgb(var(--cw-slate-900) / 0.05);
+    color: rgb(var(--cw-slate-600));
+    font-size: 12px;
+    line-height: 1;
+    max-width: 240px;
+    user-select: none;
+    cursor: default;
+}
+.dark .voice-pill {
+    background: rgba(255, 255, 255, 0.08);
+    color: rgb(var(--cw-slate-300));
+}
+.voice-pill[data-loading="1"] {
+    opacity: 0.65;
+}
+.voice-pill-btn {
+    width: 22px;
+    height: 22px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--color-primary-500, #2563eb);
+    color: #fff;
+    flex-shrink: 0;
+    cursor: pointer;
+    transition: transform 0.1s ease;
+}
+.voice-pill-btn:hover { transform: scale(1.05); }
+.voice-pill-btn i { font-size: 9px; margin-left: 1px; }
+.voice-pill-btn[data-state="play"] i { margin-left: 2px; }
+.voice-pill-btn[data-state="pause"] i { margin-left: 0; }
+.voice-pill-track {
+    flex: 1;
+    height: 3px;
+    border-radius: 999px;
+    background: rgb(var(--cw-slate-500) / 0.25);
+    overflow: hidden;
+    min-width: 70px;
+}
+.dark .voice-pill-track {
+    background: rgb(var(--cw-slate-400) / 0.25);
+}
+.voice-pill-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--color-primary-500, #2563eb);
+    border-radius: inherit;
+    transition: width 0.1s linear;
+}
+.voice-pill-time {
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    color: inherit;
+    opacity: 0.75;
+    flex-shrink: 0;
+    min-width: 28px;
+    text-align: right;
+}
+.voice-pill audio { display: none; }
+
+/* Send button toggles into a Stop button while an SSE stream is in flight.
+   Match the look of the disabled send button (light grey block + white
+   glyph) so it reads as the same visual element, just paused/idle from
+   sending perspective and clickable to stop. */
+#send-btn.send-btn-cancel {
+    background-color: rgb(203 213 225) !important; /* slate-300, == disabled send-btn */
+    color: white !important;
+}
+#send-btn.send-btn-cancel:hover {
+    background-color: rgb(148 163 184) !important; /* slate-400 */
+}
+#send-btn.send-btn-cancel:disabled {
+    background-color: rgb(226 232 240) !important; /* slate-200, while stop is in flight */
+    color: white !important;
+    cursor: progress;
+}
+.dark #send-btn.send-btn-cancel {
+    background-color: rgb(71 85 105) !important; /* slate-600, == dark disabled send-btn */
+    color: white !important;
+}
+.dark #send-btn.send-btn-cancel:hover {
+    background-color: rgb(100 116 139) !important; /* slate-500 */
+}
+.dark #send-btn.send-btn-cancel:disabled {
+    background-color: rgb(51 65 85) !important; /* slate-700 */
+    color: rgb(203 213 225) !important;
+}
+
+/* =====================================================================
+   Drag and Drop Overlay
+   ===================================================================== */
+/* Anchor the absolutely-positioned overlay to the chat view. */
+#view-chat {
+    position: relative;
+}
+
+.drag-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(59, 130, 246, 0.1);
+    backdrop-filter: blur(2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.drag-overlay.active {
+    opacity: 1;
+}
+
+.drag-overlay.hidden {
+    display: none;
+}
+
+.drag-overlay-content {
+    background: white;
+    border: 3px dashed #3b82f6;
+    border-radius: 16px;
+    padding: 3em 4em;
+    text-align: center;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+    animation: bounce 1s ease infinite;
+}
+
+.dark .drag-overlay-content {
+    background: rgb(var(--cw-slate-800));
+    border-color: #60a5fa;
+}
+
+.drag-overlay-content i {
+    font-size: 4em;
+    color: #3b82f6;
+    margin-bottom: 0.5em;
+}
+
+.dark .drag-overlay-content i {
+    color: #60a5fa;
+}
+
+.drag-overlay-content p {
+    font-size: 1.5em;
+    font-weight: 600;
+    color: rgb(var(--cw-slate-800));
+    margin: 0;
+}
+
+.dark .drag-overlay-content p {
+    color: rgb(var(--cw-slate-100));
+}
+
+@keyframes bounce {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-10px); }
+}
+
+/* =====================================================================
+   Message Action Buttons
+   ===================================================================== */
+.edit-msg-btn,
+.delete-msg-btn,
+.regenerate-msg-btn {
+    opacity: 0;
+    transition: opacity 0.2s, color 0.2s;
+}
+
+.user-message-group:hover .edit-msg-btn,
+.user-message-group:hover .delete-msg-btn,
+.bot-message-group:hover .regenerate-msg-btn {
+    opacity: 1;
+}
+
+.edit-msg-btn:hover,
+.regenerate-msg-btn:hover {
+    color: #3b82f6 !important;
+}
+
+.delete-msg-btn:hover {
+    color: #ef4444 !important;
+}
+
+.edit-msg-btn:disabled,
+.delete-msg-btn:disabled {
+    cursor: not-allowed !important;
+    opacity: 0.35 !important;
+}
+
+/* ==========================================================================
+   Message navigator
+   The header button drops a card listing the conversation's questions; the
+   one being read is highlighted, and picking one glides the view to it.
+   ========================================================================== */
+#timeline-toggle-btn.timeline-empty { display: none; }
+#timeline-toggle-btn.is-active { background: rgb(var(--cw-primary-400) / 0.12); }
+#timeline-toggle-btn.is-active i { color: rgb(var(--cw-primary-500)); }
+
+.chat-timeline-panel {
+    position: fixed;
+    z-index: 60;
+    width: 300px;
+    max-width: calc(100vw - 24px);
+    padding: 6px;
+    border-radius: 16px;
+    background: #ffffff;
+    border: 1px solid rgb(var(--cw-slate-900) / 0.06);
+    box-shadow: 0 12px 32px -8px rgb(var(--cw-slate-900) / 0.16), 0 2px 6px rgb(var(--cw-slate-900) / 0.04);
+    animation: timeline-panel-in 140ms ease-out;
+}
+.chat-timeline-panel.hidden { display: none; }
+.dark .chat-timeline-panel {
+    background: #242424;
+    border-color: rgba(255, 255, 255, 0.08);
+    box-shadow: 0 12px 32px -8px rgba(0, 0, 0, 0.6);
+}
+@keyframes timeline-panel-in {
+    from { opacity: 0; transform: translateY(2px) scale(0.98); }
+    to { opacity: 1; transform: none; }
+}
+
+.chat-timeline-list {
+    max-height: min(420px, 60vh);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+}
+.chat-timeline-list::-webkit-scrollbar { width: 4px; }
+.chat-timeline-list::-webkit-scrollbar-thumb { background: rgb(var(--cw-slate-400) / 0.4); border-radius: 2px; }
+
+.chat-timeline-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    padding: 8px 10px 8px 12px;
+    border-radius: 10px;
+    text-align: left;
+    font-size: 13px;
+    line-height: 1.35;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+}
+.chat-timeline-row:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-800)); }
+.chat-timeline-row.is-active { color: rgb(var(--cw-primary-500)); font-weight: 500; }
+.dark .chat-timeline-row { color: rgb(var(--cw-slate-400)); }
+.dark .chat-timeline-row:hover { background: rgba(255, 255, 255, 0.06); color: rgb(var(--cw-slate-100)); }
+.dark .chat-timeline-row.is-active { color: rgb(var(--cw-accent-ink)); }
+
+.chat-timeline-row-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.chat-timeline-row-dash {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 2px;
+    border-radius: 2px;
+    background: rgb(var(--cw-slate-300));
+    transition: width 150ms ease, background 150ms ease;
+}
+.chat-timeline-row:hover .chat-timeline-row-dash { background: rgb(var(--cw-slate-400)); }
+.chat-timeline-row.is-active .chat-timeline-row-dash { width: 14px; background: rgb(var(--cw-primary-400)); }
+.dark .chat-timeline-row-dash { background: rgba(255, 255, 255, 0.18); }
+.dark .chat-timeline-row.is-active .chat-timeline-row-dash { background: rgb(var(--cw-primary-400)); }
+
+/* Brief ring on the bubble a jump lands on. */
+.timeline-flash {
+    animation: timeline-flash-kf 1.6s ease;
+}
+@keyframes timeline-flash-kf {
+    0%, 40% { box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0.35); }
+    100% { box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0); }
+}
+
+/* Keep the browser's scroll anchor on the message list while content grows. */
+#chat-messages {
+    overflow-anchor: auto;
+}
+
+/* Skip rendering work for off-screen messages. Without this every frame (each
+   keystroke in the composer included) walks the whole conversation, so typing
+   lags in long sessions. `auto` remembers each bubble's real height once it has
+   been rendered; the length is only the estimate for never-rendered ones. */
+#chat-messages > .user-message-group,
+#chat-messages > .bot-message-group {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 400px;
+}
+/* Containment would trap the fixed-position fallback fullscreen inside the bubble. */
+#chat-messages > .bot-message-group:has(.mermaid-fullscreen) {
+    content-visibility: visible;
+}
+
+/* Right edge lines up with the composer card (px-4 gutter, max-w-3xl column). */
+.chat-scroll-to-bottom {
+    position: absolute;
+    z-index: 20;
+    right: max(16px, calc((100% - 768px) / 2));
+    bottom: calc(var(--chat-composer-height, 96px) + 12px);
+    display: flex;
+    width: 32px;
+    height: 32px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 9999px;
+    background: #fff;
+    color: rgb(var(--cw-slate-500));
+    font-size: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.chat-scroll-to-bottom.hidden {
+    display: none;
+}
+.chat-scroll-to-bottom:hover {
+    color: #16a34a;
+    transform: scale(1.05);
+}
+.chat-scroll-to-bottom:focus-visible {
+    outline: 2px solid rgb(var(--cw-primary-500));
+    outline-offset: 2px;
+}
+.dark .chat-scroll-to-bottom {
+    border-color: rgba(255, 255, 255, 0.15);
+    background: #2a2a2a;
+    color: rgb(var(--cw-slate-400));
+}
+.dark .chat-scroll-to-bottom:hover {
+    color: #4ade80;
+}

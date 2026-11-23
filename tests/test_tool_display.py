@@ -48,7 +48,7 @@ def _executor(tool):
     executor.agent = None
     executor.cancel_event = None
     executor._record_tool_result = lambda *a, **kw: None
-    executor._check_consecutive_failures = lambda *a, **kw: (False, None, False)
+    executor._check_consecutive_failures = lambda *a, **kw: (False, None, False, False)
     executor._emit_event = lambda kind, data: events.append((kind, data))
     return executor, events
 
@@ -98,7 +98,8 @@ def test_both_consoles_render_what_the_backend_sends():
     """The web console and the desktop app read the same stream. A field only
     one of them understands is a feature that exists on one client."""
     root = Path(__file__).parents[1]
-    web = (root / "channel/web/static/js/console.js").read_text(encoding="utf-8")
+    from conftest import console_js
+    web = console_js()
     desktop_store = (root / "desktop/src/renderer/src/store/chatStore.ts").read_text(encoding="utf-8")
     desktop_steps = (root / "desktop/src/renderer/src/components/MessageSteps.tsx").read_text(encoding="utf-8")
 

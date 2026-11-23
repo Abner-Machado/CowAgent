@@ -1,0 +1,74 @@
+name: Tests
+
+# Runs the full backend test suite on every push to master and on every PR.
+# Previously only a single file (test_bash_streaming.py) was exercised in CI;
+# the ~130-file suite never ran here, so regressions could slip past the
+# release pipeline. This workflow is the safety net for that gap.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install -r requirements.txt
+
+      - name: Run backend test suite
+        run: python -m pytest tests/ -q
+
+  lint:
+    name: ruff (F-class gate)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install ruff
+
+      - name: Run ruff (fatal on real-bug F-class violations, changed files only)
+        # F = pyflakes (unused imports, undefined names, dead code) — these are
+        # real defects and must stay green on the files this PR touches. The
+        # codebase carries thousands of legacy E/W/B (style/bugbear) violations
+        # and pre-existing F debt on master, so the gate is scoped to changed
+        # Python files instead of scanning the whole repo: that keeps new
+        # regressions out without forcing an unrelated codebase-wide cleanup.
+        # F403/F405 (star-imports) are an intentional re-export pattern.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          files=$(git diff --name-only "${BASE_SHA}" HEAD -- '*.py' || true)
+          if [ -z "$files" ]; then
+            echo "No Python files changed; skipping ruff."
+            exit 0
+          fi
+          ruff check $files --select F --ignore F403,F405

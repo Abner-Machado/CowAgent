@@ -18,17 +18,29 @@ Implementation note:
 import os
 import re
 import threading
-
-import requests
+import uuid
+from urllib.parse import urlparse
 
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel, check_prefix
 from channel.slack.slack_message import SlackMessage
+from common import state_dir
 from common.expired_dict import ExpiredDict
 from common.log import logger
+from common.markdown_fence import split_markdown
+from common.media_download import MAX_FILE_BYTES, download_to_file, remove_download
 from common.singleton import singleton
 from config import conf
+
+# send() runs on the shared reply thread; a stalled download must not block it.
+_MAX_REMOTE_FILE_SECONDS = 300
+
+
+# `message` event subtypes that carry something a user typed or shared; every other subtype
+# (bot_message, message_changed/deleted, channel_join/leave/topic/purpose/name, pinned_item, ...)
+# is Slack bookkeeping and must not be answered as a prompt.
+_USER_MESSAGE_SUBTYPES = (None, "file_share", "thread_broadcast", "me_message")
 
 
 @singleton
@@ -57,8 +69,8 @@ class SlackChannel(ChatChannel):
     # ------------------------------------------------------------------
 
     def startup(self):
-        self.bot_token = conf().get("slack_bot_token", "")
-        self.app_token = conf().get("slack_app_token", "")
+        self.bot_token = self.cfg("slack_bot_token", "")
+        self.app_token = self.cfg("slack_app_token", "")
         if not self.bot_token or not self.app_token:
             err = "[Slack] slack_bot_token and slack_app_token are both required"
             logger.error(err)
@@ -166,8 +178,9 @@ class SlackChannel(ChatChannel):
                 f"subtype={event.get('subtype')}, user={event.get('user')}, "
                 f"ts={event.get('ts')}, thread_ts={event.get('thread_ts')}"
             )
-            # Ignore bot messages (including our own) and message edits/deletes
-            if event.get("bot_id") or event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
+            # Ignore bot messages (including our own), edits/deletes and workspace notices
+            # (channel_join, channel_topic, pinned_item, ...): only ordinary user messages count
+            if event.get("bot_id") or event.get("subtype") not in _USER_MESSAGE_SUBTYPES:
                 return
             if event.get("user") == self.bot_user_id:
                 return
@@ -278,6 +291,8 @@ class SlackChannel(ChatChannel):
                 context["receiver"] = channel_id
                 context["slack_channel"] = channel_id
                 context["slack_thread_ts"] = thread_ts if is_group else None
+                from agent.team_addressing import stamp_speaker_from_channel
+                stamp_speaker_from_channel(self, context, slack_msg.content)
                 self.produce(context)
             logger.debug(f"[Slack] received: type={ctype}, content={str(slack_msg.content)[:80]}")
         except Exception as e:
@@ -290,8 +305,7 @@ class SlackChannel(ChatChannel):
             from bridge.bridge import Bridge
             agent_bridge = Bridge().get_agent_bridge()
             agent_id = agent_bridge.agent_router.resolve(
-                channel_type=self.channel_type,
-                conversation_ids=(session_id, channel_id),
+                explicit_agent_id=getattr(self, "bound_agent_id", "") or None,
             )
             scoped_session_id = agent_bridge._cancel_key(
                 agent_id, session_id, agent_bridge.agent_registry.default_agent_id
@@ -335,18 +349,14 @@ class SlackChannel(ChatChannel):
 
     def _download_file(self, url: str, name: str):
         """Download a Slack private file (requires bot token auth) to local tmp dir."""
+        safe_name = re.sub(r"[^\w.\-]", "_", name) or "file"
+        # A name alone is not unique across messages or users.
+        local_path = os.path.join(SlackMessage.get_tmp_dir(), f"slack_{uuid.uuid4().hex[:8]}_{safe_name}")
         try:
-            headers = {"Authorization": f"Bearer {self.bot_token}"}
-            resp = requests.get(url, headers=headers, timeout=60, stream=True)
-            resp.raise_for_status()
-            tmp_dir = SlackMessage.get_tmp_dir()
-            # Sanitize the name and keep it unique-ish via the url tail
-            safe_name = re.sub(r"[^\w.\-]", "_", name)
-            local_path = os.path.join(tmp_dir, safe_name)
-            with open(local_path, "wb") as fp:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        fp.write(chunk)
+            download_to_file(
+                url, local_path, MAX_FILE_BYTES, timeout=60,
+                headers={"Authorization": f"Bearer {self.bot_token}"},
+            )
             logger.debug(f"[Slack] downloaded {name} -> {local_path}")
             return local_path
         except Exception as e:
@@ -399,6 +409,7 @@ class SlackChannel(ChatChannel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
 
@@ -446,13 +457,18 @@ class SlackChannel(ChatChannel):
             logger.warning("[Slack] no slack_channel in context, drop reply")
             return
 
+        progress = {"sent": False}
         try:
-            self._do_send(reply, channel_id, thread_ts)
+            self._do_send(reply, channel_id, thread_ts, progress)
             logger.info(f"[Slack] sent reply (type={reply.type}, channel={channel_id})")
         except Exception as e:
             logger.error(f"[Slack] send failed: {e}", exc_info=True)
+            # chat_channel._send retries the whole reply: only worth it when nothing went out.
+            if not progress["sent"]:
+                raise
 
-    def _do_send(self, reply: Reply, channel_id: str, thread_ts):
+    def _do_send(self, reply: Reply, channel_id: str, thread_ts, progress: dict = None):
+        progress = {} if progress is None else progress
         rtype = reply.type
         content = reply.content
 
@@ -461,8 +477,9 @@ class SlackChannel(ChatChannel):
             if not text:
                 return
             # Slack caps a message around 40k chars; split conservatively
-            for chunk in _split_text(text, 3500):
+            for chunk in split_markdown(text, 3500):
                 self._client.chat_postMessage(channel=channel_id, text=chunk, thread_ts=thread_ts)
+                progress["sent"] = True
 
         elif rtype == ReplyType.IMAGE:
             # Already a local BytesIO; upload it directly
@@ -482,34 +499,28 @@ class SlackChannel(ChatChannel):
                 # Post the URL as text; Slack will unfurl it as an image preview
                 self._client.chat_postMessage(channel=channel_id, text=url, thread_ts=thread_ts)
 
-        elif rtype in (ReplyType.VOICE, ReplyType.FILE):
+        elif rtype in (ReplyType.VOICE, ReplyType.FILE, ReplyType.VIDEO):
             local = content[7:] if isinstance(content, str) and content.startswith("file://") else content
             caption = getattr(reply, "text_content", None) or None
-            self._client.files_upload_v2(
-                channel=channel_id, file=local, initial_comment=caption, thread_ts=thread_ts,
-            )
+            file_name = getattr(reply, "file_name", None) or None
+            downloaded = None
+            try:
+                if isinstance(local, str) and local.startswith(("http://", "https://")):
+                    # A file reply may carry an http(s) URL instead of a local path.
+                    url_path = urlparse(local).path
+                    downloaded = state_dir.tmp_file("slack_file", os.path.splitext(url_path)[1] or ".bin")
+                    download_to_file(local, downloaded, MAX_FILE_BYTES, timeout=60,
+                                     max_seconds=_MAX_REMOTE_FILE_SECONDS, guarded=True)
+                    # The published URL's last segment is a random hash, not the user's file name.
+                    file_name = file_name or os.path.basename(url_path)
+                    local = downloaded
+                self._client.files_upload_v2(
+                    channel=channel_id, file=local, filename=file_name,
+                    initial_comment=caption, thread_ts=thread_ts,
+                )
+            finally:
+                remove_download(downloaded)
 
         else:
             # Fallback: send as plain text
             self._client.chat_postMessage(channel=channel_id, text=str(content), thread_ts=thread_ts)
-
-
-def _split_text(text: str, limit: int):
-    """Split long text preferring line breaks to keep markdown structure intact."""
-    if len(text) <= limit:
-        yield text
-        return
-    buf = []
-    size = 0
-    for line in text.splitlines(keepends=True):
-        if size + len(line) > limit and buf:
-            yield "".join(buf)
-            buf, size = [], 0
-        # Hard-split single lines that exceed the limit
-        while len(line) > limit:
-            yield line[:limit]
-            line = line[limit:]
-        buf.append(line)
-        size += len(line)
-    if buf:
-        yield "".join(buf)

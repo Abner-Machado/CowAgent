@@ -2,25 +2,50 @@
 Background scheduler service for executing scheduled tasks
 """
 
-import time
+import inspect
 import threading
 from datetime import datetime, timedelta
 from typing import Callable, Optional
-from croniter import croniter
+
 from common.log import logger
+from agent.tools.scheduler.time_utils import (
+    format_scheduled_time,
+    next_cron_occurrence,
+    normalize_task_timestamps,
+    parse_scheduled_time,
+    scheduled_reference_time,
+    task_timezone,
+)
 
 
-def _parse_naive_local(iso_str: str) -> datetime:
-    """Parse an ISO datetime and coerce it to tz-naive local time.
+def _callable_accepts_two_positional(fn: Callable) -> bool:
+    """Return True if ``fn`` can be called with two positional args.
 
-    The scheduler uses ``datetime.now()`` (tz-naive) for all comparisons,
-    so any persisted timestamp must be normalized to the same flavor —
-    otherwise comparing naive vs aware raises TypeError.
+    Used to decide whether the execute callback accepts a ``trigger`` argument
+    in addition to the task, so we can forward it without breaking older
+    single-arg callbacks. Falls back to False if the signature can't be read.
     """
-    dt = datetime.fromisoformat(iso_str)
-    if dt.tzinfo is not None:
-        dt = dt.astimezone().replace(tzinfo=None)
-    return dt
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True
+    positional = [
+        p for p in params
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(positional) >= 2
+
+
+def _migrate_naive_timestamps(task: dict) -> dict:
+    """Normalize persisted scheduling timestamps for one scheduler read.
+
+    Aware values are converted to UTC. Naive values keep their historical
+    server-local meaning, unless the task explicitly declares an IANA timezone.
+    The store is not rewritten here so upgrading never mutates unrelated tasks.
+    """
+    return normalize_task_timestamps(task)
 
 
 class SchedulerService:
@@ -38,11 +63,21 @@ class SchedulerService:
         """
         self.task_store = task_store
         self.execute_callback = execute_callback
+        # Whether the callback declares a second positional slot for ``trigger``.
+        # Computed once so _execute_task can forward the run source without
+        # risking a TypeError-based misdetection at call time.
+        self._callback_accepts_trigger = _callable_accepts_two_positional(execute_callback)
         self.running = False
         self.thread = None
+        self._stop_event = None
+        self._wake_event = None
         self._lock = threading.Lock()
         self._execution_lock = threading.Lock()
         self._active_task_ids = set()
+        # When a run held the loop past a tick, its start time. The next tick
+        # uses it to tell an occurrence we swallowed from one that expired
+        # while the process was away; see _is_task_due.
+        self._blocked_from = None
     
     def start(self):
         """Start the scheduler service"""
@@ -52,7 +87,16 @@ class SchedulerService:
                 return
             
             self.running = True
-            self.thread = threading.Thread(target=self._run_loop, daemon=True)
+            # A fresh worker starts with no blocking run behind it, so an
+            # occurrence that expired before the restart stays expired.
+            self._blocked_from = None
+            # Each worker keeps its own stop signal so a restart cannot
+            # reactivate a previous worker still finishing a callback.
+            self._stop_event = threading.Event()
+            self._wake_event = threading.Event()
+            self.thread = threading.Thread(
+                target=self._run_loop, args=(self._stop_event, self._wake_event), daemon=True
+            )
             self.thread.start()
     
     def stop(self):
@@ -62,36 +106,64 @@ class SchedulerService:
                 return
             
             self.running = False
+            self._stop_event.set()
+            self._wake_event.set()
             if self.thread:
                 self.thread.join(timeout=5)
             logger.info("[Scheduler] Service stopped")
     
-    def _run_loop(self):
-        """Main scheduler loop"""
+    def _run_loop(self, stop_event, wake_event):
+        """Main scheduler loop. ``wake_event`` is the worker's own, like its
+        stop signal, and stop() sets it too."""
         logger.info("[Scheduler] Scheduler loop started")
         
-        while self.running:
+        while self.running and not stop_event.is_set():
+            # Cleared before the check, so a wake() during it brings the next one at once.
+            wake_event.clear()
             try:
                 self._check_and_execute_tasks()
             except Exception as e:
                 logger.error(f"[Scheduler] Error in scheduler loop: {e}")
 
-            time.sleep(30)
+            wake_event.wait(30)
+
+    def wake(self):
+        """Check for due tasks now instead of at the next tick, for a host
+        that only lets the process run for a moment when a task comes due."""
+        event = self._wake_event
+        if event is not None:
+            event.set()
     
     def _check_and_execute_tasks(self):
         """Check for due tasks and execute them"""
         now = datetime.now()
-        tasks = self.task_store.list_tasks(enabled_only=True)
-        
-        for task in tasks:
+        # Consume the window left by the previous tick: only the tick that
+        # follows a blocking run may rescue the occurrences it swallowed.
+        blocked_from = self._blocked_from
+        self._blocked_from = None
+        tasks = []
+        for raw_task in self.task_store.list_tasks(enabled_only=True):
             try:
-                if self._is_task_due(task, now):
+                tasks.append((_migrate_naive_timestamps(raw_task), raw_task))
+            except Exception as e:
+                logger.error(
+                    f"[Scheduler] Failed to normalize timestamps for task "
+                    f"{raw_task.get('id')}: {e}"
+                )
+        
+        for task, observed_task in tasks:
+            try:
+                if self._is_task_due(task, now, blocked_from):
                     logger.info(f"[Scheduler] Executing task: {task['id']} - {task['name']}")
                     if not self._claim_task(task['id']):
                         logger.info(
                             f"[Scheduler] Task {task['id']} is already running; skipping this tick"
                         )
                         continue
+                    # Tasks run inline, so this call holds the loop until it
+                    # returns; note when, for the next tick's catch-up.
+                    if self._blocked_from is None:
+                        self._blocked_from = datetime.now()
                     try:
                         ok = self._execute_task(task)
                     finally:
@@ -106,14 +178,19 @@ class SchedulerService:
                         continue
 
                     next_run = self._calculate_next_run(task, now)
+                    last_run_at = format_scheduled_time(scheduled_reference_time(task, now))
                     if next_run:
-                        self.task_store.update_task(task['id'], {
-                            "next_run_at": next_run.isoformat(),
-                            "last_run_at": now.isoformat()
-                        })
+                        self.task_store.finish_scheduled_run(
+                            task['id'], observed_task,
+                            {"next_run_at": format_scheduled_time(next_run)},
+                            last_run_at=last_run_at,
+                        )
                     else:
-                        self.task_store.delete_task(task['id'])
-                        logger.info(f"[Scheduler] One-time task completed and removed: {task['id']}")
+                        removed = self.task_store.finish_scheduled_run(
+                            task['id'], observed_task, None, last_run_at=last_run_at
+                        )
+                        if removed:
+                            logger.info(f"[Scheduler] One-time task completed and removed: {task['id']}")
             except Exception as e:
                 logger.error(f"[Scheduler] Error processing task {task.get('id')}: {e}")
 
@@ -131,19 +208,20 @@ class SchedulerService:
         task = self.task_store.get_task(task_id)
         if not task:
             raise ValueError(f"Task '{task_id}' not found")
+        task = _migrate_naive_timestamps(task)
         if not self._claim_task(task_id):
             raise RuntimeError(f"Task '{task_id}' is already running")
 
         def _run():
-            now = datetime.now()
+            now = scheduled_reference_time(task, datetime.now())
             try:
                 logger.info(f"[Scheduler] Manually executing task: {task_id} - {task.get('name', '')}")
-                ok = self._execute_task(task)
+                ok = self._execute_task(task, trigger="manual")
                 if ok:
                     self.task_store.update_task(task_id, {
-                        "last_run_at": now.isoformat(),
-                        "last_manual_run_at": now.isoformat(),
-                    })
+                        "last_run_at": format_scheduled_time(now),
+                        "last_manual_run_at": format_scheduled_time(now),
+                    }, missing_ok=True)
                     logger.info(f"[Scheduler] Manual execution completed: {task_id}")
                 else:
                     logger.warning(f"[Scheduler] Manual execution failed: {task_id}")
@@ -168,13 +246,17 @@ class SchedulerService:
         with self._execution_lock:
             self._active_task_ids.discard(task_id)
     
-    def _is_task_due(self, task: dict, now: datetime) -> bool:
+    def _is_task_due(self, task: dict, now: datetime, blocked_from=None) -> bool:
         """
         Check if a task is due to run
         
         Args:
             task: Task dictionary
             now: Current datetime
+            blocked_from: When the run that held the loop during the previous
+                tick started, if one did. Occurrences that became due after
+                that point are late because the loop was busy, not because the
+                process was away.
             
         Returns:
             True if task should run now
@@ -185,16 +267,17 @@ class SchedulerService:
             next_run = self._calculate_next_run(task, now)
             if next_run:
                 self.task_store.update_task(task['id'], {
-                    "next_run_at": next_run.isoformat()
+                    "next_run_at": format_scheduled_time(next_run)
                 })
                 return False
             return False
         
         try:
-            next_run = _parse_naive_local(next_run_str)
+            reference_now = scheduled_reference_time(task, now)
+            next_run = parse_scheduled_time(next_run_str, task_timezone(task))
 
-            if next_run < now:
-                time_diff = (now - next_run).total_seconds()
+            if next_run < reference_now:
+                time_diff = (reference_now - next_run).total_seconds()
                 schedule = task.get("schedule", {})
                 schedule_type = schedule.get("type")
 
@@ -202,6 +285,20 @@ class SchedulerService:
                 # scheduled tick. Beyond that we'd rather skip than push a
                 # stale daily report to the user.
                 if time_diff <= 600:
+                    return True
+
+                # The loop runs every task inline, so one long agent task holds
+                # every other occurrence until it returns. An occurrence that
+                # came due after that run started missed its tick because of
+                # us, not because the process was away: run it late instead of
+                # dropping it and rescheduling to the next occurrence.
+                if blocked_from is not None and next_run >= scheduled_reference_time(
+                    task, blocked_from
+                ):
+                    logger.info(
+                        f"[Scheduler] Task {task['id']} came due while another task "
+                        f"was running; running it {int(time_diff)}s late"
+                    )
                     return True
 
                 logger.warning(
@@ -217,12 +314,12 @@ class SchedulerService:
                 next_next_run = self._calculate_next_run(task, now)
                 if next_next_run:
                     self.task_store.update_task(task['id'], {
-                        "next_run_at": next_next_run.isoformat()
+                        "next_run_at": format_scheduled_time(next_next_run)
                     })
                     logger.info(f"[Scheduler] Rescheduled task {task['id']} to {next_next_run}")
                 return False
 
-            return now >= next_run
+            return reference_now >= next_run
         except Exception as e:
             logger.error(
                 f"[Scheduler] Failed to evaluate due-state for task "
@@ -243,7 +340,8 @@ class SchedulerService:
         """
         schedule = task.get("schedule", {})
         schedule_type = schedule.get("type")
-        
+        from_time = scheduled_reference_time(task, from_time)
+
         if schedule_type == "cron":
             # Cron expression
             expression = schedule.get("expression")
@@ -251,8 +349,9 @@ class SchedulerService:
                 return None
             
             try:
-                cron = croniter(expression, from_time)
-                return cron.get_next(datetime)
+                return next_cron_occurrence(
+                    expression, from_time, task_timezone(task)
+                )
             except Exception as e:
                 logger.error(f"[Scheduler] Invalid cron expression '{expression}': {e}")
                 return None
@@ -271,7 +370,7 @@ class SchedulerService:
                 return None
             
             try:
-                run_at = _parse_naive_local(run_at_str)
+                run_at = parse_scheduled_time(run_at_str, task_timezone(task))
                 if run_at > from_time:
                     return run_at
             except Exception as e:
@@ -283,9 +382,13 @@ class SchedulerService:
         
         return None
     
-    def _execute_task(self, task: dict) -> bool:
+    def _execute_task(self, task: dict, trigger: str = "scheduled") -> bool:
         """
         Execute a task.
+
+        ``trigger`` records how the run fired — ``"scheduled"`` for the timer
+        loop, ``"manual"`` for a user-initiated "run now" — and is forwarded to
+        the callback so run history can tell the two sources apart.
 
         Returns True if delivery succeeded (caller should advance state),
         False if it failed (caller should keep next_run_at so the next
@@ -293,12 +396,19 @@ class SchedulerService:
         behaviour, treated as success.
         """
         try:
-            result = self.execute_callback(task)
+            # Pass ``trigger`` only when the callback declares a slot for it, so
+            # older single-arg callbacks keep working. We inspect the signature
+            # (rather than catch TypeError) to avoid mistaking a TypeError raised
+            # *inside* the callback for an arity mismatch and re-running the task.
+            if self._callback_accepts_trigger:
+                result = self.execute_callback(task, trigger)
+            else:
+                result = self.execute_callback(task)
             return False if result is False else True
         except Exception as e:
             logger.error(f"[Scheduler] Error executing task {task['id']}: {e}")
             self.task_store.update_task(task['id'], {
                 "last_error": str(e),
                 "last_error_at": datetime.now().isoformat()
-            })
+            }, missing_ok=True)
             return False

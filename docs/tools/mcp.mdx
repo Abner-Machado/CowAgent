@@ -1,9 +1,24 @@
 ---
 title: MCP Tools
-description: Integrate external tool ecosystems via the Model Context Protocol
+description: "CowAgent supports the Model Context Protocol (MCP). Add servers in mcp.json or the console and the agent can call thousands of community MCP tools just like built-in ones."
 ---
 
 CowAgent supports the [Model Context Protocol (MCP)](https://modelcontextprotocol.io), allowing the Agent to directly invoke tens of thousands of community MCP tools. Configure `mcp.json` once and the tools are exposed to the LLM in exactly the same way as built-in tools — automatically selected and invoked.
+
+## Web and Desktop Console
+
+The **MCP Tools** section of the Capabilities page in the **web console** and **desktop app** can add, edit, disable, and remove MCP servers without editing `mcp.json` by hand.
+
+- **Form or JSON**: fill in the form, or paste a standard `mcpServers` config in JSON mode (several servers at once), for example `{"mcpServers":{"fetch":{"command":"uvx","args":["mcp-server-fetch"]}}}`.
+- **Test connection**: checks that each server is reachable and lists its tools. Saving runs the same check first; if it fails, fix the config or choose **Save anyway** (for servers that require authorization after saving).
+- **Storage**: written to the current Agent's `mcp.json`, in the same format as Claude Desktop / Cursor.
+- **Immediate effect**: changes apply from the next message, with no restart.
+
+stdio, SSE, and streamable HTTP transports are all supported. A disabled server stays in the file but is not booted.
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/mcp-config.png" alt="Add an MCP tool" width="800" />
+</Frame>
 
 ## Configuration File
 
@@ -38,6 +53,7 @@ Fully compatible with the MCP community standard, identical to Claude Desktop / 
 | `type` | Remote | Remote transport type: `sse` or `streamable-http` (defaults to `sse`) |
 | `headers` | No | Extra HTTP headers for remote requests (e.g. `Authorization`); Streamable HTTP only |
 | `scope` | No | OAuth scope, only for remote servers that require OAuth authorization (optional) |
+| `tool_name_prefix` | No | String prepended to this server's tool names in CowAgent, e.g. `myserver_`. Defaults to an empty string. Include any separator in the prefix. Use a unique prefix to avoid collisions with built-in tools or other servers. |
 | `disabled` | No | When `true`, this server is skipped — handy for temporary disabling |
 
 ### Full Example
@@ -63,6 +79,28 @@ Fully compatible with the MCP community standard, identical to Claude Desktop / 
 - **fetch**: Generic web page fetcher that returns page text content. No API key required.
 - **github**: Access GitHub repos, issues, PRs, etc. Requires a Personal Access Token.
 
+### Streamable HTTP with a Bearer Key
+
+For a remote server that authenticates with a static API key, set `type` explicitly — a remote URL without it falls back to `sse` — and pass the key in `headers`:
+
+```json
+{
+  "mcpServers": {
+    "my-remote-tools": {
+      "type": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_API_KEY"
+      }
+    }
+  }
+}
+```
+
+- Header values are sent literally: `${API_KEY}` is **not** expanded from the environment.
+- The key is stored as plain text, so keep `mcp.json` out of version control.
+- An `Authorization` header selects static authentication and skips the OAuth flow below, even when the value is wrong.
+
 ## Let the Agent Configure It for You
 
 CowAgent ships with `read` / `write` / `edit` tools, so **you can simply send the MCP config to the Agent and ask it to write the file**:
@@ -79,6 +117,10 @@ The Agent will:
 
 1. Read the existing MCP config and merge the new server entry, preserving existing ones
 2. Hot-reload the new MCP server, so the corresponding tools become available on the next message
+
+<Note>
+Commands in `mcp.json` start with the Agent process's privileges, so the Agent may only change `mcp.json` in a **full-access** session. Read-only and workspace-write sessions refuse it: switch the session's permission, or add the server from the console.
+</Note>
 
 ## Web Authorization (OAuth)
 

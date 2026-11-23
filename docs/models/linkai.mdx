@@ -1,6 +1,6 @@
 ---
 title: LinkAI
-description: Access text, vision, image, speech, and embedding capabilities through the LinkAI platform
+description: "Use one linkai_api_key on the LinkAI platform to reach models from OpenAI, Claude, Gemini, DeepSeek, Qwen, Kimi, Doubao and more for chat, vision, image generation, speech and embeddings."
 ---
 
 A single `linkai_api_key` gives you access to all capabilities of mainstream providers such as OpenAI, Claude, Gemini, DeepSeek, MiniMax, Qwen, Kimi, and Doubao.
@@ -21,10 +21,10 @@ A single `linkai_api_key` gives you access to all capabilities of mainstream pro
 | Parameter | Description |
 | --- | --- |
 | `use_linkai` | Set to `true` to enable |
-| `linkai_api_key` | Create one in the [Console](https://link-ai.tech/console/interface) |
-| `model` | Can be any code from the [model list](https://link-ai.tech/console/models) |
+| `linkai_api_key` | Create one in the [Console](https://link-ai.tech/console/interface?utm_source=cowagent&utm_medium=docs&utm_campaign=models-linkai) |
+| `model` | Can be any code from the [model list](https://link-ai.tech/console/models?utm_source=cowagent&utm_medium=docs&utm_campaign=models-linkai) |
 
-See [Model Service](https://link-ai.tech/console/models) for more.
+See [Model Service](https://link-ai.tech/console/models?utm_source=cowagent&utm_medium=docs&utm_campaign=models-linkai) for more.
 
 ## Image Understanding
 
@@ -40,7 +40,7 @@ Once configured, the Agent's Vision tool automatically calls multimodal models v
 }
 ```
 
-Available models: `gpt-4.1-mini`, `gpt-5.4-mini`, `qwen3.7-plus`, `doubao-seed-2-1-pro-260628`, `kimi-k2.6`, `claude-sonnet-5`, `claude-fable-5`, `gemini-3.1-flash-lite-preview`, etc.
+Available models: `gpt-4.1-mini`, `gpt-5.4-mini`, `qwen3.8-flash`, `qwen3.7-plus`, `doubao-seed-2-1-pro-260628`, `kimi-k2.6`, `claude-sonnet-5`, `claude-fable-5-1`, `claude-fable-5`, `gemini-3.1-flash-lite-preview`, etc.
 
 ## Image Generation
 
@@ -48,7 +48,7 @@ Available models: `gpt-4.1-mini`, `gpt-5.4-mini`, `qwen3.7-plus`, `doubao-seed-2
 {
   "skills": {
     "image-generation": {
-      "model": "gpt-image-2"
+      "model": "gpt-image-2.5-flare"
     }
   }
 }
@@ -56,6 +56,11 @@ Available models: `gpt-4.1-mini`, `gpt-5.4-mini`, `qwen3.7-plus`, `doubao-seed-2
 
 | Model ID | Alias |
 | --- | --- |
+| `gpt-image-2.5-flare` | OpenAI |
+| `gpt-image-2.5-sunburst` | OpenAI |
+| `gpt-image-2.6-flare` | OpenAI |
+| `gpt-image-2.6-sunburst` | OpenAI |
+| `gemini-nano-banana-2.1` | Nano Banana 2.1 |
 | `gpt-image-2` | OpenAI |
 | `gemini-3.1-flash-image-preview` | Nano Banana 2 |
 | `gemini-3-pro-image-preview` | Nano Banana Pro |
@@ -69,7 +74,7 @@ Available models: `gpt-4.1-mini`, `gpt-5.4-mini`, `qwen3.7-plus`, `doubao-seed-2
 }
 ```
 
-ASR uses Whisper by default; credentials are automatically reused from `linkai_api_key`.
+Credentials are automatically reused from `linkai_api_key`. Pick the recognition engine with `voice_to_text_model`: leave it empty for the gateway default, or set `doubao`, `whisper-1`, `baidu` or `deepseek-asr`.
 
 ## Text-to-Speech (TTS)
 
@@ -88,6 +93,7 @@ The TTS gateway supports multiple underlying engines. The engine is selected by 
 | `tts-1` | OpenAI · Multi-language (voices like `alloy` / `nova` / `echo`, etc.) |
 | `doubao` | ByteDance Doubao · Rich Chinese voices |
 | `baidu` | Baidu · Chinese broadcaster voices |
+| `deepseek-tts` | DeepSeek (voices `stella` / `tide`) |
 
 Voices differ by engine; we recommend selecting them visually in the Web Console under "Model Management → Text-to-Speech".
 

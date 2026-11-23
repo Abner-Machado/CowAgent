@@ -28,7 +28,7 @@ except ImportError:
     web_stub.seeother = lambda *args, **kwargs: Exception("seeother")
     sys.modules["web"] = web_stub
 
-from channel.web.web_channel import _log_bind_failure  # noqa: E402
+from channel.web.core._common import _log_bind_failure  # noqa: E402
 
 
 class _WinError(OSError):

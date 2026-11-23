@@ -13,6 +13,7 @@ import threading
 from typing import Optional, Callable, Any, List, Dict
 from pathlib import Path
 from datetime import datetime
+from common.atomic_write import write_text_atomic
 from common.log import logger
 
 
@@ -190,7 +191,6 @@ def _is_empty_sentinel(text: str) -> bool:
     return s == "" or s == "无" or s.lower() == "none"
 
 
-
 class MemoryFlushManager:
     """
     Manages memory flush operations.
@@ -215,7 +215,11 @@ class MemoryFlushManager:
         
         self.last_flush_timestamp: Optional[datetime] = None
         self._trim_flushed_hashes: set = set()  # Content hashes of already-flushed messages
+        self._trim_inflight_hashes: set = set()  # Content hashes dispatched but not yet settled
+        self._flush_hashes_lock = threading.Lock()  # Guards both hash sets
         self._last_flushed_content_hash: str = ""  # Content hash at last flush, for daily dedup
+        self._daily_flushed_hashes: set = set()  # Day-level hashes that have landed
+        self._daily_inflight_hashes: set = set()  # Day-level hashes dispatched, not yet settled
         self._last_dream_input_hash: str = ""  # "{date}:{daily_hash}" of last dream, for dedup
         self._last_flush_thread: Optional[threading.Thread] = None
     
@@ -262,6 +266,7 @@ class MemoryFlushManager:
         reason: str = "trim",
         max_messages: int = 0,
         context_summary_callback: Optional[Callable[[str], None]] = None,
+        daily_content_hash: Optional[str] = None,
     ) -> bool:
         """
         Asynchronously summarize and flush messages to daily memory.
@@ -269,12 +274,18 @@ class MemoryFlushManager:
         Deduplication runs synchronously, then LLM summarization + file write
         run in a background thread so the main reply flow is never blocked.
 
+        Messages are only recorded as flushed once their summary has actually
+        landed, so a flush that fails leaves them eligible for a later attempt.
+        While a flush is in flight its content hashes are claimed, which keeps a
+        second flush of the same messages from summarising them twice.
+
         If *context_summary_callback* is provided, it is called with the
         [DAILY] portion of the LLM summary once available. The caller can use
         this to inject the summary into the live message list for context
         continuity — one LLM call serves both disk persistence and in-context
         injection.
         """
+        claimed: list = []
         try:
             # Strip scheduler-injected pairs before any further processing.
             # These messages already serve as short-term context inside the
@@ -287,13 +298,16 @@ class MemoryFlushManager:
 
             import hashlib
             deduped = []
-            for m in messages:
-                text = self._extract_text_from_content(m.get("content", ""))
-                if not text or not text.strip():
-                    continue
-                h = hashlib.md5(text.encode("utf-8")).hexdigest()
-                if h not in self._trim_flushed_hashes:
-                    self._trim_flushed_hashes.add(h)
+            with self._flush_hashes_lock:
+                for m in messages:
+                    text = self._extract_text_from_content(m.get("content", ""))
+                    if not text or not text.strip():
+                        continue
+                    h = hashlib.md5(text.encode("utf-8")).hexdigest()
+                    if h in self._trim_flushed_hashes or h in self._trim_inflight_hashes:
+                        continue
+                    self._trim_inflight_hashes.add(h)
+                    claimed.append(h)
                     deduped.append(m)
             if not deduped:
                 return False
@@ -305,7 +319,8 @@ class MemoryFlushManager:
             thread = threading.Thread(
                 target=lambda: _ctx.run(
                     self._flush_worker,
-                    snapshot, user_id, reason, max_messages, context_summary_callback,
+                    snapshot, user_id, reason, max_messages, context_summary_callback, claimed,
+                    daily_content_hash,
                 ),
                 daemon=True,
             )
@@ -316,7 +331,17 @@ class MemoryFlushManager:
 
         except Exception as e:
             logger.warning(f"[MemoryFlush] Failed to dispatch flush (reason={reason}): {e}")
+            self._settle_flush_hashes(claimed, committed=False)
             return False
+
+    def _settle_flush_hashes(self, hashes: List[str], committed: bool):
+        """Record a finished flush's hashes, or release them so a later flush retries."""
+        if not hashes:
+            return
+        with self._flush_hashes_lock:
+            self._trim_inflight_hashes.difference_update(hashes)
+            if committed:
+                self._trim_flushed_hashes.update(hashes)
 
     def _flush_worker(
         self,
@@ -325,21 +350,39 @@ class MemoryFlushManager:
         reason: str,
         max_messages: int,
         context_summary_callback: Optional[Callable[[str], None]] = None,
+        claimed_hashes: Optional[List[str]] = None,
+        daily_content_hash: Optional[str] = None,
     ):
         """Background worker: summarize with LLM, write daily memory file."""
+        claimed_hashes = claimed_hashes or []
         try:
             raw_summary = self._summarize_messages(messages, max_messages)
+            if raw_summary is None:
+                logger.warning(f"[MemoryFlush] Summary unavailable, flush kept retryable (reason={reason})")
+                self._settle_flush_hashes(claimed_hashes, committed=False)
+                self._settle_daily_hash(daily_content_hash, committed=False)
+                return
             if _is_empty_sentinel(raw_summary):
                 logger.info(f"[MemoryFlush] No valuable content to flush (reason={reason})")
+                self._settle_flush_hashes(claimed_hashes, committed=True)
+                self._settle_daily_hash(daily_content_hash, committed=True)
                 return
 
             # Strip legacy [DAILY]/[MEMORY] markers if model still outputs them
             daily_part = self._clean_summary_output(raw_summary)
             if not daily_part:
+                self._settle_flush_hashes(claimed_hashes, committed=True)
+                self._settle_daily_hash(daily_content_hash, committed=True)
                 return
 
             # --- Write daily memory ---
-            self.write_daily_summary(daily_part, user_id=user_id, reason=reason)
+            if not self.write_daily_summary(daily_part, user_id=user_id, reason=reason):
+                self._settle_flush_hashes(claimed_hashes, committed=False)
+                self._settle_daily_hash(daily_content_hash, committed=False)
+                return
+
+            self._settle_flush_hashes(claimed_hashes, committed=True)
+            self._settle_daily_hash(daily_content_hash, committed=True)
 
             # --- Inject context summary into live messages (if callback provided) ---
             if context_summary_callback:
@@ -352,6 +395,8 @@ class MemoryFlushManager:
 
         except Exception as e:
             logger.warning(f"[MemoryFlush] Async flush failed (reason={reason}): {e}")
+            self._settle_flush_hashes(claimed_hashes, committed=False)
+            self._settle_daily_hash(daily_content_hash, committed=False)
 
     def write_daily_summary(
         self,
@@ -420,6 +465,14 @@ class MemoryFlushManager:
         """
         Generate end-of-day summary. Called by daily timer.
         Skips if messages haven't changed since last flush.
+
+        The day-level hash follows the same claim-then-commit rule the
+        per-message hashes use: it is claimed here so a second flush of the
+        same day cannot double-summarise, and committed by the worker only
+        once the summary has actually landed. Spending it on dispatch is what
+        made a failed flush lose the whole day -- the timer does not retry
+        within the day, and Deep Dream has nothing to distil from an empty
+        daily file.
         """
         import hashlib
         content = "".join(
@@ -427,16 +480,31 @@ class MemoryFlushManager:
             for m in messages
         )
         content_hash = hashlib.md5(content.encode("utf-8")).hexdigest()
-        if content_hash == self._last_flushed_content_hash:
-            logger.debug("[MemoryFlush] Daily summary skipped: no new content since last flush")
-            return False
-        self._last_flushed_content_hash = content_hash
-        return self.flush_from_messages(
+        with self._flush_hashes_lock:
+            if content_hash in self._daily_flushed_hashes or content_hash in self._daily_inflight_hashes:
+                logger.debug("[MemoryFlush] Daily summary skipped: no new content since last flush")
+                return False
+            self._daily_inflight_hashes.add(content_hash)
+        dispatched = self.flush_from_messages(
             messages=messages,
             user_id=user_id,
             reason="daily_summary",
             max_messages=0,
+            daily_content_hash=content_hash,
         )
+        if not dispatched:
+            self._settle_daily_hash(content_hash, committed=False)
+        return dispatched
+
+    def _settle_daily_hash(self, content_hash: Optional[str], committed: bool):
+        """Commit the day-level dedup hash, or release it so a retry can run."""
+        if not content_hash:
+            return
+        with self._flush_hashes_lock:
+            self._daily_inflight_hashes.discard(content_hash)
+            if committed:
+                self._daily_flushed_hashes.add(content_hash)
+                self._last_flushed_content_hash = content_hash
 
     # ---- Deep Dream (memory distillation) ----
 
@@ -557,7 +625,7 @@ class MemoryFlushManager:
         try:
             main_file = self.get_main_memory_file(user_id)
             old_size = len(memory_content)
-            main_file.write_text(new_memory + "\n", encoding="utf-8")
+            write_text_atomic(main_file, new_memory + "\n")
             logger.info(
                 f"[DeepDream] Updated MEMORY.md "
                 f"({old_size} → {len(new_memory)} chars)"
@@ -646,19 +714,18 @@ class MemoryFlushManager:
 
         today = datetime.now().strftime("%Y-%m-%d")
         diary_file = dreams_dir / f"{today}.md"
-        diary_file.write_text(
-            f"# Dream Diary: {today}\n\n{content}\n",
-            encoding="utf-8",
-        )
+        write_text_atomic(diary_file, f"# Dream Diary: {today}\n\n{content}\n")
         logger.info(f"[DeepDream] Wrote dream diary to {diary_file}")
 
     # ---- Internal helpers ----
     
-    def _summarize_messages(self, messages: List[Dict], max_messages: int = 0) -> str:
+    def _summarize_messages(self, messages: List[Dict], max_messages: int = 0) -> Optional[str]:
         """
         Summarize conversation messages using LLM.
-        Returns empty string if LLM deems content not worth recording.
-        Rule-based fallback only used when LLM call raises an exception.
+        Returns empty string if LLM deems content not worth recording, and
+        ``None`` if the LLM call failed and the fallback had nothing either.
+        Rule-based fallback only used when the LLM call raises an exception or
+        answers with no text at all.
         """
         conversation_text = self._format_conversation_for_summary(messages, max_messages)
         if not conversation_text.strip():
@@ -667,13 +734,19 @@ class MemoryFlushManager:
         if self.llm_model:
             try:
                 summary = self._call_llm_for_summary(conversation_text)
+                if not summary or not summary.strip():
+                    # Only the explicit "None"/"无" reply means nothing is worth
+                    # keeping. No text at all is a failed answer, e.g. a
+                    # thinking model that ran out of output budget.
+                    logger.warning("[MemoryFlush] LLM returned no summary text, using fallback")
+                    return self._extract_summary_fallback(messages, max_messages) or None
                 if not _is_empty_sentinel(summary):
                     return summary.strip()
                 logger.info("[MemoryFlush] LLM returned empty sentinel, skipping write")
                 return ""
             except Exception as e:
                 logger.warning(f"[MemoryFlush] LLM summarization failed, using fallback: {e}")
-                return self._extract_summary_fallback(messages, max_messages)
+                return self._extract_summary_fallback(messages, max_messages) or None
         else:
             logger.info("[MemoryFlush] No LLM model available, using rule-based fallback")
             return self._extract_summary_fallback(messages, max_messages)
@@ -744,10 +817,12 @@ class MemoryFlushManager:
         """Call LLM to generate a concise summary of the conversation."""
         from agent.protocol.models import LLMRequest
         
+        # No output cap, as in deep_dream: with thinking on, reasoning tokens
+        # count against max_tokens, and a small cap left no room for the
+        # summary itself. The prompt already asks for a concise record.
         request = LLMRequest(
             messages=[{"role": "user", "content": _summarize_user_prompt().format(conversation=conversation_text)}],
             temperature=0,
-            max_tokens=500,
             stream=False,
             system=_summarize_system_prompt(),
         )

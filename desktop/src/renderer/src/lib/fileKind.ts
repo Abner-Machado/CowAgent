@@ -37,6 +37,17 @@ export const PREVIEWABLE_KINDS: ReadonlySet<FileKind> = new Set<FileKind>([
   'html', 'markdown', 'image', 'video', 'audio', 'pdf', 'csv', 'code', 'text',
 ])
 
+// Kinds the panel offers an editor for. Mirrors EDITABLE_KINDS in
+// agent/protocol/artifact.py; the backend rejects anything else on save, and
+// also refuses a file that is too large or not valid UTF-8.
+export const EDITABLE_KINDS: ReadonlySet<FileKind> = new Set<FileKind>([
+  'html', 'markdown', 'csv', 'code', 'text',
+])
+
+export function isEditable(kind: FileKind): boolean {
+  return EDITABLE_KINDS.has(kind)
+}
+
 export function kindOf(name: string): FileKind {
   const ext = (name || '').split('.').pop()?.toLowerCase() || ''
   return KIND_BY_EXT[ext] || 'file'

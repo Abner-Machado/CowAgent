@@ -15,6 +15,21 @@ from config import conf, load_config
 from zai import ZhipuAiClient
 
 
+# GLM models that natively accept image input on the chat/completions endpoint.
+# glm-5.3-flash is multimodal (image understanding); the dedicated glm-5v-turbo
+# is only needed for text-only chat models (glm-5-turbo, glm-5.2, etc.).
+_VISION_CAPABLE_MODEL_PREFIXES = ("glm-5.3-flash", "glm-5v")
+
+# Fallback vision model for text-only main models that cannot see images.
+_DEFAULT_VISION_MODEL = "glm-5v-turbo"
+
+
+def _is_vision_capable_model(model_name: Optional[str]) -> bool:
+    """Whether the given GLM model can accept image input directly."""
+    name = (model_name or "").strip().lower()
+    return bool(name) and name.startswith(_VISION_CAPABLE_MODEL_PREFIXES)
+
+
 # ZhipuAI对话模型API
 class ZHIPUAIBot(Bot, ZhipuAIImage):
     def __init__(self):
@@ -154,10 +169,14 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                     model: Optional[str] = None,
                     max_tokens: int = 1000) -> dict:
         """Analyze an image using ZhipuAI OpenAI-compatible SDK.
-        Always uses glm-5v-turbo — the text models (glm-5-turbo etc.) do not support vision.
+
+        Multimodal chat models (e.g. glm-5.3-flash) accept image input directly,
+        so we honor the requested model when it is vision-capable. Text-only chat
+        models (glm-5-turbo, glm-5.2, etc.) fall back to the dedicated
+        glm-5v-turbo vision model.
         """
         try:
-            vision_model = "glm-5v-turbo"
+            vision_model = model if _is_vision_capable_model(model) else _DEFAULT_VISION_MODEL
             response = self.client.chat.completions.create(
                 model=vision_model,
                 max_tokens=max_tokens,
@@ -361,9 +380,23 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
         """Handle streaming ZhipuAI API response"""
         try:
             stream = self._create_completion(request_params)
+            stream_usage = None  # Provider-reported token usage
             
             # Stream chunks to caller, converting to OpenAI format
             for chunk in stream:
+                # ZhipuAI attaches usage to the final chunk (which may have an
+                # empty choices list) — capture it before the skip below.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    try:
+                        stream_usage = {
+                            "prompt_tokens": chunk_usage.prompt_tokens,
+                            "completion_tokens": chunk_usage.completion_tokens,
+                            "total_tokens": chunk_usage.total_tokens,
+                        }
+                    except AttributeError:
+                        pass
+
                 if not chunk.choices:
                     continue
                 
@@ -419,6 +452,11 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                     openai_chunk["choices"][0]["delta"]["tool_calls"] = openai_tool_calls
                 
                 yield openai_chunk
+
+            # Emit a trailing usage-only chunk so the agent can record a real
+            # prompt_tokens count for the context indicator.
+            if stream_usage is not None:
+                yield {"choices": [], "usage": stream_usage}
                 
         except Exception as e:
             logger.error(f"[ZHIPU_AI] stream response error: {e}")
@@ -482,6 +520,7 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                 # Check if this is a tool result message (user role with tool_result blocks)
                 if role == "user" and any(block.get("type") == "tool_result" for block in content):
                     # Convert each tool_result block to a separate tool message
+                    text_parts = []
                     for block in content:
                         if block.get("type") == "tool_result":
                             zhipu_messages.append({
@@ -489,6 +528,12 @@ class ZHIPUAIBot(Bot, ZhipuAIImage):
                                 "tool_call_id": block.get("tool_use_id"),
                                 "content": block.get("content", "")
                             })
+                        elif block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                    # Text next to tool results (e.g. a steering message sent
+                    # while tools ran) follows them as a user message.
+                    if text_parts:
+                        zhipu_messages.append({"role": "user", "content": "\n".join(text_parts)})
                 
                 # Check if this is an assistant message with tool_use blocks
                 elif role == "assistant":

@@ -1,6 +1,6 @@
 ---
 title: 钉钉
-description: 将 CowAgent 接入钉钉应用
+description: "将 CowAgent 接入钉钉：在钉钉开放平台创建应用并添加机器人能力，配置凭证后即可在单聊和群聊中与 Agent 对话，还可开启流式 Markdown 卡片回复。"
 ---
 
 通过钉钉开放平台创建智能机器人应用，将 CowAgent 接入钉钉。
@@ -14,6 +14,8 @@ description: 将 CowAgent 接入钉钉应用
 2. 点击添加应用能力，选择 **机器人** 能力，点击 **添加**：
 
 <img src="https://img-1317903499.cos.ap-guangzhou.myqcloud.com/docs/dingtalk-add-bot.png" width="800"/>
+
+> 可选：如需以流式 Markdown 卡片回复，在 **权限管理** 中申请 `Card.Instance.Write` 和 `Card.Streaming.Write` 两个权限，并在 `config.json` 中添加 `"dingtalk_card_enabled": true`。
 
 3. 配置机器人信息后点击 **发布**。发布后，点击 "**点击调试**"，会自动创建测试群聊，可在客户端查看：
 

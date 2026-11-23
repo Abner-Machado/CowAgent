@@ -4,7 +4,10 @@ Supports text files, images (jpg, png, gif, webp), and PDF files
 """
 
 import os
-from typing import Dict, Any
+import shlex
+import stat
+import sys
+from typing import Dict, Any, Optional
 from pathlib import Path
 
 from agent.tools.base_tool import BaseTool, ToolResult
@@ -14,6 +17,12 @@ from agent.tools.utils.truncate import truncate_head, format_size, DEFAULT_MAX_L
 from common.utils import expand_path
 
 EMPTY_FILE_NOTICE = "[File exists but is empty]"
+
+_IS_WIN = sys.platform == "win32"
+
+# PowerShell ends a single-quoted string at any of these, not only at the
+# ASCII apostrophe, and a doubled one stands for itself.
+_PS_SINGLE_QUOTES = "'\u2018\u2019\u201a\u201b"
 
 
 def split_lines(content: str) -> list:
@@ -74,6 +83,31 @@ def number_lines(text: str, start_line: int) -> str:
     """
     return '\n'.join(
         f"{start_line + i}|{line}" for i, line in enumerate(text.split('\n'))
+    )
+
+
+def _long_line_command(path: str, line_number: int) -> str:
+    """A bash tool command that prints up to DEFAULT_MAX_BYTES bytes of one line.
+
+    On Windows the bash tool runs cmd.exe, which has no tail or head, so the
+    line is read with PowerShell there. It writes raw bytes, so the console
+    code page does not matter, and it stops before a character the limit would
+    cut, so the output is valid UTF-8 and stays within the bash tool's limit.
+    """
+    if not _IS_WIN:
+        return f"tail -n +{line_number} -- {shlex.quote(path)} | head -c {DEFAULT_MAX_BYTES}"
+    literal = "'" + "".join(c * 2 if c in _PS_SINGLE_QUOTES else c for c in path) + "'"
+    if "%" in path:
+        # cmd.exe expands %NAME% even inside double quotes, so never hand it a %.
+        literal = "(" + literal.replace("%", "'+[char]37+'") + ")"
+    return (
+        'powershell -NoProfile -Command "'
+        f"$bytes = [Text.Encoding]::UTF8.GetBytes([string](Get-Content -LiteralPath {literal} -Encoding UTF8"
+        f" | Select-Object -Skip {line_number - 1} -First 1)); "
+        f"$end = [Math]::Min($bytes.Length, {DEFAULT_MAX_BYTES}); "
+        # Step back over UTF-8 continuation bytes so no character is cut.
+        "while ($end -lt $bytes.Length -and ($bytes[$end] -band 0xC0) -eq 0x80) { $end-- }; "
+        '[Console]::OpenStandardOutput().Write($bytes, 0, $end)"'
     )
 
 
@@ -148,7 +182,16 @@ class Read(BaseTool):
         
         # Resolve path
         absolute_path = self._resolve_path(path)
-        
+
+        # Reached only once the path already missed, so nothing that resolves
+        # today changes: a "knowledge/..." miss is retried under the shared
+        # root before giving up. Runs ahead of the credential check below so
+        # whatever is finally read is still screened by it.
+        if not os.path.exists(absolute_path):
+            shared_page = self._shared_knowledge_path(path)
+            if shared_page:
+                absolute_path = shared_page
+
         # Security check: block credential files and their aliases.
         # See issue #2913 (/proc/self/environ bypass) and #2863 (scope).
         if self._is_credential_path(absolute_path):
@@ -175,6 +218,15 @@ class Read(BaseTool):
                 f"Use the ls tool to list what is inside it."
             )
         
+        # A FIFO has size zero yet open/read waits indefinitely for a writer.
+        # Inspect the resolved target before dispatching to any content parser.
+        try:
+            mode = os.stat(absolute_path).st_mode
+        except OSError as exc:
+            return ToolResult.fail(f"Error inspecting file: {exc}")
+        if not stat.S_ISREG(mode):
+            return ToolResult.fail(f"Error: {path} is not a regular file")
+
         # Check if readable
         if not os.access(absolute_path, os.R_OK):
             return ToolResult.fail(f"Error: File is not readable: {path}")
@@ -206,6 +258,33 @@ class Read(BaseTool):
         # Read text file (with truncation for large files)
         return self._read_text(absolute_path, path, offset, limit)
     
+    def _shared_knowledge_path(self, path: str) -> Optional[str]:
+        """An existing knowledge page under the shared root, or None.
+
+        ``state_dir`` sends an Agent with no ``knowledge/`` of its own to the
+        shared root, which is outside the workspace relative paths resolve
+        against here. That is the spelling memory_search results and the links
+        in index.md use, so accept it rather than making the model translate
+        it. Anything else returns None, keeping this to one extra lookup on a
+        path that has already missed.
+        """
+        if os.path.isabs(path) or path.startswith('~'):
+            return None
+        parts = Path(path).parts
+        if len(parts) < 2 or parts[0] != 'knowledge':
+            return None
+        try:
+            from common import state_dir
+            root = os.path.realpath(str(state_dir.knowledge_dir(base=self.cwd)))
+        except Exception:
+            return None
+        candidate = os.path.realpath(os.path.join(root, *parts[1:]))
+        # "knowledge/../.." must not turn this into a general way to name files
+        # elsewhere; the fallback only ever means a page under the shared root.
+        if candidate != root and not candidate.startswith(root + os.sep):
+            return None
+        return candidate if os.path.exists(candidate) else None
+
     def _resolve_path(self, path: str) -> str:
         """
         Resolve path to absolute path
@@ -257,6 +336,13 @@ class Read(BaseTool):
         end_line = total_lines
         user_limited = False
         if limit is not None:
+            # limit=0 used to return an empty page with a "continue" hint that
+            # pointed back at the same line; a negative one sliced from the end.
+            if limit <= 0:
+                return None, (
+                    f"Error: limit must be a positive number of lines (got {limit}). "
+                    f"Omit limit to read the whole file, or pass limit=20 to read 20 lines."
+                )
             end_line = min(start_line + limit, total_lines)
             user_limited = True
 
@@ -270,7 +356,7 @@ class Read(BaseTool):
                 "content": (
                     f"[Line {start_display} is {size}, exceeds "
                     f"{format_size(DEFAULT_MAX_BYTES)} limit. Use bash tool to read: "
-                    f"head -c {DEFAULT_MAX_BYTES} {display_path} | tail -n +{start_display}]"
+                    f"{_long_line_command(expand_path(display_path), start_display)}]"
                 ),
                 "total_lines": total_lines,
                 "start_line": start_display,
@@ -438,7 +524,8 @@ class Read(BaseTool):
     
     def _read_office(self, absolute_path: str, display_path: str, file_ext: str,
                      offset: int = None, limit: int = None) -> ToolResult:
-        """Read Office documents (.docx, .xlsx, .pptx) using python-docx / openpyxl / python-pptx."""
+        """Read Office documents (.docx, .xlsx, .pptx) using python-docx / openpyxl / python-pptx;
+        Word and PowerPoint files fall back to the standard library without them."""
         try:
             text = self._extract_office_text(absolute_path, file_ext)
         except ImportError as e:
@@ -464,46 +551,28 @@ class Read(BaseTool):
     def _extract_office_text(absolute_path: str, file_ext: str) -> str:
         """Extract plain text from an Office document."""
         if file_ext in ('.docx', '.doc'):
-            try:
-                from docx import Document
-            except ImportError:
-                raise ImportError("Error: python-docx library not installed. Install with: pip install python-docx")
-            doc = Document(absolute_path)
-            paragraphs = [p.text for p in doc.paragraphs]
-            for table in doc.tables:
-                for row in table.rows:
-                    paragraphs.append('\t'.join(cell.text for cell in row.cells))
-            return '\n'.join(paragraphs)
+            from common.office_text import docx_blocks
+            return '\n'.join(docx_blocks(absolute_path))
 
         if file_ext in ('.xlsx', '.xls'):
             try:
                 from openpyxl import load_workbook
             except ImportError:
                 raise ImportError("Error: openpyxl library not installed. Install with: pip install openpyxl")
-            wb = load_workbook(absolute_path, read_only=True, data_only=True)
+            from common.office_text import spreadsheet_sheets
             parts = []
-            for ws in wb.worksheets:
-                parts.append(f"--- Sheet: {ws.title} ---")
-                for row in ws.iter_rows(values_only=True):
-                    parts.append('\t'.join(str(c) if c is not None else '' for c in row))
-            wb.close()
+            with spreadsheet_sheets(absolute_path, load_workbook) as sheets:
+                for name, rows in sheets:
+                    parts.append(f"--- Sheet: {name} ---")
+                    parts.extend('\t'.join(row) for row in rows)
             return '\n'.join(parts)
 
         if file_ext in ('.pptx', '.ppt'):
-            try:
-                from pptx import Presentation
-            except ImportError:
-                raise ImportError("Error: python-pptx library not installed. Install with: pip install python-pptx")
-            prs = Presentation(absolute_path)
+            from common.office_text import pptx_slides
             parts = []
-            for i, slide in enumerate(prs.slides, 1):
+            for i, lines in enumerate(pptx_slides(absolute_path), 1):
                 parts.append(f"--- Slide {i} ---")
-                for shape in slide.shapes:
-                    if shape.has_text_frame:
-                        for para in shape.text_frame.paragraphs:
-                            text = para.text.strip()
-                            if text:
-                                parts.append(text)
+                parts.extend(lines)
             return '\n'.join(parts)
 
         return ""

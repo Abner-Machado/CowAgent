@@ -8,7 +8,7 @@ import os
 import uuid
 
 from bridge.context import ContextType
-from channel.chat_message import ChatMessage
+from channel.chat_message import ChatMessage, safe_filename
 from channel.weixin.weixin_api import download_media_from_cdn, CDN_BASE_URL
 from common.log import logger
 from common import state_dir
@@ -133,20 +133,16 @@ class WeixinMessage(ChatMessage):
 
             def _download():
                 path = self._download_media(item, ITEM_VIDEO, cdn_base_url)
-                if path:
-                    self.content = path
+                self.content = path or ""
             self._prepare_fn = _download
 
         elif media_type == ITEM_FILE:
             self.ctype = ContextType.FILE
-            file_name = item.get("file_item", {}).get("file_name", f"wx_{self.msg_id}")
-            save_path = os.path.join(_get_tmp_dir(), file_name)
-            self.content = save_path
+            self.content = self._file_save_path(item)
 
             def _download():
                 path = self._download_media(item, ITEM_FILE, cdn_base_url)
-                if path:
-                    self.content = path
+                self.content = path or ""
             self._prepare_fn = _download
 
         elif media_type == ITEM_VOICE:
@@ -156,9 +152,24 @@ class WeixinMessage(ChatMessage):
 
             def _download():
                 path = self._download_media(item, ITEM_VOICE, cdn_base_url)
-                if path:
-                    self.content = path
+                self.content = path or ""
             self._prepare_fn = _download
+
+    def _file_save_path(self, item: dict) -> str:
+        """Give each attachment its own path with a bounded display basename."""
+        if getattr(self, "_file_download_path", None) is None:
+            name = safe_filename(item.get("file_item", {}).get("file_name")) or "file.bin"
+            prefix = f"wx_{uuid.uuid4().hex}_"
+            # Keep the component within Linux's byte limit, including the prefix.
+            budget = 255 - len(prefix)
+            if len(name.encode("utf-8")) > budget:
+                stem, ext = os.path.splitext(name)
+                if len(ext.encode("utf-8")) > budget:
+                    stem, ext = name, ""
+                stem = stem.encode("utf-8")[:budget - len(ext.encode("utf-8"))].decode("utf-8", errors="ignore")
+                name = stem + ext
+            self._file_download_path = os.path.join(_get_tmp_dir(), prefix + name)
+        return self._file_download_path
 
     def _download_media(self, item: dict, media_type: int, cdn_base_url: str) -> str:
         """Download media from CDN, returns local file path or empty string."""
@@ -181,11 +192,7 @@ class WeixinMessage(ChatMessage):
             return ""
 
         if media_type == ITEM_FILE:
-            original_name = info.get("file_name", "")
-            if original_name:
-                save_path = os.path.join(_get_tmp_dir(), original_name)
-            else:
-                save_path = os.path.join(_get_tmp_dir(), f"wx_{self.msg_id}.bin")
+            save_path = self._file_save_path(item)
         else:
             ext_map = {ITEM_IMAGE: ".jpg", ITEM_VIDEO: ".mp4", ITEM_VOICE: ".silk"}
             ext = ext_map.get(media_type, "")

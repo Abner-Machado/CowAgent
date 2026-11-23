@@ -5,13 +5,20 @@
  * ===================================================================== */
 
 const WS_WIDTH_KEY = 'cow_workspace_width';
-const WS_DEFAULT_WIDTH = 420;
 const WS_MIN_WIDTH = 280;
 
 // Panel state
 let wsPanelOpen = false;
 let wsActiveTab = 'preview';
 let wsCurrentFile = null;
+// Preview editor state. `wsEditBaseline` is the text area's own value as loaded,
+// so comparing against it tells whether anything actually changed;
+// `wsEditBaseMtime` is the timestamp the server checks to detect that the agent
+// rewrote the file mid-edit.
+let wsEditing = false;
+let wsEditBaseline = '';
+let wsEditBaseMtime = null;
+let wsSaving = false;
 // Set once the user closes the panel by hand: from then on we stop
 // auto-opening artifacts for the rest of the page session.
 let wsAutoOpenSuppressed = false;
@@ -69,6 +76,10 @@ const WS_PREVIEWABLE = new Set(
     ['html', 'markdown', 'image', 'video', 'audio', 'pdf', 'csv', 'code', 'text']
 );
 
+// Kinds the panel offers an editor for. Mirrors EDITABLE_KINDS in
+// agent/protocol/artifact.py; the server rejects anything else on save.
+const WS_EDITABLE = new Set(['html', 'markdown', 'csv', 'code', 'text']);
+
 function wsKindOf(name) {
     const ext = (name || '').split('.').pop().toLowerCase();
     return WS_EXT_KIND[ext] || 'file';
@@ -91,14 +102,19 @@ function wsFormatSize(bytes) {
 
 async function wsApi(path) {
     // Scope workspace reads to the current session so the file panel / @ picker /
-    // preview follow the session's opened project directory. `sessionId` is the
-    // global from console.js loaded on the same page.
+    // preview follow the session's opened project directory. `sessionId` and
+    // `activeAgentId` are globals from console.js on the same page.
     try {
-        const sid = (typeof sessionId !== 'undefined') ? sessionId : '';
-        if (sid && path.startsWith('/api/workspace/')) {
-            path += (path.includes('?') ? '&' : '?') + 'session=' + encodeURIComponent(sid);
+        if (path.startsWith('/api/workspace/')) {
+            const sid = (typeof sessionId !== 'undefined') ? sessionId : '';
+            if (sid) path += (path.includes('?') ? '&' : '?') + 'session=' + encodeURIComponent(sid);
+            // Without an opened project the root falls back to the Agent's own
+            // workspace, so the file panel must say which Agent is active — else
+            // it always shows the default Agent's directory.
+            const aid = (typeof activeAgentId !== 'undefined') ? activeAgentId : '';
+            if (aid) path += (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(aid);
         }
-    } catch (e) { /* sessionId not available yet */ }
+    } catch (e) { /* globals not available yet */ }
     const res = await fetch(path);
     const data = await res.json();
     if (data.status !== 'success') throw new Error(data.message || 'Request failed');
@@ -154,15 +170,30 @@ function switchWorkspaceTab(tab) {
 }
 
 function wsUpdateHeaderActions() {
-    const show = wsActiveTab === 'preview' && !!wsCurrentFile;
-    ['ws-btn-external', 'ws-btn-download', 'ws-btn-copy'].forEach(id => {
-        document.getElementById(id)?.classList.toggle('hidden', !show);
+    const onFile = wsActiveTab === 'preview' && !!wsCurrentFile;
+    // While editing, the viewer actions would act on the saved file rather than
+    // on what is in the text area, which reads as a bug. Hide them instead.
+    ['ws-btn-external', 'ws-btn-download'].forEach(id => {
+        document.getElementById(id)?.classList.toggle('hidden', !onFile || wsEditing);
+    });
+    document.getElementById('ws-btn-reveal')?.classList.toggle('hidden',
+        !onFile || wsEditing || !wsCanReveal() || !wsCurrentFile.abs_path);
+    // Only files a conversation produced have a place in the artifacts view.
+    document.getElementById('ws-btn-artifacts')
+        ?.classList.toggle('hidden', !onFile || wsEditing || !wsCurrentFile.artifact);
+    document.getElementById('ws-btn-edit')
+        ?.classList.toggle('hidden', !onFile || wsEditing || !wsIsEditable(wsCurrentFile));
+    ['ws-btn-save', 'ws-btn-edit-cancel'].forEach(id => {
+        document.getElementById(id)?.classList.toggle('hidden', !onFile || !wsEditing);
     });
 }
 
-function initWorkspaceResizer() {
-    const resizer = document.getElementById('ws-resizer');
-    const panel = document.getElementById('workspace-panel');
+/**
+ * Let a right-hand panel be widened by dragging the handle on its left edge.
+ * The width is remembered under `opts.key`; `opts.content` is the part that
+ * may hold an iframe, which would otherwise swallow the drag.
+ */
+function wsBindResizer(resizer, panel, opts) {
     if (!resizer || !panel) return;
 
     let startX = 0;
@@ -170,18 +201,18 @@ function initWorkspaceResizer() {
 
     function onMove(e) {
         const delta = startX - e.clientX;
-        const next = Math.max(WS_MIN_WIDTH, Math.min(window.innerWidth * 0.7, startWidth + delta));
+        const next = Math.max(opts.min, Math.min(opts.max(), startWidth + delta));
         panel.style.width = `${next}px`;
     }
 
     function onUp() {
         resizer.classList.remove('dragging');
         document.body.style.userSelect = '';
-        // The preview iframe swallows mousemove while dragging over it.
-        document.getElementById('ws-preview-content')?.style.removeProperty('pointer-events');
+        opts.content?.style.removeProperty('pointer-events');
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
-        localStorage.setItem(WS_WIDTH_KEY, String(parseInt(panel.style.width, 10) || WS_DEFAULT_WIDTH));
+        const width = parseInt(panel.style.width, 10);
+        if (width) localStorage.setItem(opts.key, String(width));
     }
 
     resizer.addEventListener('mousedown', (e) => {
@@ -190,9 +221,18 @@ function initWorkspaceResizer() {
         startWidth = panel.offsetWidth;
         resizer.classList.add('dragging');
         document.body.style.userSelect = 'none';
-        document.getElementById('ws-preview-content')?.style.setProperty('pointer-events', 'none');
+        opts.content?.style.setProperty('pointer-events', 'none');
         document.addEventListener('mousemove', onMove);
         document.addEventListener('mouseup', onUp);
+    });
+}
+
+function initWorkspaceResizer() {
+    wsBindResizer(document.getElementById('ws-resizer'), document.getElementById('workspace-panel'), {
+        key: WS_WIDTH_KEY,
+        min: WS_MIN_WIDTH,
+        max: () => window.innerWidth * 0.7,
+        content: document.getElementById('ws-preview-content'),
     });
 }
 
@@ -215,6 +255,9 @@ function wsSetPreviewEmpty(message, icon) {
  * @param {object|string} target - file metadata, or a path to resolve first.
  */
 async function openInPreview(target) {
+    // Opening another file replaces the editor, so settle unsaved edits first.
+    if (!wsGuardUnsaved(() => openInPreview(target))) return;
+
     let meta = target;
     if (typeof target === 'string') {
         try {
@@ -235,20 +278,34 @@ async function openInPreview(target) {
     }
 
     wsCurrentFile = meta;
+    wsEditing = false;
     openWorkspacePanel('preview');
     switchWorkspaceTab('preview');
-
-    const title = document.getElementById('ws-preview-title');
-    if (title) {
-        title.textContent = meta.path || meta.file_name || meta.name || '';
-        title.classList.remove('hidden');
-    }
+    wsRenderPreviewTitle();
     wsUpdateHeaderActions();
     await wsRenderPreview(meta);
 }
 
-async function wsRenderPreview(meta) {
-    const body = document.getElementById('ws-preview-content');
+/** Show the current file's path, marked with a dot while edits are unsaved. */
+function wsRenderPreviewTitle() {
+    const title = document.getElementById('ws-preview-title');
+    if (!title) return;
+    if (!wsCurrentFile) {
+        title.classList.add('hidden');
+        return;
+    }
+    const name = wsCurrentFile.path || wsCurrentFile.file_name || wsCurrentFile.name || '';
+    title.textContent = wsEditorDirty() ? `${name} •` : name;
+    title.classList.remove('hidden');
+}
+
+/**
+ * Render a file into the preview area.
+ * @param {HTMLElement} [target] - render here instead of the panel's preview
+ *   tab; the artifacts view reuses the same viewers this way.
+ */
+async function wsRenderPreview(meta, target) {
+    const body = target || document.getElementById('ws-preview-content');
     if (!body) return;
     const kind = meta.kind || wsKindOf(meta.file_name || meta.name || meta.path);
     const name = meta.file_name || meta.name || (meta.path || '').split('/').pop();
@@ -261,7 +318,7 @@ async function wsRenderPreview(meta) {
         // No allow-same-origin: the generated page runs in an opaque origin and
         // cannot reach the console's storage or auth cookie.
         frame.setAttribute('sandbox', 'allow-scripts allow-popups allow-forms allow-modals');
-        frame.src = previewUrl;
+        frame.src = instanceUrl(previewUrl);
         body.appendChild(frame);
         return;
     }
@@ -305,7 +362,14 @@ async function wsRenderPreview(meta) {
             }
             applyHighlighting(body);
         } catch (e) {
-            wsSetPreviewEmpty(t('ws_preview_failed') + ': ' + e.message, 'fa-triangle-exclamation');
+            if (target) {
+                body.innerHTML = `<div class="workspace-empty">
+                    <i class="fas fa-triangle-exclamation"></i>
+                    <span>${escapeHtml(t('ws_preview_failed') + ': ' + e.message)}</span>
+                </div>`;
+            } else {
+                wsSetPreviewEmpty(t('ws_preview_failed') + ': ' + e.message, 'fa-triangle-exclamation');
+            }
         }
         return;
     }
@@ -313,11 +377,10 @@ async function wsRenderPreview(meta) {
     // Unsupported type: offer a download instead of a broken viewer.
     body.innerHTML = `<div class="workspace-empty">
         <i class="${wsIconClass(kind)}"></i>
-        <span>${escapeHtml(name)}</span>
+        <span class="ws-empty-name">${escapeHtml(name)}</span>
         <span>${escapeHtml(t('ws_no_inline_preview'))}</span>
-        <a href="${escapeHtml(rawUrl)}" download="${escapeHtml(name)}"
-           class="file-card-btn" style="width:auto;padding:4px 12px;border:1px solid currentColor;">
-            <i class="fas fa-download"></i>&nbsp;${escapeHtml(t('ws_download'))}
+        <a href="${escapeHtml(rawUrl)}" download="${escapeHtml(name)}" class="ws-empty-action">
+            <i class="fas fa-download"></i><span>${escapeHtml(t('ws_download'))}</span>
         </a>
     </div>`;
 }
@@ -337,17 +400,250 @@ function downloadPreviewFile() {
     a.remove();
 }
 
-function copyPreviewPath() {
-    if (!wsCurrentFile) return;
-    const path = wsCurrentFile.abs_path || wsCurrentFile.path || '';
-    copyToClipboard(path).then(() => {
-        const btn = document.getElementById('ws-btn-copy');
-        const icon = btn && btn.querySelector('i');
-        if (icon) {
-            icon.className = 'fas fa-check';
-            setTimeout(() => { icon.className = 'fas fa-link'; }, 1500);
+/** Whether the server can open this machine's file manager for the user. */
+function wsCanReveal() {
+    return !!(typeof appConfig !== 'undefined' && appConfig && appConfig.can_reveal_files) && !instanceActive();
+}
+
+/** Show a file in the system file manager. Resolves when the OS was asked to. */
+function wsRevealPath(path) {
+    return fetch('/api/file/reveal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+    })
+        .then(r => r.json())
+        .then(data => {
+            if (data.status !== 'success') throw new Error(data.message || t('ws_reveal_failed'));
+        });
+}
+
+function revealPreviewFile() {
+    const path = wsCurrentFile && wsCurrentFile.abs_path;
+    if (!path) return;
+    wsRevealPath(path).catch(err => _wsToast(err.message || t('ws_reveal_failed')));
+}
+
+// =====================================================================
+// Preview editor
+// =====================================================================
+function wsIsEditable(meta) {
+    if (!meta || meta.is_dir) return false;
+    return WS_EDITABLE.has(meta.kind || wsKindOf(meta.file_name || meta.name || meta.path));
+}
+
+/**
+ * Path to send to the read/write API. The absolute path is unambiguous, which
+ * matters for files the panel reaches outside the session's workspace root
+ * (memory / knowledge assets while a project is open).
+ */
+function wsEditTargetPath(meta) {
+    return meta.abs_path || meta.path || meta.rel_path || '';
+}
+
+function wsEditorTextarea() {
+    return document.getElementById('ws-editor');
+}
+
+function wsEditorDirty() {
+    const ta = wsEditorTextarea();
+    return wsEditing && !!ta && ta.value !== wsEditBaseline;
+}
+
+/** Forget the editor's state, leaving what is on screen to the caller. */
+function wsDiscardEditState() {
+    wsEditing = false;
+    wsEditBaseline = '';
+    wsEditBaseMtime = null;
+}
+
+/**
+ * Gate an action that would throw away the editor's contents.
+ *
+ * @param {function} next - run once the user agrees to discard the edits, and
+ *   responsible for whatever replaces the editor. It runs with edit mode
+ *   already off, so it must not be a function that bails out when not editing.
+ * @returns {boolean} true when there is nothing to lose and the caller may
+ *   proceed immediately; false once the confirmation has been put on screen.
+ */
+function wsGuardUnsaved(next) {
+    if (!wsEditorDirty()) return true;
+    showConfirmDialog({
+        title: t('ws_edit_discard_title'),
+        message: t('ws_edit_discard_msg'),
+        okText: t('ws_edit_discard_ok'),
+        onConfirm: () => {
+            wsDiscardEditState();
+            next();
+        },
+    });
+    return false;
+}
+
+/**
+ * Why the server refused to make a file editable. Truncation is reported first:
+ * a partial read can also split a multi-byte character and so come back lossy,
+ * but the size is the reason the user needs to hear.
+ */
+function wsUneditableReason(data) {
+    if (data.truncated) return 'ws_edit_too_large';
+    if (data.lossy) return 'ws_edit_encoding';
+    return 'ws_edit_unsupported';
+}
+
+/** Load the file's current text into an editable text area. */
+async function startPreviewEdit() {
+    if (wsEditing || !wsIsEditable(wsCurrentFile)) return;
+    const target = wsCurrentFile;
+    const body = document.getElementById('ws-preview-content');
+    if (!body) return;
+    body.innerHTML = `<div class="workspace-empty"><i class="fas fa-spinner fa-spin"></i></div>`;
+
+    let data;
+    try {
+        data = await wsApi(`/api/workspace/read?path=${encodeURIComponent(wsEditTargetPath(target))}`);
+    } catch (e) {
+        _wsToast(`${t('ws_edit_load_failed')}: ${e.message}`);
+        await wsRenderPreview(target);
+        return;
+    }
+    // The user may have navigated away while the request was in flight.
+    if (wsCurrentFile !== target) return;
+    if (!data.editable) {
+        _wsToast(t(wsUneditableReason(data)));
+        await wsRenderPreview(target);
+        return;
+    }
+
+    wsEditing = true;
+    wsEditBaseMtime = data.mtime;
+    // Read the baseline back out of the text area rather than using the response
+    // text: a text area normalizes CRLF to LF in its value, so a CRLF file would
+    // compare as modified from the moment it loaded.
+    wsEditBaseline = wsMountEditor(body, data.content).value;
+    wsRenderPreviewTitle();
+    wsUpdateHeaderActions();
+}
+
+/** @returns {HTMLTextAreaElement} the text area now holding the file. */
+function wsMountEditor(body, content) {
+    body.innerHTML = '';
+    const ta = document.createElement('textarea');
+    ta.id = 'ws-editor';
+    ta.className = 'ws-editor';
+    ta.spellcheck = false;
+    ta.value = content;
+    body.appendChild(ta);
+
+    ta.addEventListener('input', wsRenderPreviewTitle);
+    ta.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+            // Save in place, the way an editor does. The Save button instead
+            // returns to the rendered preview.
+            e.preventDefault();
+            savePreviewEdit({ keepEditing: true });
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelPreviewEdit();
+        } else if (e.key === 'Tab') {
+            // Otherwise Tab leaves the text area, which is never what indenting
+            // a line of code is meant to do.
+            e.preventDefault();
+            wsInsertAtCursor(ta, '    ');
         }
     });
+    ta.focus();
+    return ta;
+}
+
+function wsInsertAtCursor(ta, text) {
+    const { selectionStart: start, selectionEnd: end } = ta;
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    ta.selectionStart = ta.selectionEnd = start + text.length;
+    wsRenderPreviewTitle();
+}
+
+/**
+ * Write the text area back to disk.
+ *
+ * @param {object} [opts]
+ * @param {boolean} [opts.keepEditing] - stay in the editor after saving.
+ * @param {boolean} [opts.force] - save even though the file changed on disk.
+ */
+async function savePreviewEdit(opts) {
+    const { keepEditing = false, force = false } = opts || {};
+    const ta = wsEditorTextarea();
+    if (!wsEditing || !wsCurrentFile || !ta) return;
+    // Ctrl+S bypasses the button's disabled state, and a second save sent
+    // before the first reply carries a stale mtime - which would come back as a
+    // conflict against our own write.
+    if (wsSaving) return;
+    // Writing an untouched file would bump its mtime for nothing.
+    if (!force && !wsEditorDirty()) {
+        if (!keepEditing) await wsExitEdit();
+        return;
+    }
+
+    const target = wsCurrentFile;
+    const content = ta.value;
+    const btn = document.getElementById('ws-btn-save');
+    wsSaving = true;
+    btn?.classList.add('ws-btn-busy');
+    try {
+        const res = await fetch('/api/workspace/write', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                path: wsEditTargetPath(target),
+                content: content,
+                session: (typeof sessionId !== 'undefined') ? sessionId : '',
+                expected_mtime: force ? null : wsEditBaseMtime,
+            }),
+        });
+        const data = await res.json();
+        if (data.code === 'conflict') {
+            showConfirmDialog({
+                title: t('ws_edit_conflict_title'),
+                message: t('ws_edit_conflict_msg'),
+                okText: t('ws_edit_overwrite'),
+                onConfirm: () => savePreviewEdit({ keepEditing: keepEditing, force: true }),
+            });
+            return;
+        }
+        if (data.status !== 'success') throw new Error(data.message || 'save failed');
+
+        wsEditBaseline = content;
+        wsEditBaseMtime = data.mtime;
+        target.size = data.size;
+        target.mtime = data.mtime;
+        _wsToast(t('ws_edit_saved'));
+        if (keepEditing) {
+            wsRenderPreviewTitle();
+        } else {
+            await wsExitEdit();
+        }
+    } catch (e) {
+        _wsToast(`${t('ws_edit_save_failed')}: ${e.message}`);
+    } finally {
+        wsSaving = false;
+        btn?.classList.remove('ws-btn-busy');
+    }
+}
+
+function cancelPreviewEdit() {
+    if (!wsEditing) return;
+    // Retry through wsExitEdit rather than through this function, which bails
+    // out on the very flag the guard clears before retrying.
+    if (!wsGuardUnsaved(wsExitEdit)) return;
+    wsExitEdit();
+}
+
+/** Leave edit mode and show the rendered preview again. */
+async function wsExitEdit() {
+    wsDiscardEditState();
+    wsRenderPreviewTitle();
+    wsUpdateHeaderActions();
+    if (wsCurrentFile) await wsRenderPreview(wsCurrentFile);
 }
 
 // =====================================================================
@@ -371,8 +667,12 @@ function renderFileCard(meta) {
         raw_url: meta.raw_url || '',
         preview_url: meta.preview_url || '',
         previewable: meta.previewable !== false && WS_PREVIEWABLE.has(kind),
+        artifact: true,
     }));
     const canPreview = meta.previewable !== false && WS_PREVIEWABLE.has(kind);
+    const btn = (action, tipKey, icon) =>
+        `<div class="file-card-btn" data-action="${action}" data-tip-key="${tipKey}" data-tip-float
+              data-tooltip="${escapeHtml(t(tipKey))}"><i class="fas ${icon}"></i></div>`;
     return `<div class="file-card" data-file='${payload}'>
         <i class="file-card-icon ${wsIconClass(kind)}"></i>
         <div class="file-card-info">
@@ -380,10 +680,19 @@ function renderFileCard(meta) {
             ${sub ? `<div class="file-card-sub">${escapeHtml(sub)}</div>` : ''}
         </div>
         <div class="file-card-actions">
-            ${canPreview ? `<div class="file-card-btn" data-action="preview" title="${escapeHtml(t('ws_preview'))}"><i class="fas fa-eye"></i></div>` : ''}
-            <div class="file-card-btn" data-action="download" title="${escapeHtml(t('ws_download'))}"><i class="fas fa-download"></i></div>
+            ${canPreview ? btn('preview', 'ws_preview', 'fa-eye') : ''}
+            ${btn('download', 'ws_download', 'fa-download')}
+            ${btn('artifacts', 'artifacts_view_in', 'fa-layer-group')}
         </div>
     </div>`;
+}
+
+/** The turn a message element belongs to: seq of the user message opening it. */
+function wsTurnSeqOf(el) {
+    let node = el && el.closest('.bot-message-group, .user-message-group');
+    while (node && !node.classList.contains('user-message-group')) node = node.previousElementSibling;
+    const seq = node ? parseInt(node.dataset.seq, 10) : NaN;
+    return Number.isNaN(seq) ? null : seq;
 }
 
 /** Append an artifact card to a live bot bubble and remember it for auto-open. */
@@ -396,7 +705,7 @@ function appendArtifactCard(container, item) {
     wrap.dataset.artifactPath = item.abs_path || '';
     wrap.innerHTML = renderFileCard(item);
     container.appendChild(wrap);
-    wsTurnArtifacts.push(item);
+    wsTurnArtifacts.push(Object.assign({ artifact: true }, item));
 }
 
 function resetTurnArtifacts() {
@@ -405,12 +714,13 @@ function resetTurnArtifacts() {
 
 /**
  * Auto-open policy: only when the turn produced exactly one previewable
- * artifact, and only while the user hasn't dismissed the panel by hand.
+ * artifact, only while the user hasn't dismissed the panel by hand, and never
+ * over an open editor - the file cards stay in the message either way.
  */
 function maybeAutoOpenArtifact() {
     const items = wsTurnArtifacts.filter(a => a.previewable);
     wsTurnArtifacts = [];
-    if (wsAutoOpenSuppressed || items.length !== 1) return;
+    if (wsAutoOpenSuppressed || wsEditing || items.length !== 1) return;
     openInPreview(items[0]);
 }
 
@@ -480,8 +790,15 @@ document.addEventListener('click', async (e) => {
     e.preventDefault();
     let meta;
     try { meta = JSON.parse(card.dataset.file); } catch (_) { return; }
+    // Where the card sits, so the artifacts view can attribute the file to
+    // this turn if it has to index it again.
+    meta.origin = { session_id: sessionId, agent_id: activeAgentId, turn_seq: wsTurnSeqOf(card) };
 
     const action = e.target.closest('[data-action]')?.dataset.action;
+    if (action === 'artifacts') {
+        openArtifactsFor(meta);
+        return;
+    }
     if (action === 'download') {
         if (meta.raw_url) {
             wsTriggerDownload(meta.raw_url, meta.file_name);
@@ -504,9 +821,11 @@ const WS_PATH_EXTS = Object.values(WS_KIND_BY_EXT).flat().join('|');
 // (websites/report.html) paths, always anchored on a known file extension and
 // containing at least one separator, which keeps prose like "see report.html"
 // from turning into chips. Excluding `:` and `/` before the match is what stops
-// the tail of an http(s) URL from being picked up.
+// the tail of an http(s) URL from being picked up. Excluding every path char
+// (CJK included) means a match only starts where a path-like run starts; else
+// each CJK char is a start and long Chinese paragraphs scan in quadratic time.
 const WS_PATH_RE = new RegExp(
-    '(^|[^\\w/\\\\.~:-])((?:~\\/|\\/|[A-Za-z]:\\\\)?(?:[\\w.\\-\\u4e00-\\u9fa5]+[\\/\\\\])+[\\w.\\-\\u4e00-\\u9fa5]+\\.(?:'
+    '(^|[^\\w/\\\\.~:\\-\\u4e00-\\u9fa5])((?:~\\/|\\/|[A-Za-z]:\\\\)?(?:[\\w.\\-\\u4e00-\\u9fa5]+[\\/\\\\])+[\\w.\\-\\u4e00-\\u9fa5]+\\.(?:'
     + WS_PATH_EXTS + '))(?=$|[^\\w.\\-\\u4e00-\\u9fa5]|$)',
     'gi'
 );
@@ -612,6 +931,14 @@ function refreshWorkspaceTree() {
     if (input) input.value = '';
     wsSearchMode = false;
     loadWorkspaceDir(wsCurrentDir);
+}
+
+/** Switching the active Agent moves the file panel's root to that Agent's own
+ *  workspace (when no project is open). Drop back to the root and reload, but
+ *  only if the panel is already open — never pop it open on a switch. */
+function resetWorkspaceToAgentRoot() {
+    wsCurrentDir = '';
+    if (wsPanelOpen) refreshWorkspaceTree();
 }
 
 async function loadWorkspaceDir(relPath) {
@@ -832,24 +1159,56 @@ function renderMentionMenu() {
         menu.classList.remove('hidden');
         return;
     }
-    menu.innerHTML = mentionItems.map((item, i) => `
-        <div class="mention-item ${i === mentionIndex ? 'active' : ''}" data-idx="${i}">
+    menu.innerHTML = mentionItems.map((item, i) => {
+        if (item.kind === 'agent') {
+            const face = typeof agentAvatarHTML === 'function'
+                ? agentAvatarHTML(item, 20)
+                : `<i class="fas fa-user"></i>`;
+            return `<div class="mention-item ${i === mentionIndex ? 'active' : ''}" data-idx="${i}">
+                ${face}
+                <span class="m-name">${escapeHtml(item.name)}</span>
+                <span class="m-path">${escapeHtml(item.id)}</span>
+            </div>`;
+        }
+        return `<div class="mention-item ${i === mentionIndex ? 'active' : ''}" data-idx="${i}">
             <i class="${wsIconClass(item.kind)}"></i>
             <span class="m-name">${escapeHtml(item.name)}</span>
             <span class="m-path">${escapeHtml(item.path)}</span>
-        </div>`).join('');
+        </div>`;
+    }).join('');
     menu.classList.remove('hidden');
 }
 
+function matchingAgentMentions(query) {
+    // @ addresses one Agent in particular, which only means something once a
+    // conversation has more than its owner. A solo chat keeps @ as the file
+    // picker it always was.
+    if (typeof sharedConversation !== 'function' || !sharedConversation()) return [];
+    const q = String(query || '').toLowerCase();
+    // The owner is offered alongside its teammates: in a group chat it is one
+    // voice among several, and @ is how the user picks it back out after a
+    // teammate has been speaking. sessionRoster() already lists it first.
+    const roster = typeof sessionRoster === 'function' ? sessionRoster() : [];
+    return roster
+        .filter(agent => !q || agent.id.toLowerCase().includes(q) || String(agent.name).toLowerCase().includes(q))
+        .slice(0, 6)
+        .map(agent => ({ kind: 'agent', id: agent.id, name: agent.name, avatar: agent.avatar || '' }));
+}
+
 async function updateMentionQuery(query) {
+    const agents = matchingAgentMentions(query);
     try {
         const data = await wsApi(`/api/workspace/search?q=${encodeURIComponent(query)}&limit=12`);
         if (!mentionActive) return;
-        mentionItems = data.results || [];
+        mentionItems = agents.concat(data.results || []);
         mentionIndex = 0;
         renderMentionMenu();
     } catch (_) {
-        hideMentionMenu();
+        if (!mentionActive) return;
+        mentionItems = agents;
+        mentionIndex = 0;
+        if (agents.length) renderMentionMenu();
+        else hideMentionMenu();
     }
 }
 
@@ -857,12 +1216,21 @@ function acceptMention(idx) {
     const item = mentionItems[idx];
     const input = document.getElementById('chat-input');
     if (!item || !input) return;
-    addWorkspaceRefAttachment(item);
-    // Drop the "@query" fragment: the file travels as an attachment, not as text.
     const before = input.value.slice(0, mentionStart);
     const after = input.value.slice(input.selectionStart);
-    input.value = before + after;
-    input.selectionStart = input.selectionEnd = before.length;
+    if (item.kind === 'agent') {
+        // Write the name, not the id: the mention is addressed to a colleague
+        // and should read like one. The server resolves either form.
+        const inserted = `@${item.name || item.id} `;
+        input.value = before + inserted + after;
+        input.selectionStart = input.selectionEnd = before.length + inserted.length;
+        if (typeof addTeamMember === 'function') addTeamMember(item.id);
+    } else {
+        addWorkspaceRefAttachment(item);
+        // Drop the "@query" fragment: the file travels as an attachment, not as text.
+        input.value = before + after;
+        input.selectionStart = input.selectionEnd = before.length;
+    }
     hideMentionMenu();
     input.focus();
     input.dispatchEvent(new Event('input'));
@@ -944,6 +1312,8 @@ function wsOnSessionSwitch() {
     wsSearchMode = false;
     wsCurrentFile = null;
     wsTurnArtifacts = [];
+    wsDiscardEditState();
+    wsUpdateHeaderActions();
     if (!wsPanelOpen) return;
     if (wsActiveTab === 'files') {
         loadWorkspaceDir('');
@@ -961,6 +1331,13 @@ function initWorkspacePanel() {
     initWorkspaceDropTarget();
     initMention();
     wsSetPreviewEmpty(t('ws_preview_empty'));
+
+    // Reloading or closing the tab would drop an open editor's changes silently.
+    window.addEventListener('beforeunload', (e) => {
+        if (!wsEditorDirty()) return;
+        e.preventDefault();
+        e.returnValue = '';
+    });
 
     // The panel belongs to the chat view only; follow view switches.
     const toggle = document.getElementById('workspace-toggle-btn');

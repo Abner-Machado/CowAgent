@@ -96,6 +96,9 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
   }
 
   const selectProject = async (projectDir: string | null) => {
+    // Re-scoping the panel closes any open editor, so settle it here, while the
+    // binding has not been committed yet and declining can still stop it.
+    if (!(await useWorkspaceStore.getState().guardUnsavedEdit())) return
     setOpenMenu(null)
     setBusy(true)
     try {
@@ -132,6 +135,7 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
       setNewError(t('ws_sel_name_no_slash'))
       return
     }
+    if (!(await useWorkspaceStore.getState().guardUnsavedEdit())) return
     setBusy(true)
     try {
       const res = await apiClient.createProject(sessionId, name)
@@ -163,8 +167,10 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
               : 'text-content-secondary hover:text-accent hover:bg-accent-soft'
           }`}
         >
-          <FolderOpen size={13} className="shrink-0" />
-          <span className="composer-chip-label truncate">{label}</span>
+          <FolderOpen size={15} className="shrink-0 relative top-px" />
+          {/* The default workspace is the implicit state, so the label there is
+              just clutter — show the icon alone and only name a real project. */}
+          {current && <span className="composer-chip-label truncate">{label}</span>}
           <ChevronDown size={11} className="opacity-60 shrink-0" />
         </button>
       </Tooltip>
@@ -215,13 +221,16 @@ const WorkspaceSelector: React.FC<WorkspaceSelectorProps> = ({ sessionId }) => {
 
           {/* Divider between the project list and the open/new-project actions. */}
           <div className="my-1 mx-1.5 border-t border-default" />
-          <button
-            onClick={openProject}
-            className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left cursor-pointer transition-colors hover:bg-surface-2 text-content"
-          >
-            <FolderOpen size={14} className="shrink-0 text-content-tertiary" />
-            <span className="flex-1 min-w-0 text-[13px] truncate">{t('ws_sel_open')}</span>
-          </button>
+          {/* The folder picker browses this computer, not the instance being driven. */}
+          {!apiClient.isRemote() && (
+            <button
+              onClick={openProject}
+              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left cursor-pointer transition-colors hover:bg-surface-2 text-content"
+            >
+              <FolderOpen size={14} className="shrink-0 text-content-tertiary" />
+              <span className="flex-1 min-w-0 text-[13px] truncate">{t('ws_sel_open')}</span>
+            </button>
+          )}
           <button
             onClick={openNewDialog}
             className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left cursor-pointer transition-colors hover:bg-surface-2 text-content"

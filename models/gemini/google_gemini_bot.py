@@ -22,7 +22,85 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from config import conf
 from models.chatgpt.chat_gpt_session import ChatGPTSession
-from models.baidu.baidu_wenxin_session import BaiduWenxinSession
+
+
+def _completion_tokens(usage_meta: dict) -> int:
+    """Output tokens of a Gemini usageMetadata: the answer plus the thinking tokens.
+
+    Gemini reports thinking tokens in thoughtsTokenCount, apart from candidatesTokenCount,
+    but bills them as output.
+    """
+    return (usage_meta.get("candidatesTokenCount") or 0) + (usage_meta.get("thoughtsTokenCount") or 0)
+
+
+def _openai_usage(usage_meta) -> dict:
+    """Map a Gemini usageMetadata to the OpenAI usage shape the agent reads.
+
+    Returns {} when Gemini reported none, so the caller falls back to estimating.
+    """
+    if not isinstance(usage_meta, dict) or not usage_meta:
+        return {}
+    return {
+        "prompt_tokens": usage_meta.get("promptTokenCount", 0),
+        "completion_tokens": _completion_tokens(usage_meta),
+        "total_tokens": usage_meta.get("totalTokenCount", 0),
+    }
+
+
+_THINKING_LEVEL_MODELS = ("gemini-4",)
+_THINKING_LEVELS = ("low", "medium", "high")
+
+# Gemini names the stop cause in its own vocabulary. The agent reads the OpenAI
+# name instead: a turn that returns text and no tool calls looks finished either
+# way, so "length" / "max_tokens" is the only thing that separates a model which
+# chose to stop from one cut off at the output limit, and a blocked answer must
+# not be handed over as a normal completion.
+_FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "SPII": "content_filter",
+    "IMAGE_SAFETY": "content_filter",
+    "OTHER": "stop",
+}
+
+
+def _map_finish_reason(raw_finish_reason) -> str:
+    """Translate Gemini's finishReason into the finish_reason the agent reads."""
+    if not raw_finish_reason:
+        return "stop"
+    return _FINISH_REASON_MAP.get(str(raw_finish_reason).upper(), "stop")
+
+
+# Inlined images come out of message content or the model itself, so they are
+# fetched the way every channel fetches media: streamed under a size cap, with
+# the SSRF guard re-checking each redirect hop when it is switched on.
+_REMOTE_IMAGE_TIMEOUT = (5, 60)
+_REMOTE_IMAGE_MAX_SECONDS = 30
+
+# An SSE comment (": keep-alive") resets the socket's per-read timeout, and
+# Gemini 4 uses a 900s read timeout. A server sending only comments would
+# hold this generator open indefinitely without yielding anything. Cap it
+# the way the seven OpenAI-compatible providers already do.
+STREAM_KEEPALIVE_MAX_SECONDS = 180
+
+
+def _thinking_level(model_name: str, effort) -> Optional[str]:
+    """Map the resolved reasoning effort to Gemini 4's thinkingLevel, if applicable."""
+    if not (model_name or "").lower().startswith(_THINKING_LEVEL_MODELS):
+        return None
+    return effort if effort in _THINKING_LEVELS else None
+
+
+def _request_timeout(model_name: str):
+    """(connect, read) timeout. Gemini 4 may think for several minutes before the
+    first streamed chunk, so it gets a much longer read timeout."""
+    if (model_name or "").lower().startswith(_THINKING_LEVEL_MODELS):
+        return (15, 900)
+    return 60
 
 
 # OpenAI对话模型API (可用)
@@ -38,9 +116,9 @@ class GoogleGeminiBot(Bot):
 
     @property
     def model(self):
-        model_name = conf().get("model") or "gemini-3.7-flash"
+        model_name = conf().get("model") or "gemini-4-argon"
         if model_name == "gemini":
-            model_name = "gemini-3.7-flash"
+            model_name = "gemini-4-argon"
         return model_name
 
     @property
@@ -168,6 +246,16 @@ class GoogleGeminiBot(Bot):
                 logger.warning(f"[Gemini] Image file not found: {image_path}")
                 return None
 
+            from common.media_download import MAX_IMAGE_BYTES
+
+            size = os.path.getsize(image_path)
+            if size > MAX_IMAGE_BYTES:
+                # Reading it first and checking afterwards would already have
+                # paid the memory cost, and base64 adds another third on top.
+                logger.warning(
+                    f"[Gemini] Image too large to inline ({size} bytes, limit {MAX_IMAGE_BYTES}): {image_path}")
+                return None
+
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
 
@@ -212,25 +300,59 @@ class GoogleGeminiBot(Bot):
 
         if image_url.startswith("http://") or image_url.startswith("https://"):
             try:
-                response = requests.get(image_url, timeout=20)
-                if response.status_code != 200:
-                    logger.warning(f"[Gemini] Failed to fetch remote image: status={response.status_code}, url={image_url}")
-                    return None
-                mime_type = response.headers.get("Content-Type", "image/png").split(";")[0].strip()
-                if not mime_type.startswith("image/"):
-                    mime_type = "image/png"
-                return {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": base64.b64encode(response.content).decode("utf-8")
-                    }
-                }
+                fetched = GoogleGeminiBot._fetch_remote_image(image_url)
             except Exception as e:
                 logger.warning(f"[Gemini] Failed to download remote image: url={image_url}, err={e}")
                 return None
+            if not fetched:
+                return None
+            mime_type, image_bytes = fetched
+            return {
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": base64.b64encode(image_bytes).decode("utf-8")
+                }
+            }
 
         logger.warning(f"[Gemini] Unsupported image URL format: {image_url[:120]}")
         return None
+
+    @staticmethod
+    def _fetch_remote_image(image_url):
+        """Download a remote image under the same rules the channels use.
+
+        ``image_url`` comes out of a message content block, and ``call_vision``
+        hands over one the model produced, so it is treated as model-supplied:
+        with ``web_security_ssrf_protection`` on, the URL and every redirect
+        hop must resolve to a public address. The body is counted while it
+        streams and cut off at ``MAX_IMAGE_BYTES``, which also bounds the
+        base64 copy handed to the API and the wait on a trickling server.
+
+        Returns ``(mime_type, body)``, or ``None`` when the image is unusable.
+        """
+        # Imported here so building a bot never pulls the tool tree in.
+        from agent.tools.utils.url_safety import _ssrf_protection_enabled, safe_get, validate_url_safe
+        from common.media_download import MAX_IMAGE_BYTES, read_response
+
+        get = requests.get
+        if _ssrf_protection_enabled():
+            validate_url_safe(image_url)
+            get = safe_get
+
+        response = get(image_url, stream=True, timeout=_REMOTE_IMAGE_TIMEOUT)
+        try:
+            if response.status_code != 200:
+                logger.warning(
+                    f"[Gemini] Failed to fetch remote image: status={response.status_code}, url={image_url}")
+                return None
+            mime_type = (response.headers.get("Content-Type") or "").split(";")[0].strip()
+            if not mime_type.startswith("image/"):
+                mime_type = mimetypes.guess_type(image_url)[0] or "image/png"
+                if not mime_type.startswith("image/"):
+                    mime_type = "image/png"
+            return mime_type, read_response(response, MAX_IMAGE_BYTES, max_seconds=_REMOTE_IMAGE_MAX_SECONDS)
+        finally:
+            response.close()
 
     def call_vision(self, image_url: str, question: str,
                     model: Optional[str] = None,
@@ -275,7 +397,7 @@ class GoogleGeminiBot(Bot):
                 "content": "".join(text_parts),
                 "usage": {
                     "prompt_tokens": usage_meta.get("promptTokenCount", 0),
-                    "completion_tokens": usage_meta.get("candidatesTokenCount", 0),
+                    "completion_tokens": _completion_tokens(usage_meta),
                     "total_tokens": usage_meta.get("totalTokenCount", 0),
                 },
             }
@@ -324,8 +446,14 @@ class GoogleGeminiBot(Bot):
                     "parts": [{"text": system_prompt}]
                 }
             
+            # "[图片: path]" markers are inlined for the latest user message only,
+            # so earlier images are not re-sent with every turn.
+            last_user_idx = max(
+                (i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1
+            )
+
             # Convert messages to Gemini format
-            for msg in messages:
+            for msg_idx, msg in enumerate(messages):
                 role = msg.get("role")
                 content = msg.get("content", "")
                 
@@ -350,7 +478,11 @@ class GoogleGeminiBot(Bot):
                 # Handle different content formats
                 parts = []
                 
-                if isinstance(content, str):
+                if isinstance(content, str) and msg_idx != last_user_idx:
+                    if content:
+                        parts.append({"text": content})
+
+                elif isinstance(content, str):
                     # Text with optional [图片: /path/to/file] markers
                     cleaned_text, image_paths = self._extract_image_paths_from_text(content)
                     if cleaned_text:
@@ -376,15 +508,11 @@ class GoogleGeminiBot(Bot):
                         block_type = block.get("type")
                         
                         if block_type == "text":
-                            # Text block with optional image markers
+                            # Agent messages: the agent attaches the current
+                            # query's images as image_url blocks itself.
                             block_text = block.get("text", "")
-                            cleaned_text, image_paths = self._extract_image_paths_from_text(block_text)
-                            if cleaned_text:
-                                parts.append({"text": cleaned_text})
-                            for image_path in image_paths:
-                                image_part = self._build_image_inline_part(image_path)
-                                if image_part:
-                                    parts.append(image_part)
+                            if block_text:
+                                parts.append({"text": block_text})
 
                         elif block_type in ["image", "image_url"]:
                             # OpenAI format: {"type":"image_url","image_url":{"url":"..."}}
@@ -434,6 +562,11 @@ class GoogleGeminiBot(Bot):
                                     tool_result_data = tool_content
                             except Exception:
                                 tool_result_data = {"result": tool_content}
+                            # functionResponse.response must be a JSON object;
+                            # tool text that parses to a list or scalar (e.g. an
+                            # MCP tool returning a JSON array) is wrapped.
+                            if not isinstance(tool_result_data, dict):
+                                tool_result_data = {"result": tool_result_data}
                             
                             # Find the tool name from previous messages
                             tool_name = None
@@ -475,6 +608,9 @@ class GoogleGeminiBot(Bot):
             gen_config = {}
             if kwargs.get("temperature") is not None:
                 gen_config["temperature"] = kwargs["temperature"]
+            thinking_level = _thinking_level(model_name, kwargs.get("reasoning_effort"))
+            if thinking_level:
+                gen_config["thinkingConfig"] = {"thinkingLevel": thinking_level}
 
             if gen_config:
                 payload["generationConfig"] = gen_config
@@ -501,7 +637,7 @@ class GoogleGeminiBot(Bot):
                 headers=headers,
                 json=payload,
                 stream=stream,
-                timeout=60
+                timeout=_request_timeout(model_name)
             )
             
             # Check HTTP status for stream mode (for non-stream, it's checked in handler)
@@ -654,9 +790,11 @@ class GoogleGeminiBot(Bot):
                 "choices": [{
                     "index": 0,
                     "message": message_dict,
-                    "finish_reason": "tool_calls" if tool_calls else "stop"
+                    "finish_reason": "tool_calls" if tool_calls else _map_finish_reason(
+                        candidate.get("finishReason")
+                    )
                 }],
-                "usage": data.get("usageMetadata", {}),
+                "usage": _openai_usage(data.get("usageMetadata")),
                 "safety_ratings": safety_ratings
             }
             
@@ -680,6 +818,8 @@ class GoogleGeminiBot(Bot):
             last_safety_ratings = None
             raw_chunks = []  # Buffer raw chunks for diagnostics on empty response
             non_text_part_keys = []  # Track non-text/functionCall part keys (e.g. thoughtSignature)
+            last_usage_meta = None  # Gemini reports usageMetadata (cumulative) per chunk
+            last_data_at = time.time()
             
             for line in response.iter_lines():
                 if not line:
@@ -687,6 +827,27 @@ class GoogleGeminiBot(Bot):
                 
                 line = line.decode('utf-8')
                 
+                # A comment line is not JSON, so the decoder below would
+                # silently swallow it while it resets the socket timeout.
+                # Forward an empty chunk instead so the caller's cancel
+                # probe runs, and fail once only comments have arrived for
+                # STREAM_KEEPALIVE_MAX_SECONDS.
+                if line.startswith(':'):
+                    if time.time() - last_data_at > STREAM_KEEPALIVE_MAX_SECONDS:
+                        logger.error(
+                            f"[Gemini] Stream timeout: only keep-alive received for "
+                            f"{STREAM_KEEPALIVE_MAX_SECONDS}s"
+                        )
+                        yield {
+                            "error": True,
+                            "message": f"Stream timeout: only keep-alive received for {STREAM_KEEPALIVE_MAX_SECONDS}s",
+                            "status_code": 504,
+                        }
+                        return
+                    yield {}
+                    continue
+                last_data_at = time.time()
+
                 # Skip SSE prefixes
                 if line.startswith('data: '):
                     line = line[6:]
@@ -698,7 +859,12 @@ class GoogleGeminiBot(Bot):
                     chunk_data = json.loads(line)
                     chunk_count += 1
                     raw_chunks.append(chunk_data)
-                    
+
+                    # Gemini reports usageMetadata (cumulative) on chunks — keep
+                    # the latest so the final chunk can carry a real token count.
+                    if isinstance(chunk_data.get("usageMetadata"), dict):
+                        last_usage_meta = chunk_data["usageMetadata"]
+
                     candidates = chunk_data.get("candidates", [])
                     if not candidates:
                         # Could be a chunk with only usageMetadata / promptFeedback
@@ -819,8 +985,8 @@ class GoogleGeminiBot(Bot):
                 except Exception as dump_err:
                     logger.warning(f"[Gemini] Failed to dump raw chunks: {dump_err}")
             
-            # Final chunk
-            yield {
+            # Final chunk (+ usage when Gemini reported usageMetadata)
+            final_chunk = {
                 "id": f"chatcmpl-{time.time()}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
@@ -828,9 +994,20 @@ class GoogleGeminiBot(Bot):
                 "choices": [{
                     "index": 0,
                     "delta": {},
-                    "finish_reason": "tool_calls" if all_tool_calls else "stop"
+                    "finish_reason": "tool_calls" if all_tool_calls else _map_finish_reason(
+                        last_finish_reason
+                    )
                 }]
             }
+            if last_usage_meta is not None:
+                # Map Gemini's usageMetadata to the OpenAI usage shape the agent
+                # reads (prompt_tokens is what the context indicator needs).
+                final_chunk["usage"] = {
+                    "prompt_tokens": last_usage_meta.get("promptTokenCount", 0),
+                    "completion_tokens": _completion_tokens(last_usage_meta),
+                    "total_tokens": last_usage_meta.get("totalTokenCount", 0),
+                }
+            yield final_chunk
                     
         except Exception as e:
             logger.error(f"[Gemini] stream response error: {e}", exc_info=True)

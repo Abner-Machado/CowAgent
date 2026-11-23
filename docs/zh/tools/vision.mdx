@@ -1,6 +1,6 @@
 ---
 title: vision - 图片理解
-description: 分析图片内容（识别、描述、OCR 等）
+description: "vision 工具分析本地图片或图片 URL，支持内容描述、文字提取（OCR）和物体识别，优先使用多模态主模型，并自动选择其他已配置的视觉模型兜底，无需手动配置。"
 ---
 
 使用 Vision API 分析本地图片或图片 URL，支持内容描述、文字提取（OCR）、物体识别等。
@@ -19,17 +19,17 @@ Vision 工具采用多级自动选择 + 自动兜底策略，无需手动配置�
 | 厂商 | 视觉模型 | 说明 |
 | --- | --- | --- |
 | OpenAI / 兼容协议 | 使用主模型 | 支持所有 OpenAI 协议兼容的多模态模型 |
-| 通义千问 (DashScope) | 使用主模型 | 例如 qwen3.7-plus 等 |
+| 通义千问 (DashScope) | 使用主模型 | 例如 qwen3.8-flash、qwen3.7-plus 等 |
 | Claude | 使用主模型 | Anthropic 原生图像格式 |
 | Gemini | 使用主模型 | inlineData 格式 |
 | 豆包 (Doubao) | 使用主模型 | doubao-seed-2-1 系列原生支持 |
 | Kimi (Moonshot) | 使用主模型 | kimi-k2.6、kimi-k2.5 原生支持 |
 | 百度千帆 (Qianfan) | 使用主模型 | 默认使用多模态主模型 (如 ernie-5.1)，主模型不支持时兜底使用 ernie-4.5-turbo-vl |
-| 智谱 AI | glm-5v-turbo | 固定使用视觉专用模型 |
-| MiniMax | MiniMax-Text-01 | 固定使用视觉专用模型 |
+| 智谱 AI | 主模型 / glm-5v-turbo | glm-5.3-flash 直接使用；纯文本 chat 模型回落到 glm-5v-turbo |
+| MiniMax | MiniMax-M3 | 使用所选的原生多模态模型 |
 
 <Note>
-  智谱和 MiniMax 的文本模型不支持图像理解，因此始终使用对应的视觉专用模型，无需手动指定。
+  智谱和 MiniMax 的纯文本模型不支持图像理解；MiniMax 会自动选择原生多模态的 MiniMax-M3，无需手动指定。
 </Note>
 
 > 当 `use_linkai=true` 时，默认使用 LinkAI 的多模态模型进行

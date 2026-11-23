@@ -1,9 +1,24 @@
 import { create } from 'zustand'
 import apiClient from '../api/client'
 import { useWorkspaceStore } from './workspaceStore'
+import { sessionOwner } from './sessionStore'
+import { cfgFor } from './sessionSettingsStore'
+import { findAgent } from './agentStore'
 import { notifyRunDone } from '../lib/taskNotify'
+import { useUnreadStore } from './unreadStore'
 import { parseAttachmentMarkers } from '../lib/fileKind'
-import type { Artifact, ChatMessage, MessageStep, Attachment, StreamEvent, HistoryMessage } from '../types'
+import { handoffPayload } from '../lib/handoff'
+import { t } from '../i18n'
+import type { Artifact, ChatMessage, MessageStep, Attachment, StreamEvent, HistoryMessage, AgentBadge, ContextUsage } from '../types'
+
+// Result of a synchronous context compaction (mirrors the backend payload).
+export interface CompactResult {
+  ok: boolean
+  noop: boolean
+  before: number
+  after: number
+  usage: ContextUsage | null
+}
 
 /**
  * Per-session chat state. Supports parallel sessions: each session keeps its
@@ -27,14 +42,21 @@ interface ChatState {
   getSession: (sid: string) => SessionRuntime
   ensureSession: (sid: string) => void
 
-  send: (sid: string, text: string, attachments: Attachment[]) => Promise<void>
+  /** `display` is shown for the turn instead of `text`, which the agent still gets. */
+  send: (sid: string, text: string, attachments: Attachment[], display?: string) => Promise<void>
   cancel: (sid: string) => Promise<void>
   regenerate: (sid: string, botMessageId: string) => Promise<void>
   editUserMessage: (sid: string, messageId: string) => { text: string; attachments: Attachment[] } | null
   deleteMessage: (sid: string, userSeq: number, cascade: boolean) => Promise<void>
 
-  loadHistory: (sid: string, page?: number) => Promise<void>
+  /** With untilSeq, loads every page from `page` back to the one holding that
+   *  message in a single request. Resolves false when it could not be fetched. */
+  loadHistory: (sid: string, page?: number, untilSeq?: number) => Promise<boolean>
   clearContext: (sid: string) => Promise<boolean>
+  // Synchronous context compaction. On success a divider is appended to the
+  // thread; the raw result is returned so the caller can refresh the pie and
+  // surface noop/failure toasts.
+  compactContext: (sid: string) => Promise<CompactResult>
   clearLocal: (sid: string) => void
 
   // Append a server-pushed message (scheduler/push) polled outside the SSE
@@ -44,6 +66,18 @@ interface ChatState {
 
 // EventSource instances kept outside the store (not serializable).
 const streams: Record<string, EventSource> = {}
+
+// A backend restarting after a crash is back within seconds; after a minute
+// the history is left to load on the next visit to the session.
+const RELOAD_AFTER_DROP_ATTEMPTS = 30
+const RELOAD_AFTER_DROP_INTERVAL_MS = 2000
+
+// A reply running with no stream here (the window was reloaded mid-reply, or
+// its stream dropped while the backend went on) is followed by rereading the
+// history until it ends.
+const FOLLOW_RUNNING_INTERVAL_MS = 3000
+const followTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+const followReloads = new Set<string>()
 
 const EMPTY: SessionRuntime = {
   messages: [],
@@ -68,6 +102,47 @@ function stripCancelMarker(text: string): string {
     .replace(/_\(Cancelled by user\)_/g, '')
     .replace(/_\(Cancelled\)_/g, '')
     .trim()
+}
+
+function hasCancelMarker(text: string): boolean {
+  return /_\(Cancelled(?: by user)?\)_/.test(text || '')
+}
+
+/**
+ * Everyone addressable in a conversation, owner first: the owner plus any
+ * invited teammates. Empty outside a group chat.
+ */
+function sessionRoster(sid: string): AgentBadge[] {
+  const team = cfgFor(sid)?.team
+  if (!team || !team.members?.length) return []
+  const roster: AgentBadge[] = [team.owner]
+  for (const m of team.members) {
+    if (!roster.some((a) => a.id === m.id)) roster.push(m)
+  }
+  return roster
+}
+
+/**
+ * The teammate a message hands the turn to, or '' for nobody. Mirrors the
+ * server's rule: only a leading mention counts (naming someone mid-sentence is
+ * talking *about* them), matched by display name or id, longest label first so
+ * a name containing another name still resolves to the one written.
+ */
+function addressedAgentId(text: string, roster: AgentBadge[]): string {
+  const stripped = (text || '').replace(/^\s+/, '')
+  if (!stripped.startsWith('@') || roster.length < 2) return ''
+  const labels: Array<[string, string]> = []
+  for (const a of roster) {
+    for (const label of [a.name, a.id]) {
+      if (label) labels.push([String(label), a.id])
+    }
+  }
+  labels.sort((x, y) => y[0].length - x[0].length)
+  for (const [label, id] of labels) {
+    const re = new RegExp(`^@${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=[\\s,，:：、。！？；!?;]|$)`, 'i')
+    if (re.test(stripped)) return id
+  }
+  return ''
 }
 
 const SUBSTEP_ARGS_CHARS = 90
@@ -122,6 +197,62 @@ function attachmentsFromSteps(steps: MessageStep[]): Attachment[] {
   return out
 }
 
+/**
+ * The bubbles one stored message was shown as while it streamed.
+ *
+ * A hand-off is stored as an `agent_delegate` step inside the asking Agent's
+ * turn, but it was watched as the teammate answering in a bubble of its own.
+ * Replaying it as a card would tell a different story from the one that was
+ * watched, so split the turn back apart: what the Agent did up to the
+ * hand-off, the teammate's reply, then whatever the Agent said next. Anything
+ * without a hand-off comes back as the single message it always was.
+ */
+function historyToMessages(m: HistoryMessage): ChatMessage[] {
+  const out = splitHistoryMessage(m)
+  // Ids derived from the stored seq stay the same across reloads, so rereading
+  // the history (following a running reply) updates bubbles in place instead
+  // of remounting every one of them.
+  if (m._seq != null) {
+    out.forEach((msg, i) => {
+      msg.id = `h_${m.role}_${m._seq}_${i}`
+    })
+  }
+  return out
+}
+
+function splitHistoryMessage(m: HistoryMessage): ChatMessage[] {
+  const steps = m.steps || []
+  if (m.role === 'user' || !steps.some(handoffPayload)) return [historyToMessage(m)]
+
+  const out: ChatMessage[] = []
+  let pending: MessageStep[] = []
+  for (const step of steps) {
+    pending.push(step)
+    const payload = handoffPayload(step)
+    if (!payload) continue
+    // What the Agent did up to and including asking for help. The answer, the
+    // artifacts, the seq and an unfinished run's state belong to the turn's
+    // last bubble, not this one.
+    out.push(
+      historyToMessage({
+        ...m, steps: pending, content: '', artifacts: undefined, _seq: undefined, run_state: undefined,
+      })
+    )
+    out.push({
+      id: uid('assistant'),
+      role: 'assistant',
+      content: payload.content,
+      timestamp: m.created_at,
+      extras: { agent_id: payload.agent_id, peer: true },
+    })
+    pending = []
+  }
+  if (pending.length || (m.content || '').trim() || m.run_state) {
+    out.push(historyToMessage({ ...m, steps: pending }))
+  }
+  return out
+}
+
 /** Convert a backend history message into a UI ChatMessage. */
 function historyToMessage(m: HistoryMessage): ChatMessage {
   if (m.role === 'user') {
@@ -132,18 +263,28 @@ function historyToMessage(m: HistoryMessage): ChatMessage {
       id: uid('user'),
       role: 'user',
       content: text,
+      display: m.display || undefined,
       timestamp: m.created_at,
       userSeq: m._seq,
       attachments,
     }
   }
 
+  // A stopped reply keeps the cancel marker for the LLM; it shows as a status
+  // line instead. Stopped with nothing said, cut off, or still running, a reply
+  // has no answer, so every text it has stays a step.
+  const cancelled = hasCancelMarker(m.content)
+  const answer = stripCancelMarker(m.content || '')
+  const unanswered = !!m.run_state || (cancelled && !answer)
+  const raw = (m.steps || []).filter(
+    (s) => !(s.type === 'content' && hasCancelMarker(s.content || '') && !stripCancelMarker(s.content || ''))
+  )
+
   // The backend stores the final answer both as `content` and as the LAST
   // `content` step. Strip that trailing content step so it isn't rendered
   // twice (matches the web console's renderStepsHtml logic).
-  const raw = m.steps || []
   let lastContentIdx = -1
-  for (let i = raw.length - 1; i >= 0; i--) {
+  for (let i = raw.length - 1; i >= 0 && !unanswered; i--) {
     if (raw[i].type === 'content') {
       lastContentIdx = i
       break
@@ -152,10 +293,14 @@ function historyToMessage(m: HistoryMessage): ChatMessage {
   const steps: MessageStep[] = raw
     .filter((_, i) => i !== lastContentIdx)
     .map((s) => ({ ...s }))
-  const finalContent = m.content || (lastContentIdx >= 0 ? raw[lastContentIdx].content || '' : '')
-  const attachments = attachmentsFromSteps(raw)
+  const finalContent = unanswered
+    ? ''
+    : answer || (lastContentIdx >= 0 ? stripCancelMarker(raw[lastContentIdx].content || '') : '')
   // Artifacts are rebuilt by the backend, which alone knows the workspace root.
   const artifacts = m.artifacts || []
+  // A sent document comes back as an artifact card too; show it once.
+  const carded = new Set(artifacts.map((a) => a.abs_path))
+  const attachments = attachmentsFromSteps(raw).filter((a) => !a.abs_path || !carded.has(a.abs_path))
 
   return {
     id: uid('assistant'),
@@ -167,6 +312,9 @@ function historyToMessage(m: HistoryMessage): ChatMessage {
     kind: m.kind,
     extras: m.extras,
     botSeq: m._seq,
+    usage: m.usage,
+    isCancelled: cancelled || undefined,
+    runState: m.run_state,
     attachments: attachments.length > 0 ? attachments : undefined,
     artifacts: artifacts.length > 0 ? artifacts : undefined,
   }
@@ -196,6 +344,68 @@ export const useChatStore = create<ChatState>((set, get) => {
     // Set on a user-initiated cancel so a trailing error event doesn't fire a
     // spurious "task failed" notification.
     let userCancelled = false
+    // Set once the run reports its end; a stream closing before that dropped.
+    let ended = false
+
+    // A turn can change hands. Work handed to a teammate is answered by that
+    // teammate in a bubble of its own, and the Agent that asked resumes in a
+    // fresh one below it. `main` is the asking Agent's bubble, `peers` the
+    // teammates currently holding the floor (a teammate may hand on again).
+    type Speaker = { id: string; agentId?: string }
+    let main: Speaker = { id: botId }
+    const peers: Speaker[] = []
+    // Set when the floor comes back, so the next thing said opens a new bubble
+    // instead of reopening the one the teammate's reply now sits below.
+    let resumed = false
+    // Every bubble this turn opened: a bubble replaced when the floor changes
+    // hands again is no longer `main` or in `peers`, but still has to settle.
+    const opened = new Set<string>([botId])
+
+    const openBubble = (agentId?: string): Speaker => {
+      const id = uid('assistant')
+      opened.add(id)
+      patchMessages(sid, (msgs) => [
+        ...msgs,
+        {
+          id,
+          role: 'assistant',
+          content: '',
+          timestamp: Date.now(),
+          isStreaming: true,
+          // `peer` marks a bubble as part of someone else's turn rather than a
+          // turn of its own, which is what the regenerate affordance acts on.
+          extras: agentId ? { agent_id: agentId, peer: true } : undefined,
+        },
+      ])
+      return { id, agentId }
+    }
+
+    /** The bubble whoever is speaking writes into. */
+    const speaking = (): string => {
+      const cur = peers[peers.length - 1] || main
+      if (!resumed) return cur.id
+      resumed = false
+      const next = openBubble(cur.agentId)
+      if (peers.length) peers[peers.length - 1] = next
+      else main = next
+      return next.id
+    }
+
+    /**
+     * Update whichever bubble owns a tool card.
+     *
+     * A hand-off's card outlives the teammate's turn: the floor comes back
+     * before the call returns, so by the time it reports the card is no longer
+     * on the bubble in hand.
+     */
+    const updateCard = (stepId: string | undefined, fn: (m: ChatMessage) => ChatMessage) => {
+      if (!stepId) return
+      patchMessages(sid, (msgs) =>
+        msgs.map((m) =>
+          (m.steps || []).some((s) => s.type === 'tool' && s.id === stepId) ? fn(m) : m
+        )
+      )
+    }
 
     const closeStream = () => {
       if (tailTimer) {
@@ -206,15 +416,71 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (streams[sid] === es) delete streams[sid]
     }
 
+    // A stream the user stopped keeps running detached from its session (see
+    // `cancel`): only what its steps did still lands.
+    const detached = () => streams[sid] !== es
+
     // Mark the turn as complete: UI becomes interactive again immediately.
     const completeTurn = () => {
-      patchSession(sid, { isStreaming: false, requestId: null })
-      updateMsg(sid, botId, (m) => ({ ...m, isStreaming: false }))
+      if (!detached()) patchSession(sid, { isStreaming: false, requestId: null })
+      // Every bubble the turn was spoken in, not just the one it started in.
+      patchMessages(sid, (msgs) =>
+        msgs.map((m) => (opened.has(m.id) ? { ...m, isStreaming: false } : m))
+      )
     }
 
     const finishStream = () => {
       completeTurn()
       closeStream()
+    }
+
+    // Deltas, reasoning and tool progress arrive one token or line per event,
+    // often in bursts. Each commit is a synchronous store update that
+    // re-renders the conversation, so a long session streaming its thinking
+    // froze the window until the burst was over. They are buffered and
+    // committed at most once per frame.
+    let pendingText = ''
+    let pendingTarget = ''
+    let pendingReasoning = ''
+    let pendingReasoningTarget = ''
+    // tool_progress replaces a card's result, so only the latest per card counts.
+    const pendingProgress = new Map<string, string | undefined>()
+    let flushFrame: number | null = null
+    const flushDeltas = () => {
+      if (flushFrame !== null) {
+        cancelAnimationFrame(flushFrame)
+        flushFrame = null
+      }
+      if (pendingReasoning) {
+        const text = pendingReasoning
+        pendingReasoning = ''
+        updateMsg(sid, pendingReasoningTarget, (m) => ({ ...m, reasoning: (m.reasoning || '') + text }))
+      }
+      if (pendingText) {
+        const text = pendingText
+        pendingText = ''
+        updateMsg(sid, pendingTarget, (m) => ({ ...m, content: m.content + text }))
+      }
+      if (pendingProgress.size) {
+        const progress = new Map(pendingProgress)
+        pendingProgress.clear()
+        const hit = (s: MessageStep) =>
+          s.type === 'tool' && !!s.id && progress.has(s.id)
+        patchMessages(sid, (msgs) =>
+          msgs.map((m) =>
+            (m.steps || []).some(hit)
+              ? { ...m, steps: m.steps!.map((s) => (hit(s) ? { ...s, result: progress.get(s.id!) } : s)) }
+              : m
+          )
+        )
+      }
+    }
+    const scheduleFlush = () => {
+      if (flushFrame !== null) return
+      flushFrame = requestAnimationFrame(() => {
+        flushFrame = null
+        flushDeltas()
+      })
     }
 
     es.onmessage = (event) => {
@@ -224,21 +490,51 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch {
         return // keepalive
       }
+      // Every other event may read or replace the bubble's content.
+      if (data.type !== 'delta' && data.type !== 'reasoning' && data.type !== 'tool_progress') flushDeltas()
+      // Stopped: nothing more is said, but a step already running still ends.
+      if (detached() && (data.type === 'delta' || data.type === 'reasoning')) return
 
       switch (data.type) {
-        case 'reasoning':
-          updateMsg(sid, botId, (m) => ({ ...m, reasoning: (m.reasoning || '') + (data.content || '') }))
+        case 'reasoning': {
+          const target = speaking()
+          // Commit buffered answer text first so the two never reorder.
+          if (pendingText || target !== pendingReasoningTarget) flushDeltas()
+          pendingReasoningTarget = target
+          pendingReasoning += data.content || ''
+          scheduleFlush()
+          break
+        }
+
+        case 'delta': {
+          const target = speaking()
+          if (pendingReasoning || target !== pendingTarget) flushDeltas()
+          pendingTarget = target
+          pendingText += data.content || ''
+          scheduleFlush()
+          break
+        }
+
+        // A teammate given work answers as itself: its reply, reasoning and
+        // tool calls arrive as the same events as anyone's, bracketed by this
+        // pair. Tagging the bubble with its id is what puts its face on it.
+        case 'peer_start':
+          if (!data.agent_id) break
+          peers.push(openBubble(data.agent_id))
           break
 
-        case 'delta':
-          updateMsg(sid, botId, (m) => ({ ...m, content: m.content + (data.content || '') }))
+        case 'peer_end': {
+          const done = peers.pop()
+          if (done) updateMsg(sid, done.id, (m) => ({ ...m, isStreaming: false }))
+          resumed = true
           break
+        }
 
         case 'message_end':
           // Freeze accumulated text as a content step when tool calls follow,
           // mirroring the web console's interleaved step model.
           if (data.has_tool_calls) {
-            updateMsg(sid, botId, (m) => {
+            updateMsg(sid, speaking(), (m) => {
               if (!m.content.trim()) return m
               const steps = [...(m.steps || []), { type: 'content' as const, content: m.content.trim() }]
               return { ...m, steps, content: '' }
@@ -246,8 +542,31 @@ export const useChatStore = create<ChatState>((set, get) => {
           }
           break
 
+        case 'tool_retrieval':
+          updateMsg(sid, speaking(), (m) => ({
+            ...m,
+            steps: [
+              ...(m.steps || []),
+              {
+                type: 'retrieval',
+                retrieval: {
+                  mode: data.mode === 'fallback' ? 'fallback' : 'retrieved',
+                  total_mcp_tools: data.total_mcp_tools || 0,
+                  selected_mcp_tools: data.selected_mcp_tools || 0,
+                  builtin_tools: data.builtin_tools || 0,
+                  top_k: data.top_k || 0,
+                  candidate_count: data.candidate_count || 0,
+                  selected_tools: data.selected_tools || [],
+                  ranked_tools: data.ranked_tools || [],
+                  fallback_reason: data.fallback_reason,
+                },
+              },
+            ],
+          }))
+          break
+
         case 'tool_start':
-          updateMsg(sid, botId, (m) => {
+          updateMsg(sid, speaking(), (m) => {
             // commit any reasoning into a thinking step
             const steps = [...(m.steps || [])]
             if (m.reasoning && m.reasoning.trim()) {
@@ -265,16 +584,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           break
 
         case 'tool_progress':
-          updateMsg(sid, botId, (m) => ({
-            ...m,
-            steps: (m.steps || []).map((s) =>
-              s.type === 'tool' && s.id === data.tool_call_id ? { ...s, result: data.content } : s
-            ),
-          }))
+          if (!data.tool_call_id) break
+          pendingProgress.set(data.tool_call_id, data.content)
+          scheduleFlush()
           break
 
         case 'tool_end':
-          updateMsg(sid, botId, (m) => ({
+          updateCard(data.tool_call_id, (m) => ({
             ...m,
             steps: (m.steps || []).map((s) =>
               s.type === 'tool' && s.id === data.tool_call_id
@@ -300,7 +616,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // that describes work nobody is waiting on.
         case 'subagent_step':
           if (!data.card_id || !data.step_id) break
-          updateMsg(sid, botId, (m) => ({
+          updateCard(data.card_id, (m) => ({
             ...m,
             steps: (m.steps || []).map((s) => {
               if (s.type !== 'tool' || s.id !== data.card_id) return s
@@ -346,7 +662,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             preview_url: url,
             abs_path: data.abs_path,
           }
-          updateMsg(sid, botId, (m) => ({
+          updateMsg(sid, speaking(), (m) => ({
             ...m,
             attachments: [...(m.attachments || []), att],
           }))
@@ -365,7 +681,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             raw_url: data.raw_url || '',
             preview_url: data.preview_url || '',
           }
-          updateMsg(sid, botId, (m) =>
+          updateMsg(sid, speaking(), (m) =>
             (m.artifacts || []).some((a) => a.abs_path === artifact.abs_path)
               ? m
               : { ...m, artifacts: [...(m.artifacts || []), artifact] }
@@ -376,23 +692,30 @@ export const useChatStore = create<ChatState>((set, get) => {
 
         case 'cancelled':
           userCancelled = true
-          updateMsg(sid, botId, (m) => ({ ...m, isCancelled: true }))
+          updateMsg(sid, main.id, (m) => ({ ...m, isCancelled: true }))
           break
 
-        case 'done':
-          updateMsg(sid, botId, (m) => {
-            const next = stripCancelMarker(data.content || m.content)
+        case 'done': {
+          ended = true
+          // Stopped, the bubble keeps what was shown by the time stop was
+          // pressed; the reply's last text would repeat one of its steps.
+          const stopped = detached()
+          // The answer and the seq belong to the Agent that was asked, in
+          // whichever bubble it finished in — never a teammate's.
+          updateMsg(sid, main.id, (m) => {
+            const next = stopped ? m.content : stripCancelMarker(data.content || m.content)
             return {
               ...m,
               content: next,
               botSeq: data.bot_seq ?? m.botSeq,
+              usage: data.usage ?? m.usage,
               isStreaming: false,
             }
           })
           // backfill the preceding user message's seq for edit/delete
           if (data.user_seq != null) {
             patchMessages(sid, (msgs) => {
-              const idx = msgs.findIndex((m) => m.id === botId)
+              const idx = msgs.findIndex((m) => m.id === main.id)
               for (let i = idx - 1; i >= 0; i--) {
                 if (msgs[i].role === 'user') {
                   msgs[i] = { ...msgs[i], userSeq: data.user_seq }
@@ -404,17 +727,21 @@ export const useChatStore = create<ChatState>((set, get) => {
           }
           // The answer is final: free the UI now (don't wait for onerror).
           completeTurn()
-          notifyRunDone(sid, 'done', data.content || '')
-          useWorkspaceStore.getState().maybeAutoOpen()
+          if (!stopped) {
+            useUnreadStore.getState().mark(sid)
+            notifyRunDone(sid, 'done', data.content || '')
+            useWorkspaceStore.getState().maybeAutoOpen()
+          }
           // Backend keeps the stream open for a short tail (e.g. TTS audio via
           // voice_attach). Close it ourselves if nothing else arrives.
           if (tailTimer) clearTimeout(tailTimer)
           tailTimer = setTimeout(closeStream, 1500)
           break
+        }
 
         case 'voice_attach':
           if (data.audio_url) {
-            updateMsg(sid, botId, (m) => ({
+            updateMsg(sid, main.id, (m) => ({
               ...m,
               extras: { ...(m.extras || {}), audio: data.audio_url },
             }))
@@ -423,16 +750,49 @@ export const useChatStore = create<ChatState>((set, get) => {
           break
 
         case 'error':
-          updateMsg(sid, botId, (m) => ({ ...m, error: data.message || 'stream error', isStreaming: false }))
-          if (!userCancelled) notifyRunDone(sid, 'error', data.message || 'stream error')
+          // The backend restarted and no longer knows this request: the reply
+          // was cut off, not failed.
+          if (data.reason === 'unknown_request' && !ended) {
+            dropStream()
+            break
+          }
+          ended = true
+          // After a stop the bubble is already marked stopped; don't stack a
+          // failure on top.
+          if (userCancelled || detached()) {
+            updateMsg(sid, main.id, (m) => ({ ...m, isStreaming: false }))
+          } else {
+            updateMsg(sid, main.id, (m) => ({ ...m, error: data.message || 'stream error', isStreaming: false }))
+            useUnreadStore.getState().mark(sid)
+            notifyRunDone(sid, 'error', data.message || 'stream error')
+          }
           finishStream()
           break
       }
     }
 
-    es.onerror = () => {
-      // Stream closed (often the normal end after `done`/tail). Finalize.
+    // The stream went away before the run ended (the backend crashed or was
+    // restarted): show what the backend kept of the reply instead of a bubble
+    // frozen mid-way, or a step left spinning after a stop.
+    const dropStream = () => {
       finishStream()
+      void reloadAfterDrop(sid)
+    }
+
+    es.onerror = () => {
+      flushDeltas()
+      // Stream closed (often the normal end after `done`/tail). Finalize.
+      if (ended) finishStream()
+      else dropStream()
+    }
+  }
+
+  /** Reload a session's history once the backend answers again, unless a new turn began. */
+  const reloadAfterDrop = async (sid: string) => {
+    for (let attempt = 0; attempt < RELOAD_AFTER_DROP_ATTEMPTS; attempt++) {
+      if (get().sessions[sid]?.isStreaming) return
+      if (await get().loadHistory(sid, 1)) return
+      await new Promise((resolve) => setTimeout(resolve, RELOAD_AFTER_DROP_INTERVAL_MS))
     }
   }
 
@@ -445,15 +805,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!get().sessions[sid]) patchSession(sid, { ...EMPTY })
     },
 
-    send: async (sid, text, attachments) => {
+    send: async (sid, text, attachments, display) => {
       const userMsg: ChatMessage = {
         id: uid('user'),
         role: 'user',
         content: text,
+        display: display || undefined,
         timestamp: Date.now() / 1000,
         attachments: attachments.length ? attachments : undefined,
       }
       const botId = uid('assistant')
+      // The conversation's owner answers unless a teammate was addressed with a
+      // leading @mention (group chat). Lock the speaker onto the reply at send
+      // time so a later Agent switch never rewrites who spoke in the history.
+      // Empty in single-Agent mode, so those replies keep the product logo
+      // exactly as before.
+      const owner = sessionOwner(sid)
+      const addressed = owner ? addressedAgentId(text, sessionRoster(sid)) : ''
+      const speakerAgentId = addressed || owner
       const botMsg: ChatMessage = {
         id: botId,
         role: 'assistant',
@@ -461,6 +830,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         timestamp: Date.now() / 1000,
         steps: [],
         isStreaming: true,
+        extras: speakerAgentId ? { agent_id: speakerAgentId } : undefined,
       }
       patchMessages(sid, (msgs) => [...msgs, userMsg, botMsg])
       patchSession(sid, { isStreaming: true })
@@ -470,7 +840,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         const res = await apiClient.sendMessage(sid, text, {
           stream: true,
           attachments: attachments.length ? attachments : undefined,
+          agentId: owner || undefined,
+          speakerAgentId: addressed && addressed !== owner ? addressed : undefined,
+          display: display || undefined,
         })
+        // The server is the authority on who took the turn; repaint the live
+        // bubble if it resolved the mention differently than we guessed.
+        if (owner && res.status === 'success') {
+          const speaker = res.speaker || owner
+          if (speaker !== speakerAgentId && findAgent(speaker)) {
+            updateMsg(sid, botId, (m) => ({ ...m, extras: { ...(m.extras || {}), agent_id: speaker } }))
+          }
+        }
         if (res.status === 'success' && res.stream && res.request_id) {
           patchSession(sid, { requestId: res.request_id })
           attachStream(sid, res.request_id, botId)
@@ -478,7 +859,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           updateMsg(sid, botId, (m) => ({ ...m, content: res.inline_reply || '', isStreaming: false }))
           patchSession(sid, { isStreaming: false })
         } else {
-          updateMsg(sid, botId, (m) => ({ ...m, error: 'send failed', isStreaming: false }))
+          updateMsg(sid, botId, (m) => ({ ...m, error: res.message || 'send failed', isStreaming: false }))
           patchSession(sid, { isStreaming: false })
         }
       } catch (err) {
@@ -491,9 +872,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       const s = get().sessions[sid]
       if (!s?.requestId) return
       // Optimistically stop the UI right away: mark the last assistant bubble
-      // cancelled, free the input, and tear down the local SSE stream so no
-      // further deltas render after the user hit stop. The backend still gets
-      // the cancel request to abort the running agent task.
+      // cancelled and free the input. The stream is detached from the session
+      // rather than closed: nothing more it says is shown, but a step running
+      // when stop was pressed still reports how it ended. The backend still
+      // gets the cancel request to abort the running agent task.
       patchMessages(sid, (msgs) => {
         for (let i = msgs.length - 1; i >= 0; i--) {
           if (msgs[i].role === 'assistant') {
@@ -504,11 +886,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         return [...msgs]
       })
       patchSession(sid, { isStreaming: false, requestId: null })
-      const es = streams[sid]
-      if (es) {
-        es.close()
-        delete streams[sid]
-      }
+      delete streams[sid]
       try {
         await apiClient.cancel({ requestId: s.requestId, sessionId: sid })
       } catch {
@@ -532,7 +910,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       // delete the turn on the backend (by the user's seq) then resend
       if (userMsg.userSeq != null) {
         try {
-          await apiClient.deleteMessage({ sessionId: sid, userSeq: userMsg.userSeq, deleteUser: true, cascade: true })
+          await apiClient.deleteMessage({
+            sessionId: sid,
+            userSeq: userMsg.userSeq,
+            deleteUser: true,
+            cascade: true,
+            agentId: sessionOwner(sid) || undefined,
+          })
         } catch {
           /* ignore */
         }
@@ -540,7 +924,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // drop the user+bot messages locally from idx-? : remove from the user msg onward
       const userIdx = s.messages.indexOf(userMsg)
       patchMessages(sid, (msgs) => msgs.slice(0, userIdx))
-      await get().send(sid, userMsg.content, userMsg.attachments || [])
+      await get().send(sid, userMsg.content, userMsg.attachments || [], userMsg.display)
     },
 
     editUserMessage: (sid, messageId) => {
@@ -551,7 +935,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       // cascade-delete this turn on the backend
       if (msg.userSeq != null) {
         apiClient
-          .deleteMessage({ sessionId: sid, userSeq: msg.userSeq, deleteUser: true, cascade: true })
+          .deleteMessage({
+            sessionId: sid,
+            userSeq: msg.userSeq,
+            deleteUser: true,
+            cascade: true,
+            agentId: sessionOwner(sid) || undefined,
+          })
           .catch(() => {})
       }
       patchMessages(sid, (msgs) => msgs.slice(0, userIdx))
@@ -560,7 +950,13 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     deleteMessage: async (sid, userSeq, cascade) => {
       try {
-        await apiClient.deleteMessage({ sessionId: sid, userSeq, deleteUser: true, cascade })
+        await apiClient.deleteMessage({
+          sessionId: sid,
+          userSeq,
+          deleteUser: true,
+          cascade,
+          agentId: sessionOwner(sid) || undefined,
+        })
       } catch {
         /* ignore */
       }
@@ -568,29 +964,52 @@ export const useChatStore = create<ChatState>((set, get) => {
       await get().loadHistory(sid, 1)
     },
 
-    loadHistory: async (sid, page = 1) => {
+    loadHistory: async (sid, page = 1, untilSeq) => {
+      const following = followReloads.delete(sid)
       try {
-        const res = await apiClient.getHistory(sid, page, 20)
-        const uiMsgs = res.messages.map(historyToMessage)
+        const res = await apiClient.getHistory(sid, page, 20, sessionOwner(sid) || undefined, untilSeq)
+        // A turn sent while this was loading owns the live bubbles now.
+        if (page === 1 && get().sessions[sid]?.isStreaming) return true
+        const uiMsgs = res.messages.flatMap(historyToMessages)
+        const current = get().sessions[sid]
+        // Following a running reply rereads page 1 only; keep the older pages
+        // the user already scrolled in rather than dropping back to 20 messages.
+        const anchor = following && uiMsgs.length ? (current?.messages || []).findIndex((m) => m.id === uiMsgs[0].id) : -1
+        const keepOlder = anchor > 0
         patchSession(sid, {
-          historyPage: res.page,
-          historyHasMore: res.has_more,
+          historyPage: keepOlder ? Math.max(current?.historyPage || 1, res.page) : res.page,
+          historyHasMore: keepOlder ? !!current?.historyHasMore : res.has_more,
           historyLoaded: true,
         })
         if (page === 1) {
-          patchMessages(sid, () => uiMsgs)
+          patchMessages(sid, (msgs) => (keepOlder ? [...msgs.slice(0, anchor), ...uiMsgs] : uiMsgs))
+          clearTimeout(followTimers[sid])
+          delete followTimers[sid]
+          const running = uiMsgs[uiMsgs.length - 1]?.runState === 'running'
+          // A reply followed in the background (no stream here) just ended.
+          if (following && !running) useUnreadStore.getState().mark(sid)
+          if (running) {
+            followTimers[sid] = setTimeout(() => {
+              delete followTimers[sid]
+              if (get().sessions[sid]?.isStreaming) return
+              followReloads.add(sid)
+              void get().loadHistory(sid, 1)
+            }, FOLLOW_RUNNING_INTERVAL_MS)
+          }
         } else {
           // older page: prepend
           patchMessages(sid, (msgs) => [...uiMsgs, ...msgs])
         }
+        return true
       } catch {
         patchSession(sid, { historyLoaded: true })
+        return false
       }
     },
 
     clearContext: async (sid) => {
       try {
-        const res = await apiClient.clearContext(sid)
+        const res = await apiClient.clearContext(sid, sessionOwner(sid) || undefined)
         if (res.status !== 'success') return false
         // Append a visual divider so the user sees the context was cleared
         // (mirrors the web console's context-divider).
@@ -610,7 +1029,40 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
+    compactContext: async (sid) => {
+      const fail: CompactResult = { ok: false, noop: false, before: 0, after: 0, usage: null }
+      try {
+        const data = await apiClient.compactContext(sid, sessionOwner(sid) || undefined)
+        if (!data || data.status === 'error') return fail
+        const ok = !!data.ok
+        const before = data.before || 0
+        const after = data.after || 0
+        if (ok) {
+          // Drop a labeled divider into the thread so the summarize is visible,
+          // mirroring the web console (clear uses the same divider, unlabeled).
+          const label = t('ctx_compacted_divider')
+            .replace('{before}', String(before))
+            .replace('{after}', String(after))
+          patchMessages(sid, (msgs) => [
+            ...msgs,
+            {
+              id: uid('divider'),
+              role: 'system',
+              kind: 'divider',
+              content: label,
+              timestamp: Date.now() / 1000,
+            },
+          ])
+        }
+        return { ok, noop: !ok, before, after, usage: data.usage ?? null }
+      } catch {
+        return fail
+      }
+    },
+
     clearLocal: (sid) => {
+      clearTimeout(followTimers[sid])
+      delete followTimers[sid]
       const es = streams[sid]
       if (es) {
         es.close()
@@ -635,6 +1087,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         pushRequestId: requestId,
       }
       patchMessages(sid, (msgs) => [...msgs, msg])
+      useUnreadStore.getState().mark(sid)
       return true
     },
   }

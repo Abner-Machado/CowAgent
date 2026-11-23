@@ -1,4 +1,6 @@
 numpy>=1.21
+# markdown structure-aware chunking for memory/knowledge md files (chunker.chunk_markdown)
+markdown-it-py>=3.0.0
 # aiohttp<3.10 has no prebuilt wheels for Python 3.13+, so pip would compile from
 # source (needs MSVC on Windows). Use >=3.10 on 3.13+ where cp313 wheels exist.
 aiohttp>=3.8.6,<3.10; python_version < "3.13"
@@ -9,6 +11,9 @@ Pillow
 python-dotenv>=1.0.0
 PyYAML>=6.0
 croniter>=2.0.0
+# zoneinfo is stdlib from 3.9; Windows has no system tz database
+backports.zoneinfo; python_version < "3.9"
+tzdata; sys_platform == "win32"
 click>=8.0
 qrcode
 json-repair
@@ -37,7 +42,8 @@ slack_bolt
 # discord bot
 discord.py
 
-# web.py: PyPI 0.62 fails to build on Python 3.13+ (cgi module removed), use GitHub fix instead
-web.py; python_version < "3.13"
-web.py @ git+https://github.com/webpy/webpy.git ; python_version >= "3.13"
-legacy-cgi; python_version >= "3.13"
+# web.py 0.62 is the last release that supports Python < 3.10, and it imports the
+# stdlib cgi module removed in 3.13. 0.76 dropped cgi but requires 3.10+, so ask
+# for it only where it can be installed.
+web.py; python_version < "3.10"
+web.py>=0.76; python_version >= "3.10"

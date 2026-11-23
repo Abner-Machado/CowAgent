@@ -97,6 +97,13 @@ class MemorySearchTool(BaseTool):
             
             # Format results
             output = [f"Found {len(results)} relevant memories:\n"]
+
+            # The knowledge section of the prompt names this root too, but it is
+            # skipped entirely when there is no index.md, and these paths are
+            # useless to a reader who does not know what they are relative to.
+            hint = self._knowledge_root_hint(results)
+            if hint:
+                output.append(hint)
             
             for i, result in enumerate(results, 1):
                 output.append(f"\n{i}. {result.path} (lines {result.start_line}-{result.end_line})")
@@ -107,3 +114,27 @@ class MemorySearchTool(BaseTool):
             
         except Exception as e:
             return ToolResult.fail(f"Error searching memory: {str(e)}")
+
+    def _knowledge_root_hint(self, results) -> Optional[str]:
+        """Where the "knowledge/..." paths below actually live, when that is not
+        under the workspace every other tool resolves against.
+
+        An Agent with no knowledge/ of its own reads the shared copy, so these
+        paths are relative to the shared root. Said once for the whole result
+        set rather than per hit, and only when the two roots differ, so the
+        common single-Agent install sees nothing new.
+        """
+        if not any(str(r.path).startswith("knowledge/") for r in results):
+            return None
+        try:
+            import os
+            from common import state_dir
+
+            workspace = str(self.memory_manager.config.get_workspace())
+            root = str(state_dir.knowledge_dir(base=workspace))
+            own = os.path.join(workspace, "knowledge")
+            if os.path.realpath(root) == os.path.realpath(own):
+                return None
+            return f'("knowledge/..." below is relative to {root})\n'
+        except Exception:
+            return None

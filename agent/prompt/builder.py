@@ -6,7 +6,8 @@ System Prompt Builder - 系统提示词构建器
 
 from __future__ import annotations
 import os
-from typing import List, Dict, Optional, Any
+import re
+from typing import List, Dict, Optional, Any, Tuple
 from dataclasses import dataclass
 
 from common.log import logger
@@ -178,6 +179,7 @@ def build_agent_system_prompt(
     # 7. Runtime info (meta info, goes last)
     if runtime_info:
         sections.extend(_build_runtime_section(runtime_info, language))
+        sections.extend(_build_team_section(runtime_info, language))
 
     # 8. Response language (always appended, independent of the skeleton language)
     sections.extend(_build_response_language_section(language))
@@ -232,6 +234,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "memory_search": "search memory",
             "memory_get": "read memory content",
             "env_config": "manage API keys and skill config",
+            "time": "get the current date and time",
             "scheduler": "manage scheduled tasks and reminders",
             "send": "send a local file to the user (local files only; put URLs directly in the reply text)",
             "vision": "analyze images (recognition, description, OCR, etc.)",
@@ -252,6 +255,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "memory_search": "搜索记忆",
             "memory_get": "读取记忆内容",
             "env_config": "管理API密钥和技能配置",
+            "time": "获取当前日期和时间",
             "scheduler": "管理定时任务和提醒",
             "send": "发送本地文件给用户（仅限本地文件，URL直接放在回复文本中）",
             "vision": "分析图片内容（识别、描述、OCR文字提取等）",
@@ -264,7 +268,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
         "bash", "terminal",
         "web_search", "web_fetch", "browser",
         "memory_search", "memory_get",
-        "env_config", "scheduler", "send", "vision", "subagent",
+        "env_config", "time", "scheduler", "send", "vision", "subagent",
     ]
 
     # Build name -> summary mapping for available tools
@@ -300,6 +304,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "Tool-calling style:",
             "",
             "- For multi-step tasks, complex decisions or sensitive operations, briefly explain what you are doing and why, so the user follows key progress",
+            "- Never just announce intent and stop: if you say you will do something, actually call the tool in the same turn. A text-only reply ends the turn, so only reply with plain text once the work is genuinely finished",
             "- Keep going until the task is done, then report the result to the user",
             "- Always redact secrets, tokens and other sensitive info in replies",
             "- Put URLs directly in the reply text; the system handles and renders them. Don't download and re-send them via the send tool",
@@ -311,7 +316,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             # belong in the description, which it reads once it looks.
             lines.insert(
                 -1,
-                "- Hand a self-contained task that needs research, search or information gathering to `subagent`: one task, or several at once via tasks running in parallel; it brings back the conclusion",
+                "- Hand a self-contained task that needs deep research or broad information gathering to `subagent`: one task, or several at once via tasks running in parallel; it brings back the conclusion",
             )
     else:
         lines = [
@@ -323,6 +328,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "工具调用风格：",
             "",
             "- 多步骤任务、复杂决策、敏感操作时，应简要说明当前在做什么、为什么这样做，让用户了解关键进展",
+            "- 不要只宣告意图就停下：一旦你说要做某事，就必须在同一轮真正发起工具调用。纯文本回复会立即结束本轮，因此只有在任务真正完成后才用纯文本收尾",
             "- 持续推进直到任务完成，完成后向用户报告结果",
             "- 回复中涉及密钥、令牌等敏感信息必须脱敏",
             "- URL链接直接放在回复文本中即可，系统会自动处理和渲染。无需下载后使用send工具发送",
@@ -331,7 +337,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
         if has_subagent:
             lines.insert(
                 -1,
-                "- 需要深入调研、搜索或信息采集的独立任务，交给 `subagent`：可以单个任务，也可以用 tasks 同时执行多个任务，`subagent` 负责把结论带回来",
+                "- 需要深度调研或大范围信息采集的独立任务，交给 `subagent`：可以单个任务，也可以用 tasks 同时执行多个任务，`subagent` 负责把结论带回来",
             )
 
     return lines
@@ -418,6 +424,32 @@ def _state_path_prefix(workspace_dir: str, project_dir: Optional[str]) -> str:
     return workspace_dir.rstrip("/") + "/"
 
 
+def _knowledge_base_path(workspace_dir: str, project_dir: Optional[str] = None) -> str:
+    """Knowledge root spelled the way the file tools will actually resolve it.
+
+    ``state_dir`` sends an Agent with no ``knowledge/`` of its own to the shared
+    root, which does not sit under this workspace. Naming it as a bare
+    ``knowledge/`` then aims every ``read`` at the workspace, where none of the
+    pages are: the Agent is handed an index of pages it cannot open, and spends
+    its turns hunting for them instead of answering (#3175 follow-up).
+
+    On a single-Agent install the two are the same directory, so that case keeps
+    the relative spelling it has today, project-mode prefix included.
+    """
+    relative = f"{_state_path_prefix(workspace_dir, project_dir)}knowledge"
+    if not workspace_dir:
+        return relative
+    try:
+        from common import state_dir
+        root = str(state_dir.knowledge_dir(base=workspace_dir))
+        own = os.path.join(workspace_dir, "knowledge")
+        if os.path.realpath(root) == os.path.realpath(own):
+            return relative
+        return root
+    except Exception:
+        return relative
+
+
 def _build_memory_section(
     memory_manager: Any,
     tools: Optional[List[Any]],
@@ -437,7 +469,7 @@ def _build_memory_section(
     p = _state_path_prefix(workspace_dir, project_dir)
     mem_md = f"{p}MEMORY.md"
     mem_dir = f"{p}memory"
-    kb_dir = f"{p}knowledge"
+    kb_dir = _knowledge_base_path(workspace_dir, project_dir)
 
     has_memory_tools = False
     if tools:
@@ -530,6 +562,40 @@ def _build_memory_section(
     return lines
 
 
+# index.md grows by a line per knowledge page and is re-sent on every turn.
+# Past _INDEX_FULL_CHARS only the entry titles are injected, and past
+# _INDEX_MAX_CHARS the list is cut; the pages stay reachable through read and
+# memory_search, and the prompt says so.
+_INDEX_FULL_CHARS = 8000
+_INDEX_MAX_CHARS = 20000
+_INDEX_ENTRY_RE = re.compile(r"^\s*[-*]\s+\[[^\]]*\]\([^)]*\)")
+
+
+def _compact_knowledge_index(content: str) -> Tuple[str, int, bool]:
+    """Return (index text to inject, entries left out, whether it was compacted)."""
+    if len(content) <= _INDEX_FULL_CHARS:
+        return content, 0, False
+
+    kept: List[str] = []
+    size = 0
+    omitted = 0
+    full = False
+    for line in content.split("\n"):
+        entry = _INDEX_ENTRY_RE.match(line)
+        if entry:
+            line = entry.group(0).strip()
+        elif not line.lstrip().startswith("#"):
+            continue
+        if full or size + len(line) + 1 > _INDEX_MAX_CHARS:
+            full = True
+            if entry:
+                omitted += 1
+            continue
+        kept.append(line)
+        size += len(line) + 1
+    return "\n".join(kept), omitted, True
+
+
 def _build_knowledge_section(
     workspace_dir: str, language: str, project_dir: Optional[str] = None
 ) -> List[str]:
@@ -538,7 +604,11 @@ def _build_knowledge_section(
     In project mode ``project_dir`` anchors knowledge paths to ``workspace_dir``
     (absolute) so writes don't leak into the project cwd.
     """
-    index_path = os.path.join(workspace_dir, "knowledge", "index.md")
+    # Resolve through state_dir so an Agent on the shared base (no knowledge/ of
+    # its own) still gets the shared index injected, not an empty local one.
+    from common import state_dir
+    knowledge_root = str(state_dir.knowledge_dir(base=workspace_dir))
+    index_path = os.path.join(knowledge_root, "index.md")
     if not os.path.exists(index_path):
         return []
 
@@ -548,8 +618,9 @@ def _build_knowledge_section(
     except Exception:
         return []
 
-    # Anchor knowledge paths to ~/cow when a project cwd is active.
-    kb = f"{_state_path_prefix(workspace_dir, project_dir)}knowledge"
+    # Anchor knowledge paths to ~/cow when a project cwd is active, and to the
+    # shared root when this Agent reads the shared copy.
+    kb = _knowledge_base_path(workspace_dir, project_dir)
 
     if language == "en":
         lines = [
@@ -595,12 +666,22 @@ def _build_knowledge_section(
         ]
 
     if index_content:
+        index_text, omitted, compacted = _compact_knowledge_index(index_content)
         lines.extend([
             ("### Current knowledge index" if language == "en" else "### 当前知识索引"),
             "",
-            index_content,
-            "",
         ])
+        if compacted:
+            if language == "en":
+                more = f", {omitted} more entries are not listed" if omitted else ""
+                note = (f"The index is large, so only titles are listed here{more}. "
+                        f"`read` `{kb}/index.md` for the full index, or use `memory_search`.")
+            else:
+                more = f"，另有 {omitted} 条未列出" if omitted else ""
+                note = (f"索引较大，此处只列出标题{more}。"
+                        f"完整索引请 `read` `{kb}/index.md` 查看，或用 `memory_search` 检索。")
+            lines.extend([note, ""])
+        lines.extend([index_text, ""])
 
     lines.extend([
         ("**How to query**: use `read` to open a knowledge page, or `memory_search` (knowledge is in the vector index)."
@@ -724,16 +805,16 @@ def _build_workspace_section(
             "**路径使用规则** (非常重要):",
             "",
             f"1. **相对路径的基准目录**: 所有相对路径都是相对于 `{workspace_dir}` 而言的",
-            f"   - ✅ 正确: 访问工作空间内的文件用相对路径，如 `AGENT.md`",
+            "   - ✅ 正确: 访问工作空间内的文件用相对路径，如 `AGENT.md`",
             f"   - ❌ 错误: 用相对路径访问其他目录的文件 (如果它不在 `{workspace_dir}` 内)",
             "",
             "2. **访问其他目录**: 如果要访问工作空间之外的目录（如项目代码、系统文件），**必须使用绝对路径**",
-            f"   - ✅ 正确: 例如 `~/chatgpt-on-wechat`、`/usr/local/`",
-            f"   - ❌ 错误: 假设相对路径会指向其他目录",
+            "   - ✅ 正确: 例如 `~/chatgpt-on-wechat`、`/usr/local/`",
+            "   - ❌ 错误: 假设相对路径会指向其他目录",
             "",
             "3. **路径解析示例**:",
             f"   - 相对路径 `memory/` → 实际路径 `{workspace_dir}/memory/`",
-            f"   - 绝对路径 `~/chatgpt-on-wechat/docs/` → 实际路径 `~/chatgpt-on-wechat/docs/`",
+            "   - 绝对路径 `~/chatgpt-on-wechat/docs/` → 实际路径 `~/chatgpt-on-wechat/docs/`",
             "",
             "4. **不确定时**: 先用 `bash pwd` 确认当前目录，或用 `ls .` 查看当前位置",
             "",
@@ -794,7 +875,7 @@ def _build_project_workspace_section(
             "",
             f"2. **Memory and skills stay in the system directory** `{workspace_dir}`. Never write them into the project. Memory tools handle this for you; if you ever touch these files directly, use **absolute paths** under the system directory.",
             f"   - ✅ absolute `{workspace_dir}/MEMORY.md`",
-            f"   - ❌ relative `MEMORY.md` (that would land in the project, which is wrong)",
+            "   - ❌ relative `MEMORY.md` (that would land in the project, which is wrong)",
             "",
             "3. **Accessing any other directory**: use absolute paths.",
             "",
@@ -817,7 +898,7 @@ def _build_project_workspace_section(
             "",
             f"2. **记忆和技能仍在系统目录** `{workspace_dir}`，不要写入项目目录。记忆操作由记忆工具自动完成；若确需直接访问这些文件，请使用系统目录下的**绝对路径**。",
             f"   - ✅ 绝对路径 `{workspace_dir}/MEMORY.md`",
-            f"   - ❌ 相对路径 `MEMORY.md`（那会落到项目目录里，是错误的）",
+            "   - ❌ 相对路径 `MEMORY.md`（那会落到项目目录里，是错误的）",
             "",
             "3. **访问其他任意目录**：使用绝对路径。",
             "",
@@ -898,42 +979,116 @@ def _build_context_files_section(context_files: List[ContextFile], language: str
     return lines
 
 
+def _build_team_section(runtime_info: Dict[str, Any], language: str) -> List[str]:
+    """Name the other Agents sharing this conversation, if any. Empty for one.
+
+    Addressing someone by name is routing, not delegation: the named Agent is
+    already the one reading this prompt, so handover is left for work nobody
+    was asked for by name.
+
+    States the Agent's own name, which nothing else in the prompt does. Without
+    it a mention reads as a third party and the Agent declines to answer on
+    that stranger's behalf.
+    """
+    teammates = runtime_info.get("teammates")
+    getter = runtime_info.get("_get_teammates")
+    if callable(getter):
+        try:
+            teammates = getter()
+        except Exception as e:
+            logger.warning(f"[PromptBuilder] Failed to resolve teammates: {e}")
+    if not teammates:
+        return []
+
+    # One line each, with what they are for: a bare list of names is enough to
+    # address someone but not to decide whether the work is theirs.
+    roster = []
+    for item in teammates:
+        if not item.get("id"):
+            continue
+        line = f"{item.get('name') or item['id']}(@{item['id']})"
+        if item.get("description"):
+            line += f"：{item['description']}" if language != "en" else f" — {item['description']}"
+        roster.append(line)
+    if not roster:
+        return []
+
+    own_id = runtime_info.get("agent_id") or ""
+    own_name = runtime_info.get("agent_name") or own_id
+    whoami = f"{own_name}(@{own_id})" if own_id else own_name
+
+    if language == "en":
+        return [
+            "## 👥 Team conversation",
+            "",
+            f"You are {whoami}. Also in this conversation:",
+            "",
+            *[f"- {line}" for line in roster],
+            "",
+            "Everyone here reads the same history. A teammate's earlier "
+            "reply is shown as `Name(@id)：` before their words; an unmarked "
+            "one is your own. Do not take a teammate's work, or their "
+            "promises, for yours.",
+            "",
+            "This turn is yours to answer. Answer as yourself, and do NOT "
+            "prefix your reply with your own name or id — that label is only "
+            "how others' past turns are shown to you.",
+            "",
+            "Use agent_delegate for work that belongs to a teammate, passing "
+            "their id above as agent_id (without the @), and say who you handed "
+            "it to and what you asked for. Refer to teammates by name to the "
+            "user and keep the @id out of your reply — the id is internal. "
+            "Never answer in a teammate's place: hand any question or task "
+            "that is theirs straight over, and do not report their words or "
+            "actions without a hand-off.",
+            "",
+        ]
+    return [
+        "## 👥 团队会话",
+        "",
+        f"你是 {whoami}。同在这个会话里的还有：",
+        "",
+        *[f"- {line}" for line in roster],
+        "",
+        "大家读到的是同一份记录。以「名字(@id)：」开头的是那位同事说过的话，"
+        "没有前缀的才是你自己说的。不要把同事做过的事、许下的承诺当成你的。",
+        "",
+        "这一轮由你来回答，以你自己的身份回答即可，回答时不要在开头加自己的名字或 id "
+        "前缀（前缀只是用来向你标记其他成员的历史发言）。",
+        "",
+        "该由某位同事做的事，用 agent_delegate 交出去：把那位同事上面的 id "
+        "作为 agent_id 传入 (不含@符号)，并说明交给了谁、交办了什么。对用户提到同事时只用名字，"
+        "回复内容不要带 @id，id 只用于内部。不要替同事回答：该由某位成员回答的问题或执行的任务直接转交，"
+        "未经转交不得转述其言行。",
+        "",
+    ]
+
+
 def _build_runtime_section(runtime_info: Dict[str, Any], language: str) -> List[str]:
-    """Build the runtime info section - supports dynamic time."""
+    """Build the runtime info section.
+
+    Only the date goes here: the system prompt heads every request, so a
+    clock in it would change on every turn and void the provider's prefix
+    cache for the whole history. The exact time is served on demand by the
+    ``time`` tool.
+    """
     if not runtime_info:
         return []
-    
+
     is_en = language == "en"
-    time_label = "Current time" if is_en else "当前时间"
     lines = [
         ("## ⚙️ Runtime info" if is_en else "## ⚙️ 运行时信息"),
         "",
     ]
 
-    # Add current time if available
-    # Support dynamic time via callable function
     if callable(runtime_info.get("_get_current_time")):
         try:
             time_info = runtime_info["_get_current_time"]()
-            time_line = f"{time_label}: {time_info['time']} {time_info['weekday']} ({time_info['timezone']})"
-            lines.append(time_line)
+            date_label = "Current date" if is_en else "当前日期"
+            lines.append(f"{date_label}: {time_info['date']} {time_info['weekday']} ({time_info['timezone']})")
             lines.append("")
         except Exception as e:
             logger.warning(f"[PromptBuilder] Failed to get dynamic time: {e}")
-    elif runtime_info.get("current_time"):
-        # Fallback to static time for backward compatibility
-        time_str = runtime_info["current_time"]
-        weekday = runtime_info.get("weekday", "")
-        timezone = runtime_info.get("timezone", "")
-
-        time_line = f"{time_label}: {time_str}"
-        if weekday:
-            time_line += f" {weekday}"
-        if timezone:
-            time_line += f" ({timezone})"
-
-        lines.append(time_line)
-        lines.append("")
 
     # Add other runtime info
     model_label = "model" if is_en else "模型"

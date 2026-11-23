@@ -169,6 +169,69 @@ class TestResolveCustomCredentials(unittest.TestCase):
             ("legacy-key", "https://legacy.example.com/v1", None),
         )
 
+    # --- Explicit bot_type (routes the call off the global provider) ---
+
+    def test_explicit_bot_type_overrides_the_global_one(self):
+        """A caller routing to another provider gets that provider's creds.
+
+        This is the chat-fallback case: the global bot_type points at the
+        primary provider, but the engaged fallback link names a different
+        ``custom:<id>``. Reading the global value here paired the fallback's
+        model id with the primary vendor's api_base, and upstream answered
+        404 "model is not found".
+        """
+        set_conf({
+            "bot_type": "custom:primary1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1", "model": "primary-model"},
+                {"id": "backup22", "name": "backup", "api_key": "key-backup",
+                 "api_base": "https://backup.example.com/v1", "model": "backup-model"},
+            ],
+        })
+        # No argument -> global provider (unchanged legacy behavior)
+        self.assertEqual(
+            self.resolve(),
+            ("key-primary", "https://primary.example.com/v1", "primary-model"),
+        )
+        # Explicit argument -> that provider, not the global one
+        self.assertEqual(
+            self.resolve("custom:backup22"),
+            ("key-backup", "https://backup.example.com/v1", "backup-model"),
+        )
+
+    def test_explicit_non_custom_bot_type_uses_openai_fields(self):
+        """An explicit non-custom type must not resolve custom credentials."""
+        set_conf({
+            "bot_type": "custom:primary1",
+            "open_ai_api_key": "sk-openai",
+            "open_ai_api_base": "https://api.openai.com/v1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1"},
+            ],
+        })
+        self.assertEqual(
+            self.resolve("chatGPT"),
+            ("sk-openai", "https://api.openai.com/v1", None),
+        )
+
+    def test_explicit_legacy_custom_reads_flat_fields(self):
+        """Passing the bare legacy 'custom' resolves the flat credentials."""
+        set_conf({
+            "bot_type": "custom:primary1",
+            "custom_api_key": "legacy-key",
+            "custom_api_base": "https://legacy.example.com/v1",
+            "custom_providers": [
+                {"id": "primary1", "name": "primary", "api_key": "key-primary",
+                 "api_base": "https://primary.example.com/v1"},
+            ],
+        })
+        self.assertEqual(
+            self.resolve("custom"),
+            ("legacy-key", "https://legacy.example.com/v1", None),
+        )
+
 
 class TestGenerateProviderId(unittest.TestCase):
     """generate_provider_id() produces valid short ids."""
@@ -205,7 +268,6 @@ class TestDragSensitiveNested(unittest.TestCase):
 
     def test_nested_api_key_masked(self):
         from config import drag_sensitive
-        import json
         test_config = {
             "open_ai_api_key": "sk-1234567890abcdef",
             "custom_providers": [
@@ -234,6 +296,36 @@ class TestDragSensitiveNested(unittest.TestCase):
         result = drag_sensitive(test_str)
         self.assertNotIn("1234567890abcdef", result)
         self.assertNotIn("nested-very-long-secret", result)
+
+    def test_tokens_passwords_and_headers_masked(self):
+        from config import drag_sensitive
+        test_config = {
+            "web_password": "Pass2024xyz",
+            "discord_token": "MTU0.discord-bot-token-value",
+            "external_api_token": "ext-api-token-abcdef",
+            "claude_api_cookie": "sessionKey=sk-ant-cookie",
+            "custom_providers": [{"id": "p1", "headers": {"Authorization": "Bearer header-secret-value"}}],
+        }
+        result = str(drag_sensitive(test_config))
+        for leaked in ("Pass", "2024", "xyz", "discord-bot-token", "ext-api-token",
+                       "sk-ant-cookie", "header-secret"):
+            self.assertNotIn(leaked, result)
+        self.assertEqual(drag_sensitive(test_config)["web_password"], "********")
+
+    def test_short_secret_hidden_and_other_values_kept(self):
+        from config import drag_sensitive
+        result = drag_sensitive({
+            "telegram_token": "abc123",
+            "web_password": "",
+            "agent_max_context_tokens": 200000,
+            "weixin_credentials_path": "~/.weixin_cow_credentials.json",
+            "model": "deepseek-flash",
+        })
+        self.assertEqual(result["telegram_token"], "********")
+        self.assertEqual(result["web_password"], "")
+        self.assertEqual(result["agent_max_context_tokens"], 200000)
+        self.assertEqual(result["weixin_credentials_path"], "~/.weixin_cow_credentials.json")
+        self.assertEqual(result["model"], "deepseek-flash")
 
 
 if __name__ == "__main__":

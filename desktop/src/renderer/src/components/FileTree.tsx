@@ -86,7 +86,7 @@ const FileTree: React.FC = () => {
   return (
     <div className="flex flex-col flex-1 min-h-0">
       <div className="flex items-center gap-1.5 px-2.5 py-2">
-        <div className="flex-1 flex items-center gap-2 h-8 px-2.5 rounded-btn bg-inset">
+        <div className="flex-1 flex items-center gap-2 h-8 px-2.5 rounded-btn bg-inset-2">
           <Search size={12} className="text-content-tertiary shrink-0" />
           <input
             value={query}

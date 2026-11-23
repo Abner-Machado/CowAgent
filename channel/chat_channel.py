@@ -1,9 +1,9 @@
+import copy
 import os
 import re
 import threading
 import time
-from asyncio import CancelledError
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 
 from bridge.context import *
 from bridge.reply import *
@@ -17,7 +17,7 @@ from plugins import *
 
 try:
     from voice.audio_convert import any_to_wav
-except Exception as e:
+except Exception:
     pass
 
 handler_pool = ThreadPoolExecutor(max_workers=8)  # 处理消息的线程池
@@ -48,6 +48,10 @@ class ChatChannel(Channel):
         context.kwargs = kwargs
         if "channel_type" not in context:
             context["channel_type"] = self.channel_type
+        # Multi-instance routing + team: stamp the bound Agent, instance id and
+        # teammates so the router/bridge treat this as a bound (and possibly
+        # team) conversation. All empty on a legacy single-instance channel.
+        self.stamp_instance_context(context)
         if "origin_ctype" not in context:
             context["origin_ctype"] = ctype
         # context首次传入时，receiver是None，根据类型设置receiver
@@ -126,7 +130,7 @@ class ChatChannel(Channel):
                         nick_name = context["msg"].actual_user_nickname
                         if nick_name and nick_name in nick_name_black_list:
                             # 黑名单过滤
-                            logger.warning(f"[chat_channel] Nickname {nick_name} in In BlackList, ignore")
+                            logger.warning(f"[chat_channel] Nickname {nick_name} in blacklist, ignore")
                             return None
 
                         logger.info("[chat_channel]receive group at")
@@ -152,7 +156,7 @@ class ChatChannel(Channel):
                 nick_name = context["msg"].from_user_nickname
                 if nick_name and nick_name in nick_name_black_list:
                     # 黑名单过滤
-                    logger.warning(f"[chat_channel] Nickname '{nick_name}' in In BlackList, ignore")
+                    logger.warning(f"[chat_channel] Nickname '{nick_name}' in blacklist, ignore")
                     return None
 
                 match_prefix = check_prefix(content, conf().get("single_chat_prefix", [""]))
@@ -238,17 +242,20 @@ class ChatChannel(Channel):
                     any_to_wav(file_path, wav_path)
                 except Exception as e:  # 转换失败，直接使用mp3，对于某些api，mp3也可以识别
                     logger.warning("[chat_channel]any to wav error, use raw path. " + str(e))
-                    wav_path = file_path
+                    # pydub creates wav_path before ffmpeg runs, so keep it for cleanup.
+                    stt_path = file_path
+                else:
+                    stt_path = wav_path
                 # 语音识别
-                reply = super().build_voice_to_text(wav_path)
-                # 删除临时文件
-                try:
-                    os.remove(file_path)
-                    if wav_path != file_path:
-                        os.remove(wav_path)
-                except Exception as e:
-                    pass
-                    # logger.warning("[chat_channel]delete temp file error: " + str(e))
+                reply = self._safe_voice_to_text(stt_path)
+                if reply is None:
+                    reply = Reply(ReplyType.ERROR, "语音识别失败，请重试或发送文字消息")
+                # Remove each temp file independently so one failure doesn't skip the other.
+                for path in {file_path, wav_path}:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
 
                 if reply.type == ReplyType.TEXT:
                     new_context = self._compose_context(ContextType.TEXT, reply.content, **context.kwargs)
@@ -270,6 +277,49 @@ class ChatChannel(Channel):
                 return
         return reply
 
+    def _safe_text_to_voice(self, text):
+        """Synthesise ``text`` into a voice Reply, or ``None`` when TTS is unusable.
+
+        ``build_text_to_voice`` is not failure-safe: an unknown vendor raises
+        from the voice factory and custom vendors answer ERROR when their
+        endpoint/model is misconfigured. Unprotected, the exception reaches
+        ``_fail_callback`` (log only) and the user loses the turn, and the
+        ERROR Reply replaces the answer with a generic error.
+        ``_safe_voice_to_text`` guards the STT side of the same turn; TTS
+        should too.
+        """
+        try:
+            voice_reply = super().build_text_to_voice(text)
+        except Exception as e:
+            logger.warning("[chat_channel] build_text_to_voice error, fallback to text: " + str(e))
+            return None
+        if voice_reply is None or voice_reply.type != ReplyType.VOICE:
+            bad_type = getattr(voice_reply, "type", None)
+            logger.warning("[chat_channel] build_text_to_voice returned {}, fallback to text".format(bad_type))
+            return None
+        return voice_reply
+
+    def _safe_voice_to_text(self, wav_path):
+        """Transcribe ``wav_path`` into a Reply, or ``None`` when STT is unusable.
+
+        ``build_voice_to_text`` is not failure-safe either: an unknown vendor
+        raises from the voice factory, several vendors (edge, elevenlabs)
+        answer ``None`` because their ``voiceToText`` is an unimplemented
+        no-op, and a vendor network error escapes. Unprotected, the exception
+        reached ``_fail_callback`` (log only) and the user lost the turn, and a
+        ``None`` answer crashed on ``reply.type``. ``_safe_text_to_voice``
+        guards the TTS side of the same turn; this guards its sibling.
+        """
+        try:
+            reply = super().build_voice_to_text(wav_path)
+        except Exception as e:
+            logger.warning("[chat_channel] build_voice_to_text error: " + str(e))
+            return None
+        if reply is None:
+            logger.warning("[chat_channel] build_voice_to_text returned None")
+            return None
+        return reply
+
     def _decorate_reply(self, context: Context, reply: Reply) -> Reply:
         if reply and reply.type:
             e_context = PluginManager().emit_event(
@@ -282,17 +332,21 @@ class ChatChannel(Channel):
             desire_rtype = context.get("desire_rtype")
             if not e_context.is_pass() and reply and reply.type:
                 if reply.type in self.NOT_SUPPORT_REPLYTYPE:
-                    logger.error("[chat_channel]reply type not support: " + str(reply.type))
+                    unsupported_type = reply.type
+                    logger.error("[chat_channel]reply type not support: " + str(unsupported_type))
                     reply.type = ReplyType.ERROR
-                    reply.content = _t("不支持发送的消息类型: ", "Unsupported message type: ") + str(reply.type)
+                    reply.content = _t("不支持发送的消息类型: ", "Unsupported message type: ") + str(unsupported_type)
 
                 if reply.type == ReplyType.TEXT:
                     reply_text = reply.content
                     if desire_rtype == ReplyType.VOICE and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
-                        # Preserve original text for the "text-then-voice" pattern in _send_reply.
-                        context["voice_reply_text"] = reply.content
-                        reply = super().build_text_to_voice(reply.content)
-                        return self._decorate_reply(context, reply)
+                        voice_reply = self._safe_text_to_voice(reply.content)
+                        if voice_reply is not None:
+                            # Preserve original text for the "text-then-voice" pattern in _send_reply.
+                            context["voice_reply_text"] = reply.content
+                            return self._decorate_reply(context, voice_reply)
+                        # TTS unusable: fall through so the answer is still
+                        # delivered as text instead of losing the turn.
                     if context.get("isgroup", False):
                         if not context.get("no_need_at", False):
                             reply_text = "@" + context["msg"].actual_user_nickname + "\n" + reply_text.strip()
@@ -307,7 +361,7 @@ class ChatChannel(Channel):
                 else:
                     logger.error("[chat_channel] unknown reply type: {}".format(reply.type))
                     return
-            if desire_rtype and desire_rtype != reply.type and reply.type not in [ReplyType.ERROR, ReplyType.INFO]:
+            if reply and desire_rtype and desire_rtype != reply.type and reply.type not in [ReplyType.ERROR, ReplyType.INFO]:
                 logger.warning("[chat_channel] desire_rtype: {}, but reply type: {}".format(context.get("desire_rtype"), reply.type))
             return reply
 
@@ -337,7 +391,10 @@ class ChatChannel(Channel):
                     self._send(text_reply, context)
                     # 短暂延迟后发送图片
                     time.sleep(0.3)
-                    self._send(reply, context)
+                    # The caption is already out; DingTalk and QQ would send it again.
+                    image_reply = copy.copy(reply)
+                    image_reply.text_content = None
+                    self._send(image_reply, context)
                 # Send text bubble before voice, unless channel already streamed
                 # the text (feishu) or natively renders STT under the voice (wechatcom).
                 elif reply.type == ReplyType.VOICE and context.get("voice_reply_text") \
@@ -405,13 +462,13 @@ class ChatChannel(Channel):
                     # Determine whether it is a remote URL or a local file.
                     if url.startswith(('http://', 'https://')):
                         if media_type == 'video':
-                            media_reply = Reply(ReplyType.FILE, url)
+                            media_reply = Reply(ReplyType.VIDEO_URL, url)
                             media_reply.file_name = os.path.basename(url)
                         else:
                             media_reply = Reply(ReplyType.IMAGE_URL, url)
                     elif os.path.exists(url):
                         if media_type == 'video':
-                            media_reply = Reply(ReplyType.FILE, f"file://{url}")
+                            media_reply = Reply(ReplyType.VIDEO, f"file://{url}")
                             media_reply.file_name = os.path.basename(url)
                         else:
                             media_reply = Reply(ReplyType.IMAGE_URL, f"file://{url}")
@@ -445,6 +502,18 @@ class ChatChannel(Channel):
     def _success_callback(self, session_id, **kwargs):  # 线程正常结束时的回调函数
         logger.debug("Worker return success, session_id = {}".format(session_id))
 
+    def _release_claim(self, context: Context, session_id: str) -> None:
+        """Release the "a task is in flight for this conversation" marker.
+        
+        Normally cleared by the Future done-callback. Paths that answer without
+        queueing (/cancel, /steer, a disabled agent) create no Future, and on a
+        passive-reply channel a stale marker would ignore the user from then on.
+        No-op for channels without such a marker.
+        """
+        release = getattr(self, "_release_passive_claim", None)
+        if callable(release):
+            release(context, session_id)
+
     def _fail_callback(self, session_id, exception, **kwargs):  # 线程异常结束时的回调函数
         logger.exception("Worker return exception: {}".format(exception))
 
@@ -456,7 +525,7 @@ class ChatChannel(Channel):
                     self._fail_callback(session_id, exception=worker_exception, **kwargs)
                 else:
                     self._success_callback(session_id, **kwargs)
-            except CancelledError as e:
+            except CancelledError:
                 logger.info("Worker cancelled, session_id = {}".format(session_id))
             except Exception as e:
                 logger.exception("Worker raise exception: {}".format(e))
@@ -471,6 +540,7 @@ class ChatChannel(Channel):
     _BYPASS_QUEUE_COMMANDS = ("/cancel",)
 
     def produce(self, context: Context):
+        self.prepare_project_context(context)
         session_id = context["session_id"]
         try:
             from bridge.bridge import Bridge
@@ -489,6 +559,7 @@ class ChatChannel(Channel):
                 _t("该助手当前已停用，请联系管理员。",
                    "This assistant is currently disabled. Please contact an administrator."),
             ))
+            self._release_claim(context, session_id)
             return
         except Exception as e:
             logger.warning(f"[chat_channel] Agent route failed, using default: {e}")
@@ -500,10 +571,12 @@ class ChatChannel(Channel):
             stripped = context.content.strip().lower()
             if stripped in self._BYPASS_QUEUE_COMMANDS:
                 self._handle_cancel_command(context, session_id)
+                self._release_claim(context, session_id)
                 return
             if re.match(r"^/steer(?:\s|$)", stripped):
                 instruction = context.content.strip()[len("/steer"):].strip()
                 self._handle_steer_command(context, session_id, instruction)
+                self._release_claim(context, session_id)
                 return
 
         with self.lock:
@@ -598,37 +671,87 @@ class ChatChannel(Channel):
             with self.lock:
                 session_ids = list(self.sessions.keys())
             for session_id in session_ids:
-                with self.lock:
-                    context_queue, semaphore = self.sessions[session_id]
-                if semaphore.acquire(blocking=False):  # 等线程处理完毕才能删除
-                    if not context_queue.empty():
-                        context = context_queue.get()
-                        logger.debug("[chat_channel] consume context: {}".format(context))
-                        future: Future = handler_pool.submit(self._handle, context)
-                        future.add_done_callback(self._thread_pool_callback(session_id, context=context))
-                        with self.lock:
-                            if session_id not in self.futures:
-                                self.futures[session_id] = []
-                            self.futures[session_id].append(future)
-                    elif semaphore._initial_value == semaphore._value + 1:  # 除了当前，没有任务再申请到信号量，说明所有任务都处理完毕
-                        with self.lock:
-                            self.futures[session_id] = [t for t in self.futures[session_id] if not t.done()]
-                            assert len(self.futures[session_id]) == 0, "thread pool error"
-                            del self.sessions[session_id]
-                    else:
-                        semaphore.release()
+                # This is the only consumer this channel instance ever gets, so
+                # an exception raised while looking at one session must not
+                # escape: it would end the loop and stop message handling for
+                # good, leaving the queues filling up behind a bot that looks
+                # alive and stays silent. Log it and go on to the next session.
+                try:
+                    self._consume_session(session_id)
+                except Exception as e:
+                    logger.error(f"[chat_channel] consume session {session_id} failed: {e}")
             time.sleep(0.2)
 
-    def cancel_message(self, session_id: str, message_id: str):
+    def _consume_session(self, session_id):
+        """Dispatch one pending context of *session_id*, or retire the session."""
+        with self.lock:
+            context_queue, semaphore = self.sessions[session_id]
+        if not semaphore.acquire(blocking=False):  # 等线程处理完毕才能删除
+            return
+        if not context_queue.empty():
+            context = context_queue.get()
+            logger.debug("[chat_channel] consume context: {}".format(context))
+            try:
+                future: Future = handler_pool.submit(self._handle, context)
+            except Exception:
+                # The done callback is what releases the slot; without a future it never runs.
+                semaphore.release()
+                raise
+            future.add_done_callback(self._thread_pool_callback(session_id, context=context))
+            with self.lock:
+                if session_id not in self.futures:
+                    self.futures[session_id] = []
+                self.futures[session_id].append(future)
+        elif semaphore._initial_value == semaphore._value + 1:  # 除了当前，没有任务再申请到信号量，说明所有任务都处理完毕
+            with self.lock:
+                # futures[session_id] only exists once a context was submitted,
+                # so a session that never got one has no entry here.
+                pending = [t for t in self.futures.get(session_id, []) if not t.done()]
+                if pending:
+                    # Tasks are still running, so keep the session and let the
+                    # next tick look again instead of dropping their handles.
+                    self.futures[session_id] = pending
+                    logger.warning(
+                        f"[chat_channel] session {session_id} still has {len(pending)} "
+                        f"running task(s), keeping it queued"
+                    )
+                else:
+                    self.futures.pop(session_id, None)
+                    del self.sessions[session_id]
+            if pending:
+                semaphore.release()
+        else:
+            semaphore.release()
+
+    def _queue_key(self, session_id: str, agent_id: str = None) -> str:
+        """Return the key produce() filed this session's queue under.
+
+        Session ids are only unique within one Agent, so produce() namespaces
+        them; a cancel that searches with the bare id finds no queue and leaves
+        the queued messages running under an Agent the caller just reset.
+        """
+        try:
+            from bridge.bridge import Bridge
+            return Bridge().get_agent_bridge().scoped_session_key(session_id, agent_id)
+        except Exception as e:
+            logger.warning(
+                "[chat_channel] Agent scope unavailable for {}, cancelling by bare id: {}".format(
+                    session_id, e)
+            )
+            return session_id
+
+    def cancel_message(self, session_id: str, message_id: str, agent_id: str = None):
         """Cancel one channel message without disturbing later queued work.
 
         Queued contexts are matched by their original channel message ID. An
         in-flight agent run is cancelled through the per-request token that the
-        channel placed on the context before dispatch.
+        channel placed on the context before dispatch. ``agent_id`` is the Agent
+        produce() routed the turn to, which decides where the queue is filed.
         """
         removed = 0
+        queue_key = self._queue_key(session_id, agent_id)
         with self.lock:
-            session = self.sessions.get(session_id)
+            session = self.sessions.get(queue_key)
             if session is not None:
                 context_queue = session[0]
                 kept = []
@@ -655,29 +778,39 @@ class ChatChannel(Channel):
         )
         return removed, active
 
+    @staticmethod
+    def _cancel_futures(futures):
+        # Call outside self.lock: cancelling a pending future runs its done
+        # callback right here, and that callback takes self.lock.
+        for future in futures:
+            future.cancel()
+
     # 取消session_id对应的所有任务，只能取消排队的消息和已提交线程池但未执行的任务
-    def cancel_session(self, session_id):
+    def cancel_session(self, session_id, agent_id: str = None):
+        queue_key = self._queue_key(session_id, agent_id)
+        pending = []
         with self.lock:
-            if session_id in self.sessions:
-                # futures[session_id] is only created in consume() when a task is
+            if queue_key in self.sessions:
+                # futures[queue_key] is only created in consume() when a task is
                 # dispatched, so it may be absent if cancel happens right after
                 # produce() but before the first dispatch. Default to [].
-                for future in self.futures.get(session_id, []):
-                    future.cancel()
-                cnt = self.sessions[session_id][0].qsize()
+                pending = list(self.futures.get(queue_key, []))
+                cnt = self.sessions[queue_key][0].qsize()
                 if cnt > 0:
                     logger.info("Cancel {} messages in session {}".format(cnt, session_id))
-                self.sessions[session_id][0] = Dequeue()
+                self.sessions[queue_key][0] = Dequeue()
+        self._cancel_futures(pending)
 
     def cancel_all_session(self):
+        pending = []
         with self.lock:
             for session_id in self.sessions:
-                for future in self.futures.get(session_id, []):
-                    future.cancel()
+                pending.extend(self.futures.get(session_id, []))
                 cnt = self.sessions[session_id][0].qsize()
                 if cnt > 0:
                     logger.info("Cancel {} messages in session {}".format(cnt, session_id))
                 self.sessions[session_id][0] = Dequeue()
+        self._cancel_futures(pending)
 
 
 def check_prefix(content, prefix_list):

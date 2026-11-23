@@ -1,22 +1,29 @@
 """
-Workspace file service - browse and search the agent workspace.
+Workspace file service - browse, search and edit the agent workspace.
 
-Backs the file manager tab and the `@` file reference picker in the web UI.
-Read-only: it never mutates the workspace.
+Backs the file manager tab, the preview panel editor and the `@` file
+reference picker in the web UI.
 
 Every path goes through :meth:`WorkspaceService.resolve`, which rejects
 anything that escapes the workspace root after `..` and symlinks are resolved.
+
+Only :meth:`write_text` mutates anything, and only for a file that already
+exists and holds plain text. It is reachable from the web console but *not*
+from :meth:`dispatch`, so remote transports keep the read-only surface.
 """
 
 import base64
 import mimetypes
 import os
+import tempfile
+import threading
 import time
+import unicodedata
 from typing import Dict, List, Optional
 
 from common.log import logger
 
-from agent.protocol.artifact import classify_kind, is_previewable
+from agent.protocol.artifact import classify_kind, is_editable, is_previewable
 
 # Directories that are large, noisy, or purely internal. Still listable when the
 # user explicitly navigates into them, but skipped by recursive search.
@@ -42,6 +49,34 @@ MAX_CHUNK_BYTES = 2 * 1024 * 1024
 
 # Refuse to serve anything larger; well above what a browser preview needs.
 MAX_FILE_BYTES = 64 * 1024 * 1024
+
+# mtime is compared as a float that has been through JSON on both sides, so
+# allow for the last bit of the timestamp rather than requiring bit equality.
+MTIME_EPSILON = 1e-6
+
+# Services are per request, so optimistic saves need process-wide path locks.
+_WRITE_LOCKS = tuple(threading.RLock() for _ in range(256))
+
+
+class WorkspaceConflictError(Exception):
+    """The file changed on disk since the caller read it."""
+
+
+def _decode_utf8(raw: bytes):
+    """
+    Decode as UTF-8, reporting whether anything had to be replaced.
+
+    A file that isn't valid UTF-8 - a legacy GBK or Latin-1 document, or a
+    binary that slipped past the extension check - still has to preview, but an
+    editor must not offer to save it: the round-trip would write a replacement
+    character over every byte that failed to decode.
+
+    :return: ``(text, lossy)``
+    """
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace"), True
 
 
 class WorkspaceService:
@@ -253,6 +288,10 @@ class WorkspaceService:
         rather than in-process, so the path checks and size caps below apply
         uniformly. Actions: ``tree`` ``search`` ``resolve`` ``meta`` ``read``
         ``file``.
+
+        Read-only by design: ``write_text`` is intentionally not dispatchable,
+        so adding it here would hand write access to every remote transport
+        that forwards its action string straight through.
         """
         payload = payload or {}
         try:
@@ -329,19 +368,124 @@ class WorkspaceService:
         Read a text file as a string.
 
         Undecodable bytes are replaced rather than raising, so a file with a
-        stray encoding still previews instead of erroring out.
+        stray encoding still previews instead of erroring out. `mtime` is the
+        baseline an editor passes back to :meth:`write_text`, and `editable`
+        says whether saving would be accepted at all.
         """
         full = self._resolve_file(rel_path)
         max_bytes = max(1, min(int(max_bytes or MAX_TEXT_BYTES), MAX_TEXT_BYTES))
-        size = os.path.getsize(full)
         with open(full, "rb") as f:
+            # An atomic writer can replace the path while this descriptor is
+            # open. The editor baseline must describe the bytes we read,
+            # rather than the replacement now reachable through the path.
+            snapshot = os.fstat(f.fileno())
             raw = f.read(max_bytes)
+        size = snapshot.st_size
+        truncated = size > len(raw)
+        content, lossy = _decode_utf8(raw)
         return {
             "path": self.to_rel(full),
-            "content": raw.decode("utf-8", errors="replace"),
-            "truncated": size > len(raw),
+            "content": content,
+            "truncated": truncated,
+            "lossy": lossy,
             "size": size,
+            "mtime": snapshot.st_mtime,
+            # Neither a partial read nor a lossy decode may be edited: saving
+            # would truncate the tail in the first case and write replacement
+            # characters over every undecodable byte in the second.
+            "editable": is_editable(classify_kind(full)) and not truncated and not lossy,
         }
+
+    def write_text(self, rel_path: str, content: str,
+                   expected_mtime: Optional[float] = None) -> Dict:
+        """
+        Overwrite an existing text file with `content`.
+
+        The file must already exist: the preview panel edits what it shows, and
+        a path that no longer resolves means the caller's view is stale rather
+        than that a new file is wanted.
+
+        :param expected_mtime: the mtime the caller last read. When given and
+            the file has since changed - typically because the agent rewrote it
+            while the user was typing - raise :class:`WorkspaceConflictError`
+            instead of dropping those changes on the floor.
+        """
+        full = self._resolve_file(rel_path)
+        # POSIX normcase does not fold case or canonical Unicode aliases on APFS.
+        # Extra collisions on case-sensitive filesystems only serialize saves.
+        key = unicodedata.normalize("NFC", os.path.normcase(full)).casefold()
+        with _WRITE_LOCKS[hash(key) % len(_WRITE_LOCKS)]:
+            return self._write_text_locked(full, content, expected_mtime)
+
+    def _write_text_locked(self, full: str, content: str,
+                           expected_mtime: Optional[float]) -> Dict:
+        """Check the editor version and publish under the same process lock."""
+        kind = classify_kind(full)
+        if not is_editable(kind):
+            raise ValueError(f"Not an editable text file: {self.to_rel(full)}")
+
+        if expected_mtime is not None:
+            current = os.path.getmtime(full)
+            if abs(current - float(expected_mtime)) > MTIME_EPSILON:
+                raise WorkspaceConflictError(
+                    f"File changed on disk since it was read: {self.to_rel(full)}"
+                )
+
+        # Re-derive both editability rules from disk rather than trusting that
+        # the caller honoured the `editable` flag it was given by `read_text`.
+        size = os.path.getsize(full)
+        if size > MAX_TEXT_BYTES:
+            raise ValueError(f"File too large to edit: {size} bytes")
+        with open(full, "rb") as f:
+            existing = f.read()
+        if _decode_utf8(existing)[1]:
+            raise ValueError(f"Not a UTF-8 text file: {self.to_rel(full)}")
+
+        # A text area always hands back LF. Restore CRLF when the file already
+        # used it, so saving one line does not rewrite every line.
+        newline = "\r\n" if b"\r\n" in existing else "\n"
+        data = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+        if newline != "\n":
+            data = data.replace("\n", newline)
+        encoded = data.encode("utf-8")
+        if len(encoded) > MAX_TEXT_BYTES:
+            raise ValueError(f"Content too large: {len(encoded)} bytes")
+
+        self._replace_atomically(full, encoded)
+        return {
+            "path": self.to_rel(full),
+            "size": os.path.getsize(full),
+            "mtime": os.path.getmtime(full),
+        }
+
+    @staticmethod
+    def _replace_atomically(full: str, data: bytes) -> None:
+        """
+        Write via a sibling temp file and rename over the target.
+
+        A crash or a full disk then leaves the original file intact instead of
+        half-written, and a reader never observes a partial document.
+        """
+        directory = os.path.dirname(full)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".cow-edit-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            # mkstemp creates the temp file 0600; carry over the original mode so
+            # an edit does not silently strip the executable bit or group access.
+            try:
+                os.chmod(tmp_path, os.stat(full).st_mode & 0o7777)
+            except OSError:
+                pass
+            os.replace(tmp_path, full)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def read_chunk(self, rel_path: str, offset: int = 0,
                    chunk_size: int = DEFAULT_CHUNK_BYTES) -> Dict:

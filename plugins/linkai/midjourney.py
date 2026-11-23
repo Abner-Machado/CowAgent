@@ -133,7 +133,7 @@ class MJBot:
 
         if not self._is_mj_open(context):
             logger.warn("Midjourney绘画未开启，请查看 plugins/linkai/config.json 中的配置，或者在LinkAI平台 应用中添加/打开”MJ“插件")
-            self._set_reply_text(f"Midjourney绘画未开启", e_context, level=ReplyType.INFO)
+            self._set_reply_text("Midjourney绘画未开启", e_context, level=ReplyType.INFO)
             return
 
         if not self._check_rate_limit(session_id, e_context):
@@ -158,7 +158,11 @@ class MJBot:
                 self._set_reply_text(f"{cmd[0]} 命令缺少参数", e_context)
                 return
             img_id = clist[0]
-            index = int(clist[1])
+            try:
+                index = int(clist[1])
+            except ValueError:
+                self._set_reply_text(f"图片序号 {clist[1]} 错误，应为 1 至 4 的数字", e_context)
+                return
             if index < 1 or index > 4:
                 self._set_reply_text(f"图片序号 {index} 错误，应在 1 至 4 之间", e_context)
                 return
@@ -184,7 +188,7 @@ class MJBot:
             e_context['reply'] = reply
             e_context.action = EventAction.BREAK_PASS
         else:
-            self._set_reply_text(f"暂不支持该命令", e_context)
+            self._set_reply_text("暂不支持该命令", e_context)
 
     def generate(self, prompt: str, user_id: str, e_context: EventContext) -> Reply:
         """
@@ -200,37 +204,34 @@ class MJBot:
         if not self.config.get("img_proxy"):
             body["img_proxy"] = False
         res = requests.post(url=self.base_url + "/generate", json=body, headers=self.headers, timeout=(5, 40))
-        if res.status_code == 200:
-            res = res.json()
-            logger.debug(f"[MJ] image generate, res={res}")
-            if res.get("code") == 200:
-                task_id = res.get("data").get("task_id")
-                real_prompt = res.get("data").get("real_prompt")
-                if mode == TaskMode.RELAX.value:
-                    time_str = "1~10分钟"
-                else:
-                    time_str = "1分钟"
-                content = f"🚀您的作品将在{time_str}左右完成，请耐心等待\n- - - - - - - - -\n"
-                if real_prompt:
-                    content += f"初始prompt: {prompt}\n转换后prompt: {real_prompt}"
-                else:
-                    content += f"prompt: {prompt}"
-                reply = Reply(ReplyType.INFO, content)
-                task = MJTask(id=task_id, status=Status.PENDING, raw_prompt=prompt, user_id=user_id,
-                              task_type=TaskType.GENERATE)
-                # put to memory dict
-                self.tasks[task.id] = task
-                # asyncio.run_coroutine_threadsafe(self.check_task(task, e_context), self.event_loop)
-                self._do_check_task(task, e_context)
-                return reply
-        else:
-            res_json = res.json()
-            logger.error(f"[MJ] generate error, msg={res_json.get('message')}, status_code={res.status_code}")
-            if res.status_code == INVALID_REQUEST:
-                reply = Reply(ReplyType.ERROR, "图片生成失败，请检查提示词参数或内容")
+        ok, data, message = Util.parse_linkai_response(res)
+        logger.debug(f"[MJ] image generate, ok={ok}, message={message}")
+        if ok:
+            task_id = data.get("task_id")
+            real_prompt = data.get("real_prompt")
+            if mode == TaskMode.RELAX.value:
+                time_str = "1~10分钟"
             else:
-                reply = Reply(ReplyType.ERROR, "图片生成失败，请稍后再试")
+                time_str = "1分钟"
+            content = f"🚀您的作品将在{time_str}左右完成，请耐心等待\n- - - - - - - - -\n"
+            if real_prompt:
+                content += f"初始prompt: {prompt}\n转换后prompt: {real_prompt}"
+            else:
+                content += f"prompt: {prompt}"
+            reply = Reply(ReplyType.INFO, content)
+            task = MJTask(id=task_id, status=Status.PENDING, raw_prompt=prompt, user_id=user_id,
+                          task_type=TaskType.GENERATE)
+            # put to memory dict
+            self.tasks[task.id] = task
+            # asyncio.run_coroutine_threadsafe(self.check_task(task, e_context), self.event_loop)
+            self._do_check_task(task, e_context)
             return reply
+        # A refused call lands here too: LinkAI reports it as HTTP 200 with a
+        # non-zero code, not as a non-200 status.
+        logger.error(f"[MJ] generate error, msg={message}, status_code={res.status_code}")
+        if res.status_code == INVALID_REQUEST:
+            return Reply(ReplyType.ERROR, "图片生成失败，请检查提示词参数或内容")
+        return Reply(ReplyType.ERROR, "图片生成失败，请稍后再试")
 
     def do_operate(self, task_type: TaskType, user_id: str, img_id: str, e_context: EventContext,
                    index: int = None) -> Reply:
@@ -241,31 +242,28 @@ class MJBot:
         if not self.config.get("img_proxy"):
             body["img_proxy"] = False
         res = requests.post(url=self.base_url + "/operate", json=body, headers=self.headers, timeout=(5, 40))
-        logger.debug(res)
-        if res.status_code == 200:
-            res = res.json()
-            if res.get("code") == 200:
-                task_id = res.get("data").get("task_id")
-                logger.info(f"[MJ] image operate processing, task_id={task_id}")
-                icon_map = {TaskType.UPSCALE: "🔎", TaskType.VARIATION: "🪄", TaskType.RESET: "🔄"}
-                content = f"{icon_map.get(task_type)}图片正在{task_name_mapping.get(task_type.name)}中，请耐心等待"
-                reply = Reply(ReplyType.INFO, content)
-                task = MJTask(id=task_id, status=Status.PENDING, user_id=user_id, task_type=task_type)
-                # put to memory dict
-                self.tasks[task.id] = task
-                key = f"{task_type.name}_{img_id}_{index}"
-                self.temp_dict[key] = True
-                # asyncio.run_coroutine_threadsafe(self.check_task(task, e_context), self.event_loop)
-                self._do_check_task(task, e_context)
-                return reply
-        else:
-            error_msg = ""
-            if res.status_code == NOT_FOUND_ORIGIN_IMAGE:
-                error_msg = "请输入正确的图片ID"
-            res_json = res.json()
-            logger.error(f"[MJ] operate error, msg={res_json.get('message')}, status_code={res.status_code}")
-            reply = Reply(ReplyType.ERROR, error_msg or "图片生成失败，请稍后再试")
+        ok, data, message = Util.parse_linkai_response(res)
+        logger.debug(f"[MJ] image operate, ok={ok}, message={message}")
+        if ok:
+            task_id = data.get("task_id")
+            logger.info(f"[MJ] image operate processing, task_id={task_id}")
+            icon_map = {TaskType.UPSCALE: "🔎", TaskType.VARIATION: "🪄", TaskType.RESET: "🔄"}
+            content = f"{icon_map.get(task_type)}图片正在{task_name_mapping.get(task_type.name)}中，请耐心等待"
+            reply = Reply(ReplyType.INFO, content)
+            task = MJTask(id=task_id, status=Status.PENDING, user_id=user_id, task_type=task_type)
+            # put to memory dict
+            self.tasks[task.id] = task
+            key = f"{task_type.name}_{img_id}_{index}"
+            self.temp_dict[key] = True
+            # asyncio.run_coroutine_threadsafe(self.check_task(task, e_context), self.event_loop)
+            self._do_check_task(task, e_context)
             return reply
+        # A refused call lands here too (HTTP 200 with a non-zero code).
+        logger.error(f"[MJ] operate error, msg={message}, status_code={res.status_code}")
+        error_msg = ""
+        if res.status_code == NOT_FOUND_ORIGIN_IMAGE:
+            error_msg = "请输入正确的图片ID"
+        return Reply(ReplyType.ERROR, error_msg or "图片生成失败，请稍后再试")
 
     def check_task_sync(self, task: MJTask, e_context: EventContext):
         logger.debug(f"[MJ] start check task status, {task}")
@@ -322,7 +320,7 @@ class MJBot:
         trigger_prefix = conf().get("plugin_trigger_prefix", "$")
         text = ""
         if task.task_type == TaskType.GENERATE or task.task_type == TaskType.VARIATION or task.task_type == TaskType.RESET:
-            text = f"🎨绘画完成!\n"
+            text = "🎨绘画完成!\n"
             if task.raw_prompt:
                 text += f"prompt: {task.raw_prompt}\n"
             text += f"- - - - - - - - -\n图片ID: {task.img_id}"
@@ -441,7 +439,7 @@ def _send(channel, reply: Reply, context, retry_cnt=0):
         logger.exception(e)
         if retry_cnt < 2:
             time.sleep(3 + 3 * retry_cnt)
-            channel.send(reply, context, retry_cnt + 1)
+            _send(channel, reply, context, retry_cnt + 1)
 
 
 def check_prefix(content, prefix_list):

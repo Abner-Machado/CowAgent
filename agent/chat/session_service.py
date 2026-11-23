@@ -31,31 +31,22 @@ def _truncate_fallback_title(user_message: str, max_len: int = 30) -> str:
     return first_line
 
 
-def generate_session_title(user_message: str, assistant_reply: str = "",
-                            session_id: str = "") -> str:
-    """
-    Generate a short session title by calling the current bot's reply_text.
-    Falls back to the first line of the user message if the LLM call fails
-    or returns an obvious error sentinel.
-    """
-    fallback = _truncate_fallback_title(user_message)
+def _clean_title(raw: str) -> Optional[str]:
+    title = re.sub(r'<think>.*?</think>', '', raw or "", flags=re.DOTALL).strip().strip('"\'')
+    if title and len(title) <= 50:
+        return title
+    return None
+
+
+def _title_from_primary(prompt: str, session_id: str) -> Optional[str]:
+    """Ask the global chat bot for a title; None when the call failed."""
     try:
         from bridge.bridge import Bridge
         from models.session_manager import Session
         bot = Bridge().get_bot("chat")
 
-        prompt_parts = [f"User: {user_message[:300]}"]
-        if assistant_reply:
-            prompt_parts.append(f"Assistant: {assistant_reply[:300]}")
-
         session = Session(session_id or "__title_gen__", system_prompt="")
-        session.messages = [
-            {"role": "user", "content": (
-                "Generate a very short title (max 15 characters for Chinese, max 6 words for English) "
-                "summarizing this conversation. Return ONLY the title text, nothing else.\n\n"
-                + "\n".join(prompt_parts)
-            )}
-        ]
+        session.messages = [{"role": "user", "content": prompt}]
 
         result = bot.reply_text(session) or {}
         # When bots fail (network error, auth error, rate limit, etc.) they
@@ -66,17 +57,69 @@ def generate_session_title(user_message: str, assistant_reply: str = "",
         if completion_tokens <= 0:
             logger.warning(
                 f"[SessionService] Title generation got empty completion "
-                f"(completion_tokens={completion_tokens}, content='{raw[:50]}'), "
-                f"using fallback")
-            return fallback
+                f"(completion_tokens={completion_tokens}, content='{raw[:50]}')")
+            return None
 
-        title = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip().strip('"\'')
-        logger.info(f"[SessionService] Title generation result: '{title}' (len={len(title)})")
-        if title and len(title) <= 50:
-            return title
+        title = _clean_title(raw)
+        logger.info(f"[SessionService] Title generation result: '{title}'")
+        return title
     except Exception as e:
         logger.warning(f"[SessionService] Title generation failed: {e}")
-    return fallback
+        return None
+
+
+def _title_from_fallback_chain(prompt: str) -> Optional[str]:
+    """Retry on the configured chat fallback chain, one attempt per link."""
+    try:
+        from agent.memory.summarizer import MemoryFlushManager
+        from agent.protocol.models import LLMRequest
+        from bridge.agent_bridge import AgentLLMModel
+        from bridge.bridge import Bridge
+        model = AgentLLMModel(Bridge())
+        chain = model.fallback_config()["chain"]
+    except Exception as e:
+        logger.warning(f"[SessionService] Title fallback unavailable: {e}")
+        return None
+
+    for _ in chain:
+        if not model.use_fallback():
+            break
+        try:
+            response = model.call(LLMRequest(
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            ))
+            title = _clean_title(MemoryFlushManager._extract_response_text(response))
+        except Exception as e:
+            logger.warning(f"[SessionService] Title generation failed on fallback {model.model}: {e}")
+            continue
+        if title:
+            logger.info(f"[SessionService] Title generation result via fallback {model.model}: '{title}'")
+            return title
+    return None
+
+
+def generate_session_title(user_message: str, assistant_reply: str = "",
+                            session_id: str = "") -> str:
+    """
+    Generate a short session title with the current chat bot, walking the
+    configured fallback chain when it fails. Falls back to the first line of
+    the user message if every model fails.
+    """
+    prompt_parts = [f"User: {user_message[:300]}"]
+    if assistant_reply:
+        prompt_parts.append(f"Assistant: {assistant_reply[:300]}")
+    prompt = (
+        "Generate a very short title (max 15 characters for Chinese, max 6 words for English) "
+        "summarizing this conversation. Return ONLY the title text, nothing else.\n\n"
+        + "\n".join(prompt_parts)
+    )
+
+    title = _title_from_primary(prompt, session_id) or _title_from_fallback_chain(prompt)
+    if title:
+        return title
+    logger.warning("[SessionService] Title generation failed on all models, using fallback")
+    return _truncate_fallback_title(user_message)
 
 
 # Built-in fallback config, used when prompts.json is missing or broken.
@@ -271,12 +314,12 @@ class SessionService:
 
     def _resolve_agent_id(self, agent_id: str = None) -> str:
         from agent.registry import get_agent_registry
-        return get_agent_registry().get(agent_id or self.agent_id).id
+        return get_agent_registry().get_addressed(agent_id or self.agent_id).id
 
     def _get_store(self, agent_id: str = None):
         from agent.registry import get_agent_registry
         from agent.memory import get_conversation_store
-        profile = get_agent_registry().get(agent_id or self.agent_id)
+        profile = get_agent_registry().get_addressed(agent_id or self.agent_id)
         return get_conversation_store(profile.workspace)
 
     def _remove_agent(self, session_id: str, agent_id: str = None):
@@ -328,16 +371,53 @@ class SessionService:
         except Exception as e:
             logger.warning(f"[SessionService] Cancel on delete failed: {e}")
 
-    def delete_session(self, session_id: str, agent_id: str = None) -> None:
+    def delete_session(self, session_id: str, agent_id: str = None,
+                       fanout: bool = True) -> None:
         if not session_id:
             raise ValueError("session_id required")
         session_id = self._normalize_sid(session_id)
+        # Read the roster first: forgetting the side stores drops it.
+        teammates = self._teammates(session_id, agent_id) if fanout else []
 
         self._cancel_running(session_id, agent_id)
         store = self._get_store(agent_id)
         store.clear_session(session_id)
+        self._forget_side_stores(session_id, agent_id)
         self._remove_agent(session_id, agent_id)
+        # A team conversation keeps one transcript per participant.
+        self.delete_teammate_copies(session_id, teammates)
         logger.info(f"[SessionService] Session deleted: {session_id}")
+
+    def delete_teammate_copies(self, session_id: str, teammates) -> None:
+        """Drop each teammate's local copy of a deleted session, best-effort.
+
+        A peer in another process is out of reach here.
+        """
+        for member_id in teammates:
+            try:
+                self.delete_session(session_id, agent_id=member_id, fanout=False)
+            except Exception as e:
+                logger.warning(
+                    f"[SessionService] Delete failed for agent '{member_id}': {e}")
+
+    def team_members(self, session_id: str, agent_id: str = None) -> list:
+        """Everyone else holding a transcript of this session."""
+        return self._teammates(session_id, agent_id)
+
+    def _forget_side_stores(self, session_id: str, agent_id: str = None) -> None:
+        """Drop the session's project binding and prefs, each best-effort."""
+        try:
+            scoped = self._resolve_agent_id(agent_id)
+        except Exception as e:
+            logger.debug(f"[SessionService] Side-store cleanup skipped: {e}")
+            return
+        from agent.workspace import project_store, session_prefs
+
+        for module in (project_store, session_prefs):
+            try:
+                module.forget_session(session_id, agent_id=scoped)
+            except Exception as e:
+                logger.debug(f"[SessionService] Side-store cleanup skipped: {e}")
 
     def rename_session(
         self, session_id: str, title: str, agent_id: str = None
@@ -353,9 +433,13 @@ class SessionService:
         if not found:
             raise ValueError("session not found")
 
-    def clear_context(self, session_id: str, agent_id: str = None) -> int:
+    def clear_context(self, session_id: str, agent_id: str = None, fanout: bool = True) -> int:
         """
         Set context boundary. Returns the new context_start_seq value.
+
+        A team conversation keeps one transcript per participant, so every
+        participant is cleared; otherwise the rest replay it on the next turn.
+        ``fanout=False`` clears this Agent alone.
         """
         if not session_id:
             raise ValueError("session_id required")
@@ -364,7 +448,74 @@ class SessionService:
         store = self._get_store(agent_id)
         new_seq = store.clear_context(session_id)
         self._remove_agent(session_id, agent_id)
+        if fanout:
+            for member_id in self._teammates(session_id, agent_id):
+                self._clear_teammate(session_id, member_id)
         return new_seq
+
+    def _teammates(self, session_id: str, agent_id: str = None) -> list:
+        """Everyone else holding a transcript of this session."""
+        try:
+            own_id = self._resolve_agent_id(agent_id)
+        except Exception:
+            own_id = ""
+        others = []
+        try:
+            from agent.workspace import session_prefs
+
+            for (host_id, sid), members in session_prefs.members_index().items():
+                if sid != session_id:
+                    continue
+                for member_id in (host_id, *(members or [])):
+                    member_id = str(member_id or "").strip()
+                    if member_id and member_id != own_id and member_id not in others:
+                        others.append(member_id)
+        except Exception as e:
+            logger.debug(f"[SessionService] roster lookup skipped: {e}")
+        return others
+
+    def _clear_teammate(self, session_id: str, member_id: str) -> None:
+        """Clear one teammate's transcript, wherever it is kept."""
+        try:
+            from agent.registry import get_agent_registry
+
+            get_agent_registry().get_addressed(member_id, require_enabled=False)
+        except Exception:
+            self._clear_peer(session_id, member_id)
+            return
+        try:
+            self.clear_context(session_id, agent_id=member_id, fanout=False)
+        except Exception as e:
+            logger.warning(f"[SessionService] Clear failed for agent '{member_id}': {e}")
+
+    def _clear_peer(self, session_id: str, member_id: str) -> None:
+        import uuid
+
+        try:
+            from agent.multiagent import MODE_CLEAR, InvokeRequest, get_transport, peer as peer_of
+
+            transport = get_transport()
+            found = peer_of(member_id)
+            if transport is None or found is None:
+                return
+            own = self._resolve_agent_id()
+            result = transport.invoke(InvokeRequest(
+                request_id=uuid.uuid4().hex,
+                target_id=found.id,
+                task="/clear",
+                source_id=own,
+                source_name=own,
+                root_session_id=session_id,
+                trace=(own,),
+                depth=0,
+                mode=MODE_CLEAR,
+                # A clear is a single write, so the wait stays short.
+                timeout_seconds=15.0,
+            ))
+            if not result.ok:
+                logger.warning(f"[SessionService] Clear refused by '{member_id}': {result.error}")
+        except Exception as e:
+            logger.warning(f"[SessionService] Clear failed for '{member_id}': {e}")
 
     def gen_title(self, session_id: str, user_message: str,
                   assistant_reply: str = "", agent_id: str = None) -> str:
@@ -412,10 +563,13 @@ class SessionService:
         agent_id = payload.get("agent_id") or self.agent_id
         try:
             if action == "list_sessions":
+                from agent.memory.conversation_store import page_window
+
+                page, page_size = page_window(payload.get("page", 1), payload.get("page_size", 50), 50)
                 result = self.list_sessions(
                     channel_type=payload.get("channel_type"),
-                    page=int(payload.get("page", 1)),
-                    page_size=int(payload.get("page_size", 50)),
+                    page=page,
+                    page_size=page_size,
                     agent_id=agent_id,
                 )
                 return {"action": action, "code": 200, "message": "success", "payload": result}

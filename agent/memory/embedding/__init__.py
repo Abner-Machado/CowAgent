@@ -24,6 +24,7 @@ from agent.memory.embedding.rebuild import (
 )
 from agent.memory.embedding.state import (
     cleanup_legacy_state_file,
+    detect_chunker_version,
     detect_index_dim,
 )
 
@@ -39,5 +40,6 @@ __all__ = [
     "clear_index",
     "rebuild_in_process",
     "cleanup_legacy_state_file",
+    "detect_chunker_version",
     "detect_index_dim",
 ]

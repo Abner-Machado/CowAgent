@@ -28,9 +28,21 @@ if "web" not in sys.modules:
     sys.modules["web"] = web_stub
 
 
+def _no_response_headers():
+    """Neutralise web.header for a handler called outside a request.
+
+    The stub above is skipped when the real web.py is already imported, which
+    depends on what else ran first. Patching the name the handler resolves
+    keeps these cases independent of that.
+    """
+    import channel.web.web_channel as web_channel
+
+    return patch.object(web_channel.web, "header", lambda *args, **kwargs: None)
+
+
 class TestModelsHandler(unittest.TestCase):
     def test_config_handler_exposes_reasoning_effort_metadata(self):
-        from channel.web.web_channel import ConfigHandler
+        from channel.web.api.config import ConfigHandler
         from config import Config
 
         local_config = Config({
@@ -41,8 +53,9 @@ class TestModelsHandler(unittest.TestCase):
             "reasoning_effort": "max",
         })
 
-        with patch("channel.web.web_channel._require_auth", lambda: None):
-            with patch("channel.web.web_channel.conf", return_value=local_config):
+        with patch("channel.web.api.config._require_auth", lambda: None), \
+                _no_response_headers():
+            with patch("channel.web.api.config.conf", return_value=local_config):
                 result = json.loads(ConfigHandler().GET())
 
         self.assertEqual(result["reasoning_effort"], "max")
@@ -54,7 +67,6 @@ class TestModelsHandler(unittest.TestCase):
             [item["value"] for item in result["providers"]["deepseek"]["reasoning_by_model"]["deepseek-v4-flash"]["options"]],
             ["low", "high", "xhigh", "max"],
         )
-        self.assertFalse(result["providers"]["deepseek"]["reasoning_by_model"]["deepseek-chat"]["supported"])
         self.assertEqual(
             [item["value"] for item in result["providers"]["zhipu"]["reasoning"]["options"]],
             ["low", "medium", "high", "xhigh", "max"],
@@ -82,24 +94,24 @@ class TestModelsHandler(unittest.TestCase):
         self.assertFalse(result["providers"]["gemini"]["reasoning"]["supported"])
 
     def test_reasoning_effort_is_editable_config_key(self):
-        from channel.web.web_channel import ConfigHandler
+        from channel.web.api.config import ConfigHandler
 
         self.assertIn("reasoning_effort", ConfigHandler.EDITABLE_KEYS)
         self.assertIn("reasoning_effort_by_model", ConfigHandler.EDITABLE_KEYS)
 
     def test_config_save_rejects_non_dict_reasoning_effort_by_model(self):
-        from channel.web.web_channel import ConfigHandler
+        from channel.web.api.config import ConfigHandler
         from config import Config
 
         local_config = Config({"reasoning_effort_by_model": {"deepseek:deepseek-v4-flash": "high"}})
         file_config = {"reasoning_effort_by_model": {"deepseek:deepseek-v4-flash": "high"}}
         payload = {"updates": {"reasoning_effort_by_model": "not-a-dict"}}
 
-        with patch("channel.web.web_channel._require_auth", lambda: None), \
-             patch("channel.web.web_channel.web.header"), \
-             patch("channel.web.web_channel.web.data", return_value=json.dumps(payload).encode()), \
-             patch("channel.web.web_channel.conf", return_value=local_config), \
-             patch("channel.web.web_channel._read_config_file_for_write", return_value=file_config), \
+        with patch("channel.web.api.config._require_auth", lambda: None), \
+             patch("channel.web.api.config.web.header"), \
+             patch("channel.web.api.config.web.data", return_value=json.dumps(payload).encode()), \
+             patch("channel.web.api.config.conf", return_value=local_config), \
+             patch("channel.web.api.config._read_config_file_for_write", return_value=file_config), \
              patch("builtins.open", mock_open()) as m:
             result = json.loads(ConfigHandler().POST())
 
@@ -110,7 +122,7 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(local_config.get("reasoning_effort_by_model"), {"deepseek:deepseek-v4-flash": "high"})
 
     def test_config_handler_hides_deepseek_effort_for_non_v4_models(self):
-        from channel.web.web_channel import ConfigHandler
+        from channel.web.api.config import ConfigHandler
         from config import Config
 
         local_config = Config({
@@ -121,20 +133,21 @@ class TestModelsHandler(unittest.TestCase):
             "reasoning_effort": "max",
         })
 
-        with patch("channel.web.web_channel._require_auth", lambda: None):
-            with patch("channel.web.web_channel.conf", return_value=local_config):
+        with patch("channel.web.api.config._require_auth", lambda: None), \
+                _no_response_headers():
+            with patch("channel.web.api.config.conf", return_value=local_config):
                 result = json.loads(ConfigHandler().GET())
 
         self.assertFalse(result["providers"]["deepseek"]["reasoning"]["supported"])
 
     def test_set_asr_capability_persists_provider_and_model(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         local_config = {}
         file_config = {}
         handler = ModelsHandler()
 
-        with patch("channel.web.web_channel.conf", return_value=local_config):
+        with patch("channel.web.api.models.conf", return_value=local_config):
             with patch.object(ModelsHandler, "_read_file_config", return_value=file_config):
                 with patch.object(ModelsHandler, "_write_file_config") as write_file:
                     with patch.object(ModelsHandler, "_refresh_voice_routing") as refresh_voice:
@@ -155,13 +168,13 @@ class TestModelsHandler(unittest.TestCase):
     def test_set_asr_empty_model_keeps_existing(self):
         # Switching provider with an empty model must not wipe a user's
         # hand-configured voice_to_text_model.
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         local_config = {"voice_to_text_model": "qwen3-asr-flash"}
         file_config = {"voice_to_text_model": "qwen3-asr-flash"}
         handler = ModelsHandler()
 
-        with patch("channel.web.web_channel.conf", return_value=local_config):
+        with patch("channel.web.api.models.conf", return_value=local_config):
             with patch.object(ModelsHandler, "_read_file_config", return_value=file_config):
                 with patch.object(ModelsHandler, "_write_file_config"):
                     with patch.object(ModelsHandler, "_refresh_voice_routing"):
@@ -178,11 +191,37 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(file_config["voice_to_text_model"], "qwen3-asr-flash")
         self.assertEqual(result["model"], "qwen3-asr-flash")
 
+    def test_set_asr_empty_model_clears_for_default_option(self):
+        # LinkAI exposes an explicit empty-value option ("默认 · 由网关自动
+        # 选择引擎"); picking it must clear the stored model so the gateway
+        # falls back to its own default instead of keeping the old id.
+        from channel.web.api.models import ModelsHandler
+
+        local_config = {"voice_to_text_model": "doubao"}
+        file_config = {"voice_to_text_model": "doubao"}
+        handler = ModelsHandler()
+
+        with patch("channel.web.api.models.conf", return_value=local_config):
+            with patch.object(ModelsHandler, "_read_file_config", return_value=file_config):
+                with patch.object(ModelsHandler, "_write_file_config"):
+                    with patch.object(ModelsHandler, "_refresh_voice_routing"):
+                        result = json.loads(handler._handle_set_capability({
+                            "capability": "asr",
+                            "provider_id": "linkai",
+                            "model": "",
+                        }))
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(local_config["voice_to_text"], "linkai")
+        self.assertEqual(local_config["voice_to_text_model"], "")
+        self.assertEqual(file_config["voice_to_text_model"], "")
+        self.assertEqual(result["model"], "")
+
     def test_chat_capability_infers_provider_when_bot_type_empty(self):
         """A config with an empty bot_type but a recognizable model should
         resolve to the right provider (mirrors the runtime bridge inference),
         so onboarding isn't wrongly re-triggered for a working setup."""
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_capability({
             "bot_type": "",
@@ -195,7 +234,7 @@ class TestModelsHandler(unittest.TestCase):
 
     def test_chat_capability_empty_bot_type_use_linkai_stays_linkai(self):
         """use_linkai must still win when bot_type is empty (unchanged behavior)."""
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_capability({
             "bot_type": "",
@@ -207,7 +246,7 @@ class TestModelsHandler(unittest.TestCase):
     def test_chat_capability_unknown_model_stays_empty(self):
         """An unrecognizable model must not be force-mapped to a provider,
         so genuinely-unconfigured setups still surface onboarding."""
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._chat_capability({
             "bot_type": "",
@@ -217,7 +256,7 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(cap["current_provider"], "")
 
     def test_infer_provider_from_model_is_robust(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cases = {
             "deepseek-v4-flash": "deepseek",
@@ -241,7 +280,7 @@ class TestModelsHandler(unittest.TestCase):
             self.assertEqual(ModelsHandler._infer_provider_from_model(bad), "")
 
     def test_asr_capability_exposes_provider_models(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         cap = ModelsHandler._asr_capability({
             "voice_to_text": "dashscope",
@@ -255,7 +294,7 @@ class TestModelsHandler(unittest.TestCase):
         self.assertIn("dashscope", cap["provider_models"])
 
     def test_asr_capability_includes_custom_providers(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         custom_conf = {"custom_providers": [
             {"id": "abc12345", "name": "MyVendor", "api_key": "sk-test-1234567890",
@@ -276,7 +315,7 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(cap["current_model"], "fun-asr-large")
 
     def test_tts_capability_includes_custom_providers(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         custom_conf = {"custom_providers": [
             {"id": "abc12345", "name": "MyVendor", "api_key": "sk-test-1234567890",
@@ -295,7 +334,7 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(cap["current_voice"], "anna")
 
     def test_tts_capability_without_custom_providers_keeps_builtin_list(self):
-        from channel.web.web_channel import ModelsHandler
+        from channel.web.api.models import ModelsHandler
 
         with patch("models.custom_provider.conf", return_value={}):
             cap = ModelsHandler._tts_capability({

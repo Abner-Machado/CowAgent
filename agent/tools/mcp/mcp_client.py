@@ -8,17 +8,17 @@ without any external MCP SDK dependency.
 import json
 import os
 import queue
+import shutil
+import socket
 import subprocess
 import threading
+import time
 import urllib.request
 import urllib.error
 from typing import Optional
 
 from common.log import logger
-
-
-# Aliases accepted for the Streamable HTTP transport type
-_STREAMABLE_HTTP_ALIASES = {"streamable-http", "streamable_http", "streamablehttp", "http"}
+from common.deployment import is_desktop, is_mobile
 
 
 # System env vars a stdio MCP subprocess legitimately needs to run
@@ -27,6 +27,10 @@ _STREAMABLE_HTTP_ALIASES = {"streamable-http", "streamable_http", "streamablehtt
 _STDIO_ENV_PASSTHROUGH = (
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
     "TERM", "TZ", "TMPDIR", "NODE_PATH", "NVM_DIR", "PYTHONPATH", "PYTHONHOME",
+    # Package mirrors, so npx / uvx can fetch the server where the default
+    # registries are slow or blocked.
+    "NPM_CONFIG_REGISTRY", "npm_config_registry", "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL", "UV_INDEX_URL", "UV_DEFAULT_INDEX",
     # Windows essentials
     "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA",
     "LOCALAPPDATA", "USERPROFILE", "PROGRAMFILES", "PROGRAMFILES(X86)",
@@ -34,6 +38,33 @@ _STDIO_ENV_PASSTHROUGH = (
 )
 # Sensitive name patterns never forwarded, even under inherit_full_env.
 _STDIO_ENV_SENSITIVE = ("_KEY", "_SECRET", "_TOKEN", "_PASSWORD", "_PASSWD", "_CREDENTIAL")
+
+# Total time budget for reading the 'endpoint' event off a new SSE stream.
+# urlopen()'s timeout only bounds a single socket read and every arriving byte
+# resets it, so a server that holds the stream warm with keepalive comments
+# (": keepalive", which servers send every few seconds) would keep the
+# discovery loop alive forever. Because the loader walks its servers serially on
+# one background thread, that stalls every server queued behind it: they stay
+# "pending" and their tools are silently missing. Kept at the 10s this call
+# already used for connecting, since the endpoint event is due immediately.
+_SSE_DISCOVERY_TIMEOUT = 10
+
+# Ceiling on a POSTed SSE response body. The server may hold the stream open,
+# so it is read in bounded chunks against self._timeout.
+_SSE_RESPONSE_MAX_BYTES = 32 * 1024 * 1024
+
+# Per-read socket timeout on an established SSE stream. Servers send events
+# only when there is something to say, so the stream may sit idle far longer
+# than the connect timeout; a stream that does time out is reopened on the
+# next request.
+_SSE_IDLE_TIMEOUT = 300
+
+# Statuses a server that only speaks the older HTTP+SSE transport answers a
+# streamable-http POST with; the spec's backwards-compatibility rule is to
+# retry with a GET that opens an SSE stream.
+_STREAMABLE_FALLBACK_STATUSES = (400, 404, 405)
+
+_SSE_CLOSED = object()
 
 
 # Optional callback invoked after an OAuth authorization completes, so the
@@ -78,6 +109,37 @@ def _oauth_redirect_uri() -> str:
     return f"{base}/mcp/oauth/callback"
 
 
+class McpToolCallError(RuntimeError):
+    """An MCP tool call failed, rather than returning successful text."""
+
+
+class McpToolExecutionError(McpToolCallError):
+    """The server executed the tool and reported a failed result."""
+
+
+class McpHttpStatusError(IOError):
+    """A remote MCP endpoint answered with a non-success HTTP status."""
+
+    def __init__(self, message: str, code: int):
+        super().__init__(message)
+        self.code = code
+
+
+def _response_socket(resp):
+    """The socket under a urlopen() response, or None when not reachable."""
+    try:
+        return resp.fp.raw._sock
+    except AttributeError:
+        return None
+
+
+def _close_quietly(resp) -> None:
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
 class McpClient:
     """Single MCP Server client supporting stdio, SSE and Streamable HTTP transports."""
 
@@ -93,20 +155,36 @@ class McpClient:
         raw_transport: str = config.get("type", "stdio")
         # Per-server timeout for tool calls (default 120s, suitable for data queries)
         self._timeout: int = int(config.get("timeout", 120))
-        # Normalize streamable-http aliases to a single internal key
-        self.transport: str = (
-            "streamable-http"
-            if raw_transport.lower() in _STREAMABLE_HTTP_ALIASES
-            else raw_transport
-        )
+        # Same normalization the console validates with, since a hand-edited
+        # mcp.json skips validation. An unknown type is left for initialize()
+        # to report rather than raising here.
+        try:
+            from agent.tools.mcp.service import normalize_transport
+
+            self.transport: str = normalize_transport(
+                raw_transport, has_url=bool(config.get("url"))
+            )
+        except Exception:
+            self.transport = (
+                raw_transport.strip().lower()
+                if isinstance(raw_transport, str)
+                else "stdio"
+            )
 
         # stdio state
         self._proc: Optional[subprocess.Popen] = None
         self._read_queue: queue.Queue = queue.Queue()
 
-        # SSE state
+        # SSE state. Responses arrive on the long-lived GET stream, so a reader
+        # thread hands each one to the request waiting on its id.
         self._sse_url: Optional[str] = None
         self._post_url: Optional[str] = None  # endpoint for sending messages (resolved from SSE)
+        self._sse_stream = None
+        self._sse_lines = None
+        self._sse_alive = False
+        self._sse_pending: dict = {}
+        self._sse_lock = threading.Lock()
+        self._sse_reconnect_lock = threading.Lock()
 
         # Streamable HTTP state
         self._http_url: Optional[str] = None
@@ -130,7 +208,13 @@ class McpClient:
         # _http_lock protects _http_session_id initialization across
         # concurrent streamable-http requests.
         self._http_lock = threading.Lock()
+        # Blocks new requests while an expired session is being replaced.
+        # An RLock lets the recovery handshake use the normal HTTP path.
+        self._http_reinit_lock = threading.RLock()
         self._initialized = False
+        self._handshake_error: Optional[BaseException] = None
+        # Reason the last initialize() failed, for callers that show it.
+        self.last_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -138,8 +222,14 @@ class McpClient:
 
     def initialize(self) -> bool:
         """Connect and perform the MCP handshake. Returns True on success."""
+        self.last_error = None
         try:
             if self.transport == "stdio":
+                if is_mobile():
+                    # The mobile app cannot spawn local processes.
+                    self.last_error = "stdio MCP servers are not supported on mobile; use a remote (SSE / Streamable HTTP) server"
+                    logger.warning(f"[MCP:{self.name}] {self.last_error}")
+                    return False
                 return self._init_stdio()
             elif self.transport == "sse":
                 return self._init_sse()
@@ -149,6 +239,7 @@ class McpClient:
                 logger.warning(f"[MCP:{self.name}] Unknown transport type: {self.transport!r}")
                 return False
         except Exception as e:
+            self.last_error = str(e)
             logger.warning(f"[MCP:{self.name}] Initialization failed: {e}")
             return False
 
@@ -158,8 +249,21 @@ class McpClient:
         Each item is a dict: {"name": str, "description": str, "inputSchema": dict}
         """
         try:
-            resp = self._send_request("tools/list", {})
-            tools = resp.get("result", {}).get("tools", [])
+            tools = []
+            params = {}
+            seen_cursors = set()
+            while True:
+                resp = self._send_request("tools/list", params)
+                self._raise_for_rpc_error(resp)
+                page = resp.get("result") or {}
+                tools.extend(page.get("tools", []))
+                cursor = page.get("nextCursor")
+                if not cursor:
+                    break
+                if cursor in seen_cursors:
+                    raise ValueError("tools/list returned a repeated pagination cursor")
+                seen_cursors.add(cursor)
+                params = {"cursor": cursor}
             return [
                 {
                     "name": t.get("name", ""),
@@ -173,15 +277,45 @@ class McpClient:
             return []
 
     def call_tool(self, name: str, arguments: dict) -> str:
-        """Call a tool and return the result as a string."""
+        """Return successful tool text; raise McpToolCallError when the call fails."""
         try:
             resp = self._send_request("tools/call", {"name": name, "arguments": arguments})
-            content = resp.get("result", {}).get("content", [])
+            self._raise_for_rpc_error(resp)
+            result = resp.get("result") or {}
+            content = result.get("content", [])
             parts = [item.get("text", "") for item in content if item.get("type") == "text"]
-            return "\n".join(parts)
+            text = "\n".join(parts)
+            if not parts and "structuredContent" in result:
+                text = json.dumps(result["structuredContent"], ensure_ascii=False)
+            if result.get("isError"):
+                raise McpToolExecutionError(text or "MCP tool execution failed")
+            return text
+        except McpToolCallError:
+            raise
         except Exception as e:
             logger.warning(f"[MCP:{self.name}] call_tool({name}) failed: {e}")
-            return f"Error: {e}"
+            raise McpToolCallError(f"Error: {e}") from e
+
+    def _raise_for_rpc_error(self, resp: dict) -> None:
+        """Raise when a response is a JSON-RPC error rather than a result.
+
+        A JSON-RPC error carries no ``result`` key, so reading
+        ``resp["result"]["tools"]`` from one yields an empty list and the
+        failure is reported to the model as "this server has no tools" or "this
+        tool returned nothing" — the server's own message is dropped. The
+        handshake already treats ``error`` as fatal; a tools/list and a
+        tools/call are no different.
+        """
+        error = (resp or {}).get("error")
+        if not error:
+            return
+        if isinstance(error, dict):
+            message = error.get("message") or str(error)
+            code = error.get("code")
+            detail = f"[{code}] {message}" if code is not None else message
+        else:
+            detail = str(error)
+        raise RuntimeError(f"MCP server error: {detail}")
 
     def shutdown(self):
         """Close the connection / terminate the child process."""
@@ -215,6 +349,7 @@ class McpClient:
                 pass
             self._http_session_id = None
 
+        self._sse_close_stream()
         self._initialized = False
 
     # ------------------------------------------------------------------
@@ -232,9 +367,10 @@ class McpClient:
 
         args = self.config.get("args", [])
         env = self._build_stdio_env(self.config.get("env", None))
+        executable = self._resolve_executable(command, env)
 
         self._proc = subprocess.Popen(
-            [command] + list(args),
+            [executable] + list(args),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -251,7 +387,28 @@ class McpClient:
             target=self._drain_stdout, daemon=True, name=f"mcp-stdout-{self.name}"
         ).start()
 
-        return self._handshake()
+        if not self._handshake():
+            # start_all() drops a failed client, so reap the child here.
+            self.shutdown()
+            return False
+        return True
+
+    def _resolve_executable(self, command: str, env: dict) -> str:
+        """Resolve ``command`` to a full path using the subprocess PATH.
+
+        Popen without a shell does not apply PATHEXT on Windows, so shims like
+        ``npx`` / ``uvx`` (really ``npx.cmd``) fail with WinError 2 unless
+        resolved first.
+        """
+        path = env.get("PATH") or env.get("Path") or os.environ.get("PATH")
+        resolved = shutil.which(command, path=path)
+        if resolved:
+            return resolved
+        logger.warning(
+            f"[MCP:{self.name}] command '{command}' not found in PATH; "
+            f"make sure it is installed (e.g. Node.js for npx)"
+        )
+        return command
 
     def _command_allowed(self, command: str) -> bool:
         """Check the executable against an optional command allowlist.
@@ -312,6 +469,7 @@ class McpClient:
             validate_url_safe(url)
             return True
         except ValueError as e:
+            self.last_error = f"url blocked: {e}"
             logger.warning(f"[MCP:{self.name}] url blocked: {e}")
             return False
 
@@ -334,17 +492,20 @@ class McpClient:
             except Exception:
                 pass
 
-    def _readline_with_timeout(self, timeout: Optional[int] = None) -> str:
+    def _readline_with_timeout(self, timeout: Optional[float] = None) -> str:
         """Read one line from stdio stdout with a hard timeout (cross-platform).
 
-        Uses the per-server timeout from mcp.json config when no explicit
-        timeout is provided.
+        ``timeout`` may be the *remaining* share of a larger budget rather than
+        a whole number of seconds, so it is formatted for display rather than
+        interpolated raw. Defaults to the per-server timeout from mcp.json.
         """
         effective = timeout if timeout is not None else self._timeout
         try:
             line = self._read_queue.get(timeout=effective)
         except queue.Empty:
-            raise TimeoutError(f"[MCP:{self.name}] stdio read timed out after {effective}s")
+            raise TimeoutError(
+                f"[MCP:{self.name}] stdio read timed out after {effective:g}s"
+            )
         if not line:
             raise IOError(f"[MCP:{self.name}] stdio process closed unexpectedly")
         return line
@@ -356,8 +517,17 @@ class McpClient:
         self._proc.stdin.flush()
 
         expected_id = message.get("id")
+        # One deadline for the whole exchange: skipped lines (notifications,
+        # stale ids) would otherwise reset a per-read timeout forever.
+        deadline = time.monotonic() + self._timeout
         while True:
-            line = self._readline_with_timeout()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"[MCP:{self.name}] stdio read timed out after {self._timeout}s "
+                    f"waiting for a response to {message.get('method')!r}"
+                )
+            line = self._readline_with_timeout(remaining)
             if not line:
                 raise IOError(f"[MCP:{self.name}] stdio process closed unexpectedly")
             line = line.strip()
@@ -394,26 +564,65 @@ class McpClient:
             return False
 
         self._sse_url = url
+        extra_headers = self.config.get("headers") or {}
+        if isinstance(extra_headers, dict):
+            self._http_headers = {str(k): str(v) for k, v in extra_headers.items()}
 
-        # Read the first SSE event to discover the POST endpoint
+        return self._sse_connect()
+
+    def _sse_connect(self) -> bool:
+        """Open the event stream, start its reader and run the handshake."""
         try:
             self._post_url = self._sse_discover_endpoint()
         except Exception as e:
+            self.last_error = f"SSE endpoint discovery failed: {e}"
             logger.warning(f"[MCP:{self.name}] SSE endpoint discovery failed: {e}")
             return False
 
-        return self._handshake()
+        stream, lines = self._sse_stream, self._sse_lines
+        sock = _response_socket(stream)
+        if sock is not None:
+            try:
+                sock.settimeout(_SSE_IDLE_TIMEOUT)
+            except OSError:
+                pass
+        self._sse_alive = True
+        threading.Thread(
+            target=self._sse_read_loop,
+            args=(stream, lines),
+            name=f"mcp-sse-{self.name}",
+            daemon=True,
+        ).start()
+
+        if self._handshake():
+            return True
+        self._sse_close_stream()
+        return False
 
     def _sse_discover_endpoint(self) -> str:
-        """Open SSE stream and read the 'endpoint' event to learn the POST URL."""
+        """Open the SSE stream and read the 'endpoint' event to learn the POST URL.
+
+        The stream stays open on success: the server delivers every response
+        over it, and most servers drop the session once it closes.
+        """
         req = urllib.request.Request(
             self._sse_url,
-            headers={"Accept": "text/event-stream"},
+            headers={"Accept": "text/event-stream", **self._http_headers},
         )
         endpoint = None
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8").rstrip("\n\r")
+        deadline = time.monotonic() + _SSE_DISCOVERY_TIMEOUT
+        resp = urllib.request.urlopen(req, timeout=10)
+        try:
+            lines = iter(resp)
+            for raw_line in lines:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"[MCP:{self.name}] No endpoint event within "
+                        f"{_SSE_DISCOVERY_TIMEOUT}s of opening the SSE stream"
+                    )
+                # errors="replace" to match _sse_read_loop: a stray byte in the
+                # endpoint event must not fail server initialization.
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
                 if line.startswith("data:"):
                     data = line[len("data:"):].strip()
                     # Some servers send JSON with a "uri" or plain path
@@ -428,26 +637,178 @@ class McpClient:
                         from urllib.parse import urljoin
                         endpoint = urljoin(self._sse_url, data)
                     break
-        if not endpoint:
-            raise ValueError(f"[MCP:{self.name}] No endpoint event received from SSE stream")
-        # Re-validate the server-supplied POST endpoint to block redirects
-        # into internal addresses (SSRF guard; no-op when protection is off).
-        from agent.tools.utils.url_safety import validate_url_safe
-        validate_url_safe(endpoint)
+            if not endpoint:
+                raise ValueError(f"[MCP:{self.name}] No endpoint event received from SSE stream")
+            # Re-validate the server-supplied POST endpoint to block redirects
+            # into internal addresses (SSRF guard; no-op when protection is off).
+            from agent.tools.utils.url_safety import validate_url_safe
+            validate_url_safe(endpoint)
+        except BaseException:
+            _close_quietly(resp)
+            raise
+        self._sse_stream, self._sse_lines = resp, lines
         return endpoint
 
+    def _sse_read_loop(self, stream, lines) -> None:
+        """Hand each JSON-RPC response on the stream to its waiting request."""
+        event, data_buf = "message", []
+        try:
+            for raw_line in lines:
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
+                if line == "":
+                    if data_buf and event == "message":
+                        self._sse_deliver("\n".join(data_buf))
+                    event, data_buf = "message", []
+                elif line.startswith(":"):
+                    continue
+                elif line.startswith("event:"):
+                    event = line[len("event:"):].strip() or "message"
+                elif line.startswith("data:"):
+                    data_buf.append(line[len("data:"):].lstrip())
+        except Exception as e:
+            if self._sse_stream is stream:
+                logger.debug(f"[MCP:{self.name}] SSE stream ended: {e}")
+        waiters = []
+        with self._sse_lock:
+            if self._sse_stream is stream:
+                self._sse_alive = False
+                waiters = list(self._sse_pending.values())
+        for waiter in waiters:
+            waiter.put(_SSE_CLOSED)
+
+    def _sse_deliver(self, payload: str) -> None:
+        try:
+            msg = json.loads(payload)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(msg, dict) or "id" not in msg or "method" in msg:
+            return
+        with self._sse_lock:
+            waiter = self._sse_pending.get(msg.get("id"))
+        if waiter is not None:
+            waiter.put(msg)
+
+    def _sse_close_stream(self) -> None:
+        with self._sse_lock:
+            stream, self._sse_stream = self._sse_stream, None
+            self._sse_lines = None
+            self._sse_alive = False
+            waiters = list(self._sse_pending.values())
+        for waiter in waiters:
+            waiter.put(_SSE_CLOSED)
+        if stream is None:
+            return
+        # close() alone does not wake a reader blocked in recv().
+        sock = _response_socket(stream)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        _close_quietly(stream)
+
+    def _sse_reconnect(self) -> None:
+        """Reopen a dropped stream; the server forgot the old session with it."""
+        with self._sse_reconnect_lock:
+            if self._sse_alive:
+                return
+            logger.info(f"[MCP:{self.name}] SSE stream closed, reconnecting")
+            self._sse_close_stream()
+            if not self._sse_connect():
+                # A failed handshake clears this; keep it set so the next
+                # request tries again instead of failing as uninitialized.
+                self._initialized = True
+                raise IOError(
+                    f"[MCP:{self.name}] SSE reconnect failed: {self.last_error}"
+                )
+
     def _sse_send(self, message: dict) -> dict:
-        """POST a JSON-RPC message to the server and return the response."""
+        """POST a JSON-RPC request and wait for its response.
+
+        Spec-conforming servers answer the POST with 202 and push the response
+        over the event stream; some reply in the POST body instead, so both are
+        accepted. The whole exchange shares one self._timeout budget.
+        """
+        if message.get("method") != "initialize" and not self._sse_alive:
+            self._sse_reconnect()
+
+        deadline = time.monotonic() + self._timeout
+        rid = message.get("id")
+        waiter: queue.Queue = queue.Queue()
+        with self._sse_lock:
+            self._sse_pending[rid] = waiter
+        try:
+            direct = self._sse_post(message, deadline)
+            if direct is not None:
+                return direct
+            remaining = deadline - time.monotonic()
+            try:
+                msg = waiter.get(timeout=max(remaining, 0))
+            except queue.Empty:
+                raise TimeoutError(
+                    f"[MCP:{self.name}] SSE response timed out after {self._timeout}s"
+                )
+            if msg is _SSE_CLOSED:
+                raise IOError(f"[MCP:{self.name}] SSE stream closed before response")
+            return msg
+        finally:
+            with self._sse_lock:
+                self._sse_pending.pop(rid, None)
+
+    def _sse_post(self, message: dict, deadline: float) -> Optional[dict]:
+        """POST to the message endpoint; return a JSON-RPC reply found in the body.
+
+        The socket timeout resets on every byte, so the body is read in bounded
+        chunks against the deadline; one stalled server would otherwise block
+        every server queued behind it on the loader thread.
+        """
         body = json.dumps(message).encode("utf-8")
         req = urllib.request.Request(
             self._post_url,
             data=body,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self._http_headers},
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+        try:
+            resp = urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            raise McpHttpStatusError(
+                f"[MCP:{self.name}] SSE POST HTTP {e.code}: {detail[:200]}", e.code
+            )
+        with resp:
+            buf = bytearray()
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"[MCP:{self.name}] SSE response read timed out after "
+                        f"{self._timeout}s"
+                    )
+                try:
+                    chunk = resp.read1(65536)
+                except AttributeError:
+                    # Without read1, fall back to a read bounded by the remaining budget.
+                    chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > _SSE_RESPONSE_MAX_BYTES:
+                    raise IOError(
+                        f"[MCP:{self.name}] SSE response exceeded "
+                        f"{_SSE_RESPONSE_MAX_BYTES} bytes"
+                    )
+        try:
+            parsed = json.loads(buf.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if isinstance(parsed, dict) and ("result" in parsed or "error" in parsed):
+            return parsed
+        return None
 
     # ------------------------------------------------------------------
     # Streamable HTTP transport (MCP spec 2025-03-26)
@@ -472,7 +833,26 @@ class McpClient:
         # restart reuses the token instead of forcing re-authorization.
         self._maybe_load_oauth()
 
-        return self._handshake()
+        if self._handshake(log_failure=False):
+            return True
+        code = getattr(self._handshake_error, "code", None)
+        if code not in _STREAMABLE_FALLBACK_STATUSES:
+            logger.warning(f"[MCP:{self.name}] Handshake initialize failed: {self.last_error}")
+            return False
+
+        logger.info(
+            f"[MCP:{self.name}] streamable-http initialize got HTTP {code}, "
+            f"retrying with the SSE transport"
+        )
+        streamable_error = self.last_error
+        self.transport = "sse"
+        self._http_session_id = None
+        if self._init_sse():
+            return True
+        self.last_error = f"{streamable_error}; SSE fallback: {self.last_error}"
+        logger.warning(f"[MCP:{self.name}] Handshake initialize failed: {self.last_error}")
+        self.transport = "streamable-http"
+        return False
 
     # ------------------------------------------------------------------
     # OAuth helpers (streamable-http only)
@@ -544,7 +924,7 @@ class McpClient:
             f"    {auth_url}"
         )
         # On a machine with a local browser (desktop/dev), open it directly.
-        if os.environ.get("COW_DESKTOP") == "1" or not os.environ.get("COW_HEADLESS"):
+        if is_desktop() or not os.environ.get("COW_HEADLESS"):
             try:
                 import webbrowser
                 webbrowser.open(auth_url)
@@ -555,7 +935,14 @@ class McpClient:
         """POST a JSON-RPC request and return the response (JSON or SSE-wrapped)."""
         return self._streamable_http_post(message, expect_response=True)
 
-    def _handle_401(self, err, message: dict, expect_response: bool, retried: bool) -> dict:
+    def _handle_401(
+        self,
+        err,
+        message: dict,
+        expect_response: bool,
+        retried: bool,
+        session_retried: bool = False,
+    ) -> dict:
         """Handle a 401: refresh the token and retry once, else begin OAuth."""
         www_auth = ""
         try:
@@ -570,7 +957,12 @@ class McpClient:
         # First try a silent refresh with the stored refresh token.
         if not retried and self._oauth is not None and self._oauth.refresh():
             logger.info(f"[MCP:{self.name}] Token refreshed after 401, retrying")
-            return self._streamable_http_post(message, expect_response, _retried=True)
+            return self._streamable_http_post(
+                message,
+                expect_response,
+                _retried=True,
+                _session_retried=session_retried,
+            )
 
         # No usable token — start (or restart) the interactive OAuth flow.
         self._begin_oauth(www_auth)
@@ -579,7 +971,13 @@ class McpClient:
             f"(complete the OAuth flow to enable this server)"
         )
 
-    def _streamable_http_post(self, message: dict, expect_response: bool, _retried: bool = False) -> dict:
+    def _streamable_http_post(
+        self,
+        message: dict,
+        expect_response: bool,
+        _retried: bool = False,
+        _session_retried: bool = False,
+    ) -> dict:
         """
         POST a JSON-RPC message over Streamable HTTP.
 
@@ -592,10 +990,11 @@ class McpClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
-        # Read session id under lock to avoid racing with the
-        # initialization write below during concurrent requests.
-        with self._http_lock:
-            sid = self._http_session_id
+        # Do not start a request between invalidating an expired session and
+        # completing the replacement handshake.
+        with self._http_reinit_lock:
+            with self._http_lock:
+                sid = self._http_session_id
         if sid:
             headers["Mcp-Session-Id"] = sid
         headers.update(self._http_headers)
@@ -618,15 +1017,39 @@ class McpClient:
         except urllib.error.HTTPError as e:
             # 401 is the spec-compliant "needs authorization" signal.
             if e.code == 401 and not self._has_static_auth():
-                return self._handle_401(e, message, expect_response, _retried)
+                return self._handle_401(
+                    e,
+                    message,
+                    expect_response,
+                    _retried,
+                    _session_retried,
+                )
+            if (
+                e.code == 404
+                and sid
+                and not _session_retried
+                and message.get("method") != "initialize"
+            ):
+                try:
+                    e.read()
+                except Exception:
+                    pass
+                self._replace_expired_http_session(sid)
+                return self._streamable_http_post(
+                    message,
+                    expect_response,
+                    _retried=_retried,
+                    _session_retried=True,
+                )
             # Surface the server-provided error body for easier debugging
             detail = ""
             try:
                 detail = e.read().decode("utf-8", errors="ignore")
             except Exception:
                 pass
-            raise IOError(
-                f"[MCP:{self.name}] streamable-http HTTP {e.code}: {detail[:200]}"
+            raise McpHttpStatusError(
+                f"[MCP:{self.name}] streamable-http HTTP {e.code}: {detail[:200]}",
+                e.code,
             )
 
         with resp:
@@ -635,7 +1058,11 @@ class McpClient:
             # Double-checked lock: only the first response sets the
             # session id, preventing concurrent initializers from
             # overwriting each other.
-            if session_id and not self._http_session_id:
+            if (
+                session_id
+                and (message.get("method") == "initialize" or sid is None)
+                and not self._http_session_id
+            ):
                 with self._http_lock:
                     if not self._http_session_id:
                         self._http_session_id = session_id
@@ -661,11 +1088,42 @@ class McpClient:
                 return {}
             return json.loads(raw)
 
-    def _read_sse_response(self, resp, expected_id) -> dict:
-        """Read an SSE stream and return the first JSON-RPC response with matching id."""
+    def _replace_expired_http_session(self, expired_session_id: str) -> None:
+        """Replace an expired Streamable HTTP session once across callers."""
+        with self._http_reinit_lock:
+            with self._http_lock:
+                if self._http_session_id != expired_session_id:
+                    if not self._initialized:
+                        raise IOError(
+                            f"[MCP:{self.name}] failed to reinitialize expired HTTP session"
+                        )
+                    return
+                self._http_session_id = None
+
+            if not self._handshake():
+                raise IOError(
+                    f"[MCP:{self.name}] failed to reinitialize expired HTTP session"
+                )
+
+    def _read_sse_response(self, resp, expected_id, timeout: Optional[float] = None) -> dict:
+        """Read an SSE stream and return the first JSON-RPC response with matching id.
+
+        urlopen()'s timeout is per read and keepalive comments reset it, so the
+        loop carries its own total deadline (the per-server mcp.json timeout
+        unless one is given).
+        """
+        effective = timeout if timeout is not None else self._timeout
+        deadline = time.monotonic() + effective
         data_buf: list = []
         for raw_line in resp:
-            line = raw_line.decode("utf-8").rstrip("\n\r")
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"[MCP:{self.name}] streamable-http SSE response read "
+                    f"timed out after {effective}s"
+                )
+            # errors="replace" to match _sse_read_loop: one stray byte in a
+            # stream must not fail the whole tools/call.
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\n\r")
             if line == "":
                 # End of an SSE event, attempt to parse accumulated data
                 if data_buf:
@@ -744,7 +1202,7 @@ class McpClient:
                 self._post_url,
                 data=body,
                 method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", **self._http_headers},
             )
             try:
                 with urllib.request.urlopen(req, timeout=10):
@@ -757,25 +1215,31 @@ class McpClient:
             except Exception:
                 pass  # notifications are fire-and-forget
 
-    def _handshake(self) -> bool:
+    def _handshake(self, log_failure: bool = True) -> bool:
         """Perform the MCP initialize / notifications/initialized handshake."""
         init_params = {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
             "clientInfo": {"name": "CowAgent", "version": "1.0"},
         }
+        self._handshake_error = None
         # Temporarily mark as initialized so _send_request doesn't block
         self._initialized = True
         try:
             resp = self._send_request("initialize", init_params)
         except Exception as e:
             self._initialized = False
-            logger.warning(f"[MCP:{self.name}] Handshake initialize failed: {e}")
+            self._handshake_error = e
+            self.last_error = str(e)
+            if log_failure:
+                logger.warning(f"[MCP:{self.name}] Handshake initialize failed: {e}")
             return False
 
         if "error" in resp:
             self._initialized = False
-            logger.warning(f"[MCP:{self.name}] Handshake error: {resp['error']}")
+            self.last_error = f"handshake error: {resp['error']}"
+            if log_failure:
+                logger.warning(f"[MCP:{self.name}] Handshake error: {resp['error']}")
             return False
 
         self._send_notification("notifications/initialized", {})
@@ -795,8 +1259,93 @@ class McpClientRegistry:
                 obj = super().__new__(cls)
                 obj._clients: dict[str, McpClient] = {}
                 obj._registry_lock = threading.Lock()
+                # Process-wide pool of booted clients keyed by their *source*
+                # config, so several Agents that resolve to the same shared
+                # mcp.json reuse one subprocess instead of each forking its own.
+                # Keyed by (mcp_json_path, server_name, config_signature): an
+                # Agent with its own mcp.json, or a different command/env, gets a
+                # distinct key and stays isolated.
+                obj._shared_pool: dict[tuple, McpClient] = {}
+                obj._shared_pool_lock = threading.Lock()
+                # Per-key boot locks so that when several Agents' loader threads
+                # miss the pool for the same server at once, only one forks the
+                # subprocess and the rest wait and reuse it (instead of racing
+                # and each booting a duplicate).
+                obj._boot_locks: dict[tuple, threading.Lock] = {}
                 cls._instance = obj
         return cls._instance
+
+    @staticmethod
+    def shared_key(mcp_json_path: str, server_name: str, cfg: dict) -> tuple:
+        import json as _json
+        try:
+            sig = _json.dumps(cfg, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            sig = repr(cfg)
+        return (mcp_json_path or "", server_name, sig)
+
+    def get_shared_client(self, key: tuple):
+        """Return a live pooled client for this exact config, or None. A client
+        whose subprocess has died is dropped so the caller boots a fresh one."""
+        with self._shared_pool_lock:
+            client = self._shared_pool.get(key)
+        if client is None:
+            return None
+        if not self._shared_client_alive(client):
+            with self._shared_pool_lock:
+                # Only evict the exact object we found dead; a concurrent reload
+                # may already have put a fresh one under the same key.
+                if self._shared_pool.get(key) is client:
+                    self._shared_pool.pop(key, None)
+            return None
+        return client
+
+    def put_shared_client(self, key: tuple, client: "McpClient") -> None:
+        with self._shared_pool_lock:
+            self._shared_pool[key] = client
+
+    def _boot_lock_for(self, key: tuple) -> "threading.Lock":
+        with self._shared_pool_lock:
+            lock = self._boot_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._boot_locks[key] = lock
+            return lock
+
+    def get_or_boot_shared(self, key: tuple, factory):
+        """Return a pooled client for ``key``, booting it via ``factory`` if
+        absent. Serialized per key so concurrent loader threads don't each fork
+        a duplicate; distinct keys still boot in parallel.
+
+        Returns (client, reused). ``client`` is None when ``factory`` failed to
+        produce a usable client (e.g. init failed / needs auth); ``reused`` is
+        True when an already-booted subprocess was handed back.
+        """
+        client = self.get_shared_client(key)
+        if client is not None:
+            return client, True
+        with self._boot_lock_for(key):
+            # Re-check: another thread may have booted it while we waited.
+            client = self.get_shared_client(key)
+            if client is not None:
+                return client, True
+            client = factory()
+            if client is None:
+                return None, False
+            self.put_shared_client(key, client)
+            return client, False
+
+    @staticmethod
+    def _shared_client_alive(client: "McpClient") -> bool:
+        """Best-effort liveness: a stdio client whose child process has exited
+        must not be reused. Unknown/remote transports are assumed alive."""
+        proc = getattr(client, "_proc", None)
+        if proc is not None and hasattr(proc, "poll"):
+            try:
+                return proc.poll() is None
+            except Exception:
+                return False
+        return True
 
     def start_all(self, configs: list) -> None:
         """Initialize McpClient for each config entry; skip failures with a warning."""

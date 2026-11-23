@@ -1,6 +1,6 @@
 ---
 title: web_fetch - 网页获取
-description: 获取网页或文档内容
+description: "web_fetch 工具获取 HTTP / HTTPS 地址的内容：从网页提取可读文本，自动下载并解析 PDF、Word、Excel 等文档；需要 JavaScript 渲染的页面请改用 browser 工具。"
 ---
 
 获取 HTTP/HTTPS URL 的内容。对网页提取可读文本，对文档文件（PDF、Word、Excel 等）自动下载并解析内容。
@@ -27,6 +27,49 @@ description: 获取网页或文档内容
 - 下载并解析远程文档
 - 获取 API 响应内容
 
+## DeepSeek Fetch 后端（可选）
+
+默认情况下 `web_fetch` 直接抓取页面。将 `tools.web_fetch.provider` 设为
+`"deepseek"` 可改用 [DeepSeek 官方 Fetch API](https://api-docs.deepseek.com/guides/search)
+抓取，返回页面的 Markdown 内容——适合直接抓取无法渲染的页面（如重度依赖
+JavaScript 的站点）。
+
+```json
+{
+  "tools": {
+    "web_fetch": {
+      "provider": "deepseek"
+    }
+  }
+}
+```
+
+该后端复用 `deepseek_api_key` 模型凭证（或 `DEEPSEEK_API_KEY` 环境变量）。调用按成功请求计费
+（每 1000 次 $0.75），因此保持为手动开启；`"direct"`（默认）免费。
+SSRF 防护仍然生效：内网、回环及云元数据地址在请求发出前即被拒绝。
+文档链接（PDF、Word 等）始终在本地下载解析。
+
+## Olostep 后端（可选）
+
+将 `tools.web_fetch.provider` 设为 `"olostep"` 可改用
+[Olostep Scrape API](https://docs.olostep.com/features/scrapes) 抓取。Olostep
+在浏览器中渲染页面并返回 Markdown 内容，因此也适用于重度依赖 JavaScript 的站点。
+
+```json
+{
+  "tools": {
+    "web_fetch": {
+      "provider": "olostep"
+    }
+  }
+}
+```
+
+该后端复用 Olostep 搜索厂商的密钥 `tools.web_search.olostep_api_key`（或 `OLOSTEP_API_KEY`
+环境变量），可在 [Olostep 控制台](https://www.olostep.com/dashboard/api-keys) 创建。
+每次抓取消耗 Olostep 额度，因此保持为手动开启。SSRF 防护同样生效，文档链接（PDF、Word 等）
+仍在本地下载解析。
+
 <Note>
-  `web_fetch` 只能获取静态 HTML 内容。如果页面需要 JavaScript 渲染（如 SPA 单页应用），请使用 `browser` 工具。
+  默认的 `direct` 后端只能获取静态 HTML 内容。如果页面需要 JavaScript 渲染（如 SPA 单页应用），可改用上文的 DeepSeek 或 Olostep 后端，或使用 `browser` 工具。
 </Note>

@@ -6,7 +6,7 @@ Initializes the workspace, creates template files, and loads context files.
 
 from __future__ import annotations
 import os
-from typing import List, Optional, Dict
+from typing import List, Optional
 from dataclasses import dataclass
 
 from common.log import logger
@@ -60,10 +60,11 @@ def ensure_workspace(workspace_dir: str, create_templates: bool = True) -> Works
     # Create the memory subdirectory
     os.makedirs(memory_dir, exist_ok=True)
 
-    # Skills, websites and knowledge are shared across Agents, so they get
-    # scaffolded through state_dir rather than under this workspace: an Agent
-    # opts out of the shared copy by having its own directory, and creating one
-    # here would opt every new Agent out on its first boot.
+    # Skills and knowledge are shared across Agents, so they get scaffolded
+    # through state_dir rather than under this workspace: an Agent opts out of
+    # the shared copy by having its own directory, and creating one here would
+    # opt every new Agent out on its first boot. Published files are per Agent,
+    # so that one does land under this workspace.
     from common import state_dir
 
     state_dir.skills_dir(base=workspace_dir, ensure=True)
@@ -177,9 +178,12 @@ def _create_template_if_missing(filepath: str, template_content: str):
     """Create the template file if it does not exist."""
     if not os.path.exists(filepath):
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(filepath, 'x', encoding='utf-8') as f:
                 f.write(template_content)
             logger.debug(f"[Workspace] Created template: {os.path.basename(filepath)}")
+        except FileExistsError:
+            # Another initializer or writer created it after the existence check.
+            pass
         except Exception as e:
             logger.error(f"[Workspace] Failed to create template {filepath}: {e}")
 
@@ -202,13 +206,16 @@ def _truncate_memory_content(content: str) -> str:
         lines = lines[-_MEMORY_MAX_LINES:]
         truncated = True
 
-    result = '\n'.join(lines)
-    if len(result.encode('utf-8')) > _MEMORY_MAX_BYTES:
-        while len(result.encode('utf-8')) > _MEMORY_MAX_BYTES and lines:
-            lines.pop(0)
-            truncated = True
-        result = '\n'.join(lines)
+    # Drop the oldest lines until what is left fits the byte budget. The size
+    # has to be recomputed from the shrinking list on every pass: measuring
+    # text joined before the loop never notices the pops, so the condition
+    # stays true until `lines` is empty and the whole file collapses to the
+    # hint alone.
+    while lines and len('\n'.join(lines).encode('utf-8')) > _MEMORY_MAX_BYTES:
+        lines.pop(0)
+        truncated = True
 
+    result = '\n'.join(lines)
     if truncated:
         result = "...(older entries truncated, use `memory_search` or `memory_get` for full content)\n\n" + result
     return result
@@ -240,24 +247,32 @@ def _is_template_placeholder(content: str) -> bool:
     return False
 
 
+# The name placeholder each template (zh/en) leaves for the first conversation.
+_ONBOARDING_PLACEHOLDERS = {
+    DEFAULT_AGENT_FILENAME: ("*(在首次对话时填写", "*(filled during the first conversation"),
+    DEFAULT_USER_FILENAME: ("*(在首次对话时询问", "*(ask during the first conversation"),
+}
+
+
 def _is_onboarding_done(workspace_dir: str) -> bool:
-    """Check if AGENT.md or USER.md has been modified from the original template"""
-    agent_path = os.path.join(workspace_dir, DEFAULT_AGENT_FILENAME)
-    user_path = os.path.join(workspace_dir, DEFAULT_USER_FILENAME)
-    
-    agent_template = _get_agent_template().strip()
-    user_template = _get_user_template().strip()
-    
-    for path, template in [(agent_path, agent_template), (user_path, user_template)]:
+    """Check if AGENT.md or USER.md has had its name placeholder filled in.
+
+    BOOTSTRAP.md itself marks onboarding as pending; this only backs up an agent
+    that filled the files but forgot to delete it. Looking at the placeholder
+    rather than comparing with the template keeps the check stable across
+    template rewording, a language switch, or text added elsewhere in the file.
+    """
+    for filename, placeholders in _ONBOARDING_PLACEHOLDERS.items():
+        path = os.path.join(workspace_dir, filename)
         if not os.path.exists(path):
             continue
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                content = f.read().strip()
-            if content != template:
-                return True
+                content = f.read()
         except Exception:
             continue
+        if content.strip() and not any(p in content for p in placeholders):
+            return True
     return False
 
 
@@ -447,7 +462,7 @@ _RULE_TEMPLATE_ZH = """# RULE.md - 工作空间规则
 │   └── <子目录>/     # 按需创建，参考 index.md 已有分类
 │
 ├── skills/           # 技能
-├── websites/         # 网页产物
+├── websites/         # 网页及对外分享的文件
 └── tmp/              # 系统临时文件（自动管理，勿手动存放重要文件）
 ```
 
@@ -546,7 +561,7 @@ This folder is your home. Treat it well.
 │   └── <subdirs>/    # Created on demand, see existing categories in index.md
 │
 ├── skills/           # Skills
-├── websites/         # Web artifacts
+├── websites/         # Web pages and files to share
 └── tmp/              # System temp files (auto-managed, don't store important files here)
 ```
 

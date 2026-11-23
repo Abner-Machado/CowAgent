@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import apiClient from '../api/client'
 import { t } from '../i18n'
+import { sessionOwner, useSessionStore } from './sessionStore'
 import type { SessionSettingsState } from '../types'
 
 /**
@@ -26,11 +27,15 @@ interface SessionSettingsStore {
 
   /** Fetch (and cache) settings for a session. Safe to call repeatedly. */
   refresh: (sessionId: string) => Promise<void>
-  /** Apply a model / permission change, then repaint from the server echo. */
+  /** Apply a model / permission / team change, then repaint from the server echo. */
   apply: (
     sessionId: string,
-    body: { provider?: string | null; model?: string | null; permission?: string | null }
+    body: { provider?: string | null; model?: string | null; permission?: string | null; members?: string[] | null }
   ) => Promise<boolean>
+  /** Invite a teammate into the conversation (group chat). */
+  addMember: (sessionId: string, agentId: string) => Promise<boolean>
+  /** Remove a teammate from the conversation. */
+  removeMember: (sessionId: string, agentId: string) => Promise<boolean>
   /** Drop cached settings (e.g. on a brand-new chat) so chips fall back to global. */
   reset: () => void
   setOpenMenu: (menu: ComposerMenu) => void
@@ -56,14 +61,14 @@ export const useSessionSettingsStore = create<SessionSettingsStore>((set, get) =
     const token = ++requestSeq
     set({ loading: true })
     try {
-      const data = await apiClient.getSessionSettings(sessionId)
+      const data = await apiClient.getSessionSettings(sessionId, sessionOwner(sessionId) || undefined)
       // A newer request has superseded this one: drop the response entirely.
       if (token !== requestSeq) return
       if (data.status !== 'success') {
         set({ loading: false })
         return
       }
-      set({ cfg: { model: data.model, permission: data.permission }, sessionId, loading: false })
+      set({ cfg: { model: data.model, permission: data.permission, team: data.team }, sessionId, loading: false })
     } catch {
       if (token === requestSeq) set({ loading: false })
     }
@@ -75,18 +80,36 @@ export const useSessionSettingsStore = create<SessionSettingsStore>((set, get) =
     const token = ++requestSeq
     set({ error: null })
     try {
-      const data = await apiClient.updateSessionSettings(sessionId, body)
+      const data = await apiClient.updateSessionSettings(sessionId, body, sessionOwner(sessionId) || undefined)
       if (data.status !== 'success' || !data.model || !data.permission) {
         set({ error: t('session_settings_failed') })
         return false
       }
       if (token !== requestSeq) return true
-      set({ cfg: { model: data.model, permission: data.permission }, sessionId })
+      set({ cfg: { model: data.model, permission: data.permission, team: data.team }, sessionId })
+      // Keep the list's faces in step with the roster we just changed, which it
+      // cannot read from the API until the conversation has a first message.
+      if (data.team) useSessionStore.getState().setParticipants(sessionId, data.team)
       return true
     } catch {
       set({ error: t('session_settings_failed') })
       return false
     }
+  },
+
+  addMember: async (sessionId, agentId) => {
+    const owner = sessionOwner(sessionId)
+    if (!agentId || agentId === owner) return false
+    const current = (cfgFor(sessionId)?.team?.members || []).map((m) => m.id)
+    if (current.includes(agentId)) return true
+    return get().apply(sessionId, { members: [...current, agentId] })
+  },
+
+  removeMember: async (sessionId, agentId) => {
+    const current = (cfgFor(sessionId)?.team?.members || []).map((m) => m.id)
+    const next = current.filter((id) => id !== agentId)
+    // An empty list means "nobody invited": the backend takes null for that.
+    return get().apply(sessionId, { members: next.length ? next : null })
   },
 
   reset: () => set({ cfg: null, sessionId: null, openMenu: null, error: null }),
@@ -96,4 +119,10 @@ export const useSessionSettingsStore = create<SessionSettingsStore>((set, get) =
 export function cfgFor(sessionId: string): SessionSettingsState | null {
   const { cfg, sessionId: loaded } = useSessionSettingsStore.getState()
   return cfg && loaded === sessionId ? cfg : null
+}
+
+/** Selector: the loaded conversation holds more than its owner (a group chat).
+ *  Until then it's an ordinary chat and is drawn like one. */
+export function selectSharedConversation(s: SessionSettingsStore): boolean {
+  return (s.cfg?.team?.members?.length ?? 0) > 0
 }

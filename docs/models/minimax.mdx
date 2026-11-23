@@ -1,6 +1,6 @@
 ---
 title: MiniMax
-description: MiniMax model configuration (Text / Image Understanding / Image Generation / Text-to-Speech)
+description: "Configure MiniMax in CowAgent: one API key enables chat, image understanding, image generation and text-to-speech with 70+ voices in Chinese, Cantonese, English, Japanese and Korean."
 ---
 
 MiniMax supports text chat, image understanding, image generation, and text-to-speech. A single `minimax_api_key` enables all capabilities.
@@ -13,19 +13,21 @@ MiniMax supports text chat, image understanding, image generation, and text-to-s
 
 ```json
 {
-  "model": "MiniMax-M3",
+  "model": "MiniMax-M3.1-Flash",
   "minimax_api_key": "YOUR_API_KEY"
 }
 ```
 
 | Parameter | Description |
 | --- | --- |
-| `model` | Can be `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, etc. |
+| `model` | Can be `MiniMax-M3.1-Flash` (default recommendation), `MiniMax-M3`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`, etc. |
 | `minimax_api_key` | Create one in the [MiniMax Console](https://platform.minimaxi.com/user-center/basic-information/interface-key) |
+
+`MiniMax-M3.1-Flash` always thinks (thinking cannot be disabled); tune its depth with `reasoning_effort`: `low` / `medium` / `high` / `xhigh` / `max` (default `max`). `MiniMax-M3` still supports disabling thinking. See the [MiniMax API reference](https://platform.minimax.io/docs/api-reference/text-openai-api).
 
 ## Image Understanding
 
-MiniMax's M2.x chat models do not support vision natively; vision calls are uniformly routed to `MiniMax-Text-01`. Once `minimax_api_key` is configured, the Agent's Vision tool automatically uses this model, with no need to specify it explicitly in the configuration file.
+MiniMax-M3.1-Flash and MiniMax-M3 natively accept text, image, and video input through the OpenAI-compatible chat endpoint. Once `minimax_api_key` is configured, the Agent's Vision tool automatically uses a MiniMax multimodal model for image requests, with no need to specify a separate vision model.
 
 ## Image Generation
 

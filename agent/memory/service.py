@@ -11,8 +11,9 @@ Memory file layout (under workspace_root):
 
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
-from pathlib import Path
+from typing import List, Optional
+
+from agent.memory.conversation_store import page_window
 from common.log import logger
 
 
@@ -42,7 +43,11 @@ class MemoryService:
                       ``"evolution"`` — self-evolution logs from memory/evolution/
                                         merged with the nightly dream diaries, so
                                         one tab shows everything the agent learned.
+
+        ``page`` and ``page_size`` are clamped by ``page_window``.
         """
+        page, page_size = page_window(page, page_size, 20)
+
         if category == "evolution":
             files = self._list_evolution_files()
         elif category == "dream":
@@ -115,7 +120,7 @@ class MemoryService:
                 if os.path.isfile(full) and name.endswith(".md"):
                     files.append(self._file_info(full, name, ftype))
         # Sort newest first by filename (date-named); ties favor evolution.
-        files.sort(key=lambda f: (f["filename"], f["type"] != "evolution"), reverse=True)
+        files.sort(key=lambda f: (f["filename"], f["type"] == "evolution"), reverse=True)
         return files
 
     # ------------------------------------------------------------------
@@ -127,7 +132,7 @@ class MemoryService:
 
         :param filename: File name, e.g. ``MEMORY.md``, ``2026-02-20.md``
         :param category: ``"memory"``, ``"dream"`` or ``"evolution"``
-        :return: dict with ``filename`` and ``content``
+        :return: dict with ``filename``, ``rel_path`` and ``content``
         :raises FileNotFoundError: if the file does not exist
         """
         path = self._resolve_path(filename, category)
@@ -139,6 +144,10 @@ class MemoryService:
 
         return {
             "filename": filename,
+            # Where this file sits under the workspace root. A caller that wants
+            # to edit it can then address it through the workspace file API
+            # instead of re-deriving the layout from filename plus category.
+            "rel_path": self._to_rel(path),
             "content": content,
         }
 
@@ -159,6 +168,17 @@ class MemoryService:
                 page = payload.get("page", 1)
                 page_size = payload.get("page_size", 20)
                 category = payload.get("category", "memory")
+                # They may arrive as strings; a non-numeric value is a 400.
+                try:
+                    page = int(page)
+                    page_size = int(page_size)
+                except (TypeError, ValueError):
+                    return {
+                        "action": action,
+                        "code": 400,
+                        "message": "page and page_size must be integers",
+                        "payload": None,
+                    }
                 result_payload = self.list_files(page=page, page_size=page_size, category=category)
                 return {"action": action, "code": 200, "message": "success", "payload": result_payload}
 
@@ -173,7 +193,7 @@ class MemoryService:
             else:
                 return {"action": action, "code": 400, "message": f"unknown action: {action}", "payload": None}
 
-        except ValueError as e:
+        except ValueError:
             return {"action": action, "code": 403, "message": "invalid filename", "payload": None}
         except FileNotFoundError as e:
             return {"action": action, "code": 404, "message": str(e), "payload": None}
@@ -208,9 +228,14 @@ class MemoryService:
         allowed = os.path.realpath(base_dir)
 
         if resolved != allowed and not resolved.startswith(allowed + os.sep):
-            raise ValueError(f"Invalid filename: path traversal detected")
+            raise ValueError("Invalid filename: path traversal detected")
 
         return resolved
+
+    def _to_rel(self, path: str) -> str:
+        """Path relative to the workspace root, with forward slashes."""
+        root = os.path.realpath(self.workspace_root)
+        return os.path.relpath(path, root).replace(os.sep, "/")
 
     @staticmethod
     def _file_info(path: str, filename: str, file_type: str) -> dict:

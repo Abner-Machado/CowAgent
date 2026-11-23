@@ -19,16 +19,16 @@
   "navbar": {
     "links": [
       {
-        "label": "官网",
-        "href": "https://cowagent.ai/"
+        "label": "Website",
+        "href": "https://cowagent.ai/?utm_source=docs"
       },
       {
-        "label": "下载",
+        "label": "Download",
         "href": "https://cowagent.ai/download/"
       },
       {
-        "label": "博客",
-        "href": "https://cowagent.ai/zh/blog/"
+        "label": "Blog",
+        "href": "https://cowagent.ai/blog/"
       },
       {
         "label": "GitHub",
@@ -46,6 +46,21 @@
       "source": "/en/:slug*",
       "destination": "/:slug*",
       "permanent": true
+    },
+    {
+      "source": "/guide/desktop-themes",
+      "destination": "/extensions/custom-theme",
+      "permanent": true
+    },
+    {
+      "source": "/zh/guide/desktop-themes",
+      "destination": "/zh/extensions/custom-theme",
+      "permanent": true
+    },
+    {
+      "source": "/ja/guide/desktop-themes",
+      "destination": "/ja/extensions/custom-theme",
+      "permanent": true
     }
   ],
   "navigation": {
@@ -57,7 +72,7 @@
           "links": [
             {
               "label": "Website",
-              "href": "https://cowagent.ai/"
+              "href": "https://cowagent.ai/?utm_source=docs"
             },
             {
               "label": "Download",
@@ -95,6 +110,7 @@
                 "pages": [
                   "guide/quick-start",
                   "guide/desktop",
+                  "guide/cloud",
                   "guide/manual-install",
                   "guide/upgrade"
                 ]
@@ -119,6 +135,7 @@
                   "models/kimi",
                   "models/qianfan",
                   "models/mimo",
+                  "models/cowagent",
                   "models/linkai",
                   "models/coding-plan",
                   "models/custom"
@@ -148,7 +165,9 @@
                   "tools/memory",
                   "tools/env-config",
                   "tools/web-fetch",
-                  "tools/scheduler"
+                  "tools/scheduler",
+                  "tools/delegate",
+                  "tools/subagent"
                 ]
               },
               {
@@ -259,7 +278,38 @@
               {
                 "group": "Multi-Agent System",
                 "pages": [
+                  "multi-agent/team",
                   "multi-agent/subagent"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "Extensions",
+            "groups": [
+              {
+                "group": "API",
+                "pages": [
+                  "extensions/chat-api"
+                ]
+              },
+              {
+                "group": "Sharing",
+                "pages": [
+                  "extensions/guest-share"
+                ]
+              },
+              {
+                "group": "Customization",
+                "pages": [
+                  "extensions/custom-menu",
+                  "extensions/custom-theme"
+                ]
+              },
+              {
+                "group": "Third-party Integrations",
+                "pages": [
+                  "extensions/agent-mail"
                 ]
               }
             ]
@@ -271,6 +321,11 @@
                 "group": "Release Notes",
                 "pages": [
                   "releases/overview",
+                  "releases/v2.2.2",
+                  "releases/v2.2.1",
+                  "releases/v2.2.0",
+                  "releases/v2.1.9",
+                  "releases/v2.1.8",
                   "releases/v2.1.7",
                   "releases/v2.1.6",
                   "releases/v2.1.5",
@@ -301,15 +356,15 @@
           "links": [
             {
               "label": "官网",
-              "href": "https://cowagent.ai/?lang=zh"
+              "href": "https://cowagent.cn/?utm_source=docs"
             },
             {
               "label": "下载",
-              "href": "https://cowagent.ai/zh/download/"
+              "href": "https://cowagent.cn/zh/download/"
             },
             {
               "label": "博客",
-              "href": "https://cowagent.ai/zh/blog/"
+              "href": "https://cowagent.cn/zh/blog/"
             },
             {
               "label": "GitHub",
@@ -339,6 +394,7 @@
                 "pages": [
                   "zh/guide/quick-start",
                   "zh/guide/desktop",
+                  "zh/guide/cloud",
                   "zh/guide/manual-install",
                   "zh/guide/upgrade"
                 ]
@@ -363,6 +419,7 @@
                   "zh/models/kimi",
                   "zh/models/qianfan",
                   "zh/models/mimo",
+                  "zh/models/cowagent",
                   "zh/models/linkai",
                   "zh/models/coding-plan",
                   "zh/models/custom"
@@ -392,7 +449,9 @@
                   "zh/tools/memory",
                   "zh/tools/env-config",
                   "zh/tools/web-fetch",
-                  "zh/tools/scheduler"
+                  "zh/tools/scheduler",
+                  "zh/tools/delegate",
+                  "zh/tools/subagent"
                 ]
               },
               {
@@ -503,7 +562,38 @@
               {
                 "group": "多 Agent 系统",
                 "pages": [
+                  "zh/multi-agent/team",
                   "zh/multi-agent/subagent"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "扩展",
+            "groups": [
+              {
+                "group": "开放接口",
+                "pages": [
+                  "zh/extensions/chat-api"
+                ]
+              },
+              {
+                "group": "对外分享",
+                "pages": [
+                  "zh/extensions/guest-share"
+                ]
+              },
+              {
+                "group": "界面定制",
+                "pages": [
+                  "zh/extensions/custom-menu",
+                  "zh/extensions/custom-theme"
+                ]
+              },
+              {
+                "group": "三方集成",
+                "pages": [
+                  "zh/extensions/agent-mail"
                 ]
               }
             ]
@@ -515,6 +605,11 @@
                 "group": "发布记录",
                 "pages": [
                   "zh/releases/overview",
+                  "zh/releases/v2.2.2",
+                  "zh/releases/v2.2.1",
+                  "zh/releases/v2.2.0",
+                  "zh/releases/v2.1.9",
+                  "zh/releases/v2.1.8",
                   "zh/releases/v2.1.7",
                   "zh/releases/v2.1.6",
                   "zh/releases/v2.1.5",
@@ -545,7 +640,7 @@
           "links": [
             {
               "label": "ウェブサイト",
-              "href": "https://cowagent.ai/"
+              "href": "https://cowagent.ai/?utm_source=docs"
             },
             {
               "label": "ダウンロード",
@@ -607,6 +702,7 @@
                   "ja/models/kimi",
                   "ja/models/qianfan",
                   "ja/models/mimo",
+                  "ja/models/cowagent",
                   "ja/models/linkai",
                   "ja/models/coding-plan",
                   "ja/models/custom"
@@ -636,7 +732,9 @@
                   "ja/tools/memory",
                   "ja/tools/env-config",
                   "ja/tools/web-fetch",
-                  "ja/tools/scheduler"
+                  "ja/tools/scheduler",
+                  "ja/tools/delegate",
+                  "ja/tools/subagent"
                 ]
               },
               {
@@ -746,7 +844,38 @@
               {
                 "group": "マルチ Agent システム",
                 "pages": [
+                  "ja/multi-agent/team",
                   "ja/multi-agent/subagent"
+                ]
+              }
+            ]
+          },
+          {
+            "tab": "拡張",
+            "groups": [
+              {
+                "group": "API",
+                "pages": [
+                  "ja/extensions/chat-api"
+                ]
+              },
+              {
+                "group": "共有",
+                "pages": [
+                  "ja/extensions/guest-share"
+                ]
+              },
+              {
+                "group": "UI カスタマイズ",
+                "pages": [
+                  "ja/extensions/custom-menu",
+                  "ja/extensions/custom-theme"
+                ]
+              },
+              {
+                "group": "サードパーティ連携",
+                "pages": [
+                  "ja/extensions/agent-mail"
                 ]
               }
             ]
@@ -758,6 +887,11 @@
                 "group": "リリースノート",
                 "pages": [
                   "ja/releases/overview",
+                  "ja/releases/v2.2.2",
+                  "ja/releases/v2.2.1",
+                  "ja/releases/v2.2.0",
+                  "ja/releases/v2.1.9",
+                  "ja/releases/v2.1.8",
                   "ja/releases/v2.1.7",
                   "ja/releases/v2.1.6",
                   "ja/releases/v2.1.5",

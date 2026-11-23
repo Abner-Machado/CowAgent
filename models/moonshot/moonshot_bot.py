@@ -5,13 +5,18 @@ import time
 from typing import Optional
 
 import requests
-from models.bot import Bot
+from models.bot import Bot, read_error_body
 from models.session_manager import SessionManager
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from common.log import logger
 from config import conf, load_config
 from .moonshot_session import MoonshotSession
+
+# An overloaded endpoint can hold the stream open with only ": keep-alive"
+# comments. Each one resets the socket read timeout, so without this cap a
+# queued request can hang for many minutes.
+STREAM_KEEPALIVE_MAX_SECONDS = 180
 
 
 # Moonshot (Kimi) API Bot
@@ -150,7 +155,8 @@ class MoonshotBot(Bot):
             res = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers=headers,
-                json=body
+                json=body,
+                timeout=120
             )
             if res.status_code == 200:
                 response = res.json()
@@ -160,8 +166,7 @@ class MoonshotBot(Bot):
                     "content": response["choices"][0]["message"]["content"]
                 }
             else:
-                response = res.json()
-                error = response.get("error")
+                error = read_error_body(res)
                 logger.error(f"[MOONSHOT] chat failed, status_code={res.status_code}, "
                              f"msg={error.get('message')}, type={error.get('type')}")
 
@@ -282,6 +287,10 @@ class MoonshotBot(Bot):
                 "messages": converted_messages,
                 "stream": stream,
             }
+            # Ask for a trailing usage chunk on streaming calls so the agent can
+            # surface a real prompt_tokens count for the context indicator.
+            if stream:
+                request_body["stream_options"] = {"include_usage": True}
             if max_tokens is not None:
                 request_body["max_tokens"] = max_tokens
 
@@ -311,18 +320,20 @@ class MoonshotBot(Bot):
                 return self._handle_sync_response(request_body)
 
         except Exception as e:
+            error_msg = str(e)
             logger.error(f"[MOONSHOT] call_with_tools error: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
             def error_generator():
-                yield {"error": True, "message": str(e), "status_code": 500}
+                yield {"error": True, "message": error_msg, "status_code": 500}
             return error_generator()
 
     # -------------------- streaming --------------------
 
     def _handle_stream_response(self, request_body: dict):
         """Handle streaming SSE response from Moonshot API and yield OpenAI-format chunks."""
+        response = None
         try:
             headers = self._build_headers()
 
@@ -337,12 +348,31 @@ class MoonshotBot(Bot):
 
             current_tool_calls = {}
             finish_reason = None
+            stream_usage = None  # Provider-reported token usage (include_usage)
+            last_data_at = time.time()
 
             for line in response.iter_lines():
                 if not line:
                     continue
 
                 line = line.decode("utf-8")
+                if line.startswith(":"):
+                    if time.time() - last_data_at > STREAM_KEEPALIVE_MAX_SECONDS:
+                        logger.error(
+                            f"[MOONSHOT] Stream timeout: only keep-alive received for "
+                            f"{STREAM_KEEPALIVE_MAX_SECONDS}s"
+                        )
+                        yield {
+                            "error": True,
+                            "message": f"Stream timeout: only keep-alive received for {STREAM_KEEPALIVE_MAX_SECONDS}s",
+                            "status_code": 504,
+                        }
+                        return
+                    # Empty chunk lets the caller check for cancel while the server is queueing
+                    yield {}
+                    continue
+                last_data_at = time.time()
+
                 # Handle both "data: {...}" and "data:{...}" (Kimi Coding Plan omits the space)
                 if line.startswith("data: "):
                     data_str = line[6:]
@@ -366,6 +396,11 @@ class MoonshotBot(Bot):
                     logger.error(f"[MOONSHOT] stream error: {error_msg}")
                     yield {"error": True, "message": error_msg, "status_code": 500}
                     return
+
+                # The include_usage chunk carries usage with an empty choices
+                # list — capture it before the choices skip below drops it.
+                if isinstance(chunk.get("usage"), dict):
+                    stream_usage = chunk["usage"]
 
                 if not chunk.get("choices"):
                     continue
@@ -431,14 +466,17 @@ class MoonshotBot(Bot):
                             }]
                         }
 
-            # Final chunk with finish_reason
-            yield {
+            # Final chunk with finish_reason (+ usage when the provider reported it)
+            final_chunk = {
                 "choices": [{
                     "index": 0,
                     "delta": {},
                     "finish_reason": finish_reason
                 }]
             }
+            if stream_usage is not None:
+                final_chunk["usage"] = stream_usage
+            yield final_chunk
 
         except requests.exceptions.Timeout:
             logger.error("[MOONSHOT] Request timeout")
@@ -448,6 +486,9 @@ class MoonshotBot(Bot):
             import traceback
             logger.error(traceback.format_exc())
             yield {"error": True, "message": str(e), "status_code": 500}
+        finally:
+            if response is not None:
+                response.close()
 
     # -------------------- sync --------------------
 

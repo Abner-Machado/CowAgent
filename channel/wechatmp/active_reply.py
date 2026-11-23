@@ -1,5 +1,3 @@
-import time
-
 import web
 from wechatpy import parse_message
 from wechatpy.replies import create_reply
@@ -29,13 +27,13 @@ class Query:
             if args.get("encrypt_type") == "aes":
                 logger.debug("[wechatmp] Receive encrypted post data:\n" + message.decode("utf-8"))
                 if not channel.crypto:
-                    raise Exception("Crypto not initialized, Please set wechatmp_aes_key in config.json")
+                    raise RuntimeError("Crypto not initialized, Please set wechatmp_aes_key in config.json")
                 message = channel.crypto.decrypt_message(message, args.msg_signature, args.timestamp, args.nonce)
                 encrypt_func = lambda x: channel.crypto.encrypt_message(x, args.nonce, args.timestamp)
             else:
                 logger.debug("[wechatmp] Receive post data:\n" + message.decode("utf-8"))
             msg = parse_message(message)
-            if msg.type in ["text", "voice", "image"]:
+            if msg.type in WeChatMPMessage.SUPPORTED_TYPES:
                 wechatmp_msg = WeChatMPMessage(msg, client=channel.client)
                 from_user = wechatmp_msg.from_user_id
                 content = wechatmp_msg.content
@@ -68,7 +66,10 @@ class Query:
                 else:
                     return "success"
             else:
-                logger.info("暂且不处理")
+                logger.info(
+                    f"[wechatmp] unsupported message type {msg.type!r} from "
+                    f"{getattr(msg, 'source', '?')}, ignored"
+                )
             return "success"
         except Exception as exc:
             logger.exception(exc)

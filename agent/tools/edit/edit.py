@@ -4,9 +4,11 @@ Edit files through exact text replacement
 """
 
 import os
+import threading
 from typing import Dict, Any
 
 from agent.tools.base_tool import BaseTool, ToolResult
+from common.atomic_write import write_text_atomic
 from common.utils import expand_path
 from agent.tools.utils.credentials import DENIED_MESSAGE, is_credential_path
 from agent.tools.utils.diff import (
@@ -19,9 +21,14 @@ from agent.tools.utils.diff import (
     looks_like_line_numbered_block,
     reindent_replacement,
     strip_line_number_prefixes,
+    trim_outer_newlines,
 )
 from agent.tools.utils.file_state import note_write, staleness_warning
+from agent.tools.utils.memory_path import feeds_memory_index
 from agent.tools.utils.syntax_check import review as syntax_review
+
+
+_EDIT_LOCKS = tuple(threading.RLock() for _ in range(256))
 
 
 class Edit(BaseTool):
@@ -59,13 +66,23 @@ class Edit(BaseTool):
         self.memory_manager = self.config.get("memory_manager", None)
     
     def execute(self, args: Dict[str, Any]) -> ToolResult:
+        path = (args.get("path") or "").strip()
+        if not path:
+            return ToolResult.fail("Error: path parameter is required")
+        key = os.path.normcase(os.path.realpath(self._resolve_path(path)))
+        # Atomic replacement protects file integrity but not two edits made
+        # from the same snapshot. Serialize this process's whole edit cycle.
+        with _EDIT_LOCKS[hash(key) % len(_EDIT_LOCKS)]:
+            return self._execute_locked(args)
+
+    def _execute_locked(self, args: Dict[str, Any]) -> ToolResult:
         """
         Execute file edit operation
         
         :param args: Contains file path, old text and new text
         :return: Operation result
         """
-        path = args.get("path", "").strip()
+        path = (args.get("path") or "").strip()
         old_text = args.get("oldText", "")
         new_text = args.get("newText", "")
         replace_all = bool(args.get("replaceAll", False))
@@ -85,15 +102,22 @@ class Edit(BaseTool):
         # Check if file exists
         if not os.path.exists(absolute_path):
             return ToolResult.fail(f"Error: File not found: {path}")
+
+        if not os.path.isfile(absolute_path):
+            return ToolResult.fail(f"Error: {path} is not a regular file")
         
         # Check if readable/writable
         if not os.access(absolute_path, os.R_OK | os.W_OK):
             return ToolResult.fail(f"Error: File is not readable/writable: {path}")
         
         try:
-            # Read file
-            with open(absolute_path, 'r', encoding='utf-8') as f:
-                raw_content = f.read()
+            # Read the file's bytes instead of opening it in text mode. A
+            # newline=None read translates every CRLF to LF before we ever see
+            # it, so the detect_line_ending() call below could only ever answer
+            # '\n' and restore_line_endings() was guaranteed to be a no-op.
+            # Decoding the bytes leaves the real ending intact for it to find.
+            with open(absolute_path, 'rb') as f:
+                raw_content = f.read().decode('utf-8')
             
             # Remove BOM (LLM won't include invisible BOM in oldText)
             bom, content = strip_bom(raw_content)
@@ -107,7 +131,7 @@ class Edit(BaseTool):
             normalized_new_text = normalize_to_lf(new_text)
             
             # Special case: empty oldText means append to end of file
-            if not old_text or not old_text.strip():
+            if not old_text:
                 # Append mode: add newText to the end
                 # Add newline before newText if file doesn't end with one
                 if normalized_content and not normalized_content.endswith('\n'):
@@ -155,6 +179,11 @@ class Edit(BaseTool):
                 for start, end in reversed(spans):
                     replacement = normalized_new_text
                     if not exact:
+                        # A fuzzy match leaves oldText's outer newlines in the
+                        # file, so newText must not add its own copies of them.
+                        replacement = trim_outer_newlines(
+                            normalized_old_text, replacement, base_content, start, end
+                        )
                         # A fuzzy match swallowed the file's own indentation;
                         # re-anchor the replacement to it instead of silently
                         # reindenting the line to whatever the model sent.
@@ -191,9 +220,9 @@ class Edit(BaseTool):
             if blocking:
                 return ToolResult.fail(f"Error: {blocking}")
 
-            # Write file
-            with open(absolute_path, 'w', encoding='utf-8') as f:
-                f.write(final_content)
+            # newline='' writes final_content verbatim; text mode would turn
+            # every '\n' into os.linesep and undo the ending restored above.
+            write_text_atomic(absolute_path, final_content, newline='')
             note_write(absolute_path)
             
             # Generate diff
@@ -217,10 +246,12 @@ class Edit(BaseTool):
                 result["warning"] = " ".join(warnings)
             
             # Notify memory manager if file is in memory directory
-            if self.memory_manager and "memory/" in path:
+            if self.memory_manager and feeds_memory_index(
+                absolute_path, self.memory_manager, self.cwd
+            ):
                 try:
                     self.memory_manager.mark_dirty()
-                except Exception as e:
+                except Exception:
                     # Don't fail the edit if memory notification fails
                     pass
             

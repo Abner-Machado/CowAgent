@@ -37,7 +37,7 @@ BLOCKED_TOOLS = frozenset(
 
 READ_ONLY_TOOLS = (
     "read", "ls", "search_files", "web_search", "web_fetch", "vision",
-    "memory_search", "memory_get",
+    "memory_search", "memory_get", "time",
 )
 
 _ALL_TOOLS = "*"
@@ -117,6 +117,8 @@ EXPLORE = SubagentTemplate(
         "modify anything. You cannot see the conversation of the agent that "
         "spawned you and cannot ask the user anything, but you can search and "
         "read the shared memory / knowledge base.\n\n"
+        "Stop as soon as you have enough information to answer the task, and "
+        "take only the steps it needs: every extra step adds time and cost. "
         "Report what you found, with concrete file paths, line numbers, URLs or "
         "quotes so the answer can be checked without redoing your search. Say so "
         "plainly when you did not find something, rather than guessing."
@@ -135,6 +137,7 @@ def _parse_tools(raw) -> List[str]:
         names = [part.strip() for part in raw.split(",")]
     elif isinstance(raw, (list, tuple)):
         names = [str(part).strip() for part in raw]
+        return [name for name in names if name]
     else:
         return [_ALL_TOOLS]
     names = [name for name in names if name]
@@ -143,15 +146,10 @@ def _parse_tools(raw) -> List[str]:
 
 def parse_template(content: str, fallback_name: str, source: str) -> Optional[SubagentTemplate]:
     """Parse one markdown template. Returns None when it is unusable."""
-    from agent.skills.frontmatter import parse_frontmatter
+    from agent.skills.frontmatter import parse_frontmatter, strip_frontmatter
 
     frontmatter = parse_frontmatter(content) or {}
-    body = content
-    if content.startswith("---"):
-        parts = content.split("---", 2)
-        if len(parts) == 3:
-            body = parts[2]
-    body = body.strip()
+    body = strip_frontmatter(content).strip()
 
     name = str(frontmatter.get("name") or fallback_name).strip()
     description = str(frontmatter.get("description") or "").strip()
@@ -184,7 +182,17 @@ def load_templates(workspace_dir: Optional[str] = None) -> Dict[str, SubagentTem
     if not os.path.isdir(directory):
         return templates
 
-    for entry in sorted(os.listdir(directory)):
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError as e:
+        # A directory that cannot be listed (permissions, a race with a
+        # delete) must not take the tool down with it: the built-in types
+        # stay available, the same way one undecodable file below does not
+        # remove them.
+        logger.warning(f"[SubAgent] Cannot list templates in {directory}: {e}")
+        return templates
+
+    for entry in entries:
         if not entry.endswith(".md"):
             continue
         # The shipped format guide lives here too. It is documentation, not a
@@ -196,7 +204,7 @@ def load_templates(workspace_dir: Optional[str] = None) -> Dict[str, SubagentTem
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 content = handle.read()
-        except OSError as e:
+        except (OSError, UnicodeError) as e:
             logger.warning(f"[SubAgent] Cannot read template {path}: {e}")
             continue
 

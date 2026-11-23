@@ -4,13 +4,24 @@ import os
 import sys
 import subprocess
 import time
-from typing import Optional
+from typing import List, Optional
 
 import click
 
-from cli.utils import get_project_root, load_config_json
+from cli.utils import _ensure_project_on_path, get_project_root, load_config_json
 
 _IS_WIN = sys.platform == "win32"
+
+
+def _configured_channels() -> List[str]:
+    channel = load_config_json().get("channel_type", "")
+    if isinstance(channel, str):
+        names = [c.strip() for c in channel.split(",") if c.strip()]
+    elif isinstance(channel, (list, tuple)):
+        names = [str(c).strip() for c in channel if str(c).strip()]
+    else:
+        names = []
+    return names
 
 
 def _is_terminal_only() -> bool:
@@ -20,14 +31,7 @@ def _is_terminal_only() -> bool:
     background daemon mode (stdout/stdin detached). When terminal is the only
     channel, `start` must run in the foreground so it can own the tty.
     """
-    channel = load_config_json().get("channel_type", "")
-    if isinstance(channel, str):
-        names = [c.strip() for c in channel.split(",") if c.strip()]
-    elif isinstance(channel, (list, tuple)):
-        names = [str(c).strip() for c in channel if str(c).strip()]
-    else:
-        names = []
-    return names == ["terminal"]
+    return _configured_channels() == ["terminal"]
 
 
 def _get_pid_file():
@@ -45,6 +49,7 @@ def _is_pid_alive(pid: int) -> bool:
             out = subprocess.check_output(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 stderr=subprocess.DEVNULL,
+                timeout=5,
             )
             return str(pid) in out.decode(errors="ignore")
         except Exception:
@@ -53,19 +58,25 @@ def _is_pid_alive(pid: int) -> bool:
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except PermissionError:
+            return True
+        except ProcessLookupError:
             return False
 
 
 def _kill_pid(pid: int, force: bool = False):
     """Terminate a process by PID (cross-platform)."""
     if _IS_WIN:
-        flag = "/F" if force else ""
         cmd = ["taskkill"]
         if force:
             cmd.append("/F")
         cmd.extend(["/PID", str(pid)])
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            # A taskkill that cannot run or will not finish must not wedge
+            # `stop` -- the liveness loop below decides what actually happened.
+            pass
     else:
         import signal
         sig = signal.SIGKILL if force else signal.SIGTERM
@@ -131,6 +142,7 @@ def start(foreground, no_logs):
         if _IS_WIN:
             sys.exit(subprocess.call([python, app_py], cwd=root))
         else:
+            os.chdir(root)
             os.execv(python, [python, app_py])
     else:
         log_file = _get_log_file()
@@ -148,6 +160,8 @@ def start(foreground, no_logs):
         with open(log_file, "a") as log:
             proc = subprocess.Popen(
                 [python, app_py],
+                # A terminal channel exits the whole service on stdin EOF.
+                stdin=None if "terminal" in _configured_channels() else subprocess.DEVNULL,
                 stdout=log,
                 stderr=log,
                 **popen_kwargs,
@@ -178,6 +192,12 @@ def stop():
                 break
         else:
             _kill_pid(pid, force=True)
+    except PermissionError:
+        click.echo(click.style(
+            f"✗ No permission to stop PID {pid}; it was likely started by another user (try sudo).",
+            fg="red",
+        ))
+        sys.exit(1)
     except (ProcessLookupError, OSError):
         pass
 
@@ -230,10 +250,18 @@ def log(msg):
 # `import app` exercises top-level imports / syntax of the entry module. If it
 # fails, abort and leave the running service untouched — never end up with the
 # old process killed and the new one unable to start.
-check = subprocess.run(
-    [python, "-c", "import app"], cwd=root,
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-)
+# A hung import (a top-level network call, a dependency waiting on something)
+# must not leave the relay stuck forever, so it is bounded and aborts the same
+# way a failing import does. The relay's stderr is discarded, so log it here.
+try:
+    check = subprocess.run(
+        [python, "-c", "import app"], cwd=root,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=60,
+    )
+except subprocess.TimeoutExpired:
+    log("self-check timed out after 60s, aborting restart; service left running")
+    sys.exit(1)
 if check.returncode != 0:
     detail = (check.stdout or b"").decode("utf-8", "replace").strip()
     log("self-check FAILED, aborting restart; service left running:\n" + detail)
@@ -313,16 +341,26 @@ def self_restart():
 @click.pass_context
 def update(ctx):
     """Update CowAgent and restart."""
+    from cli.update_service import is_managed, manage_url
+
+    if is_managed():
+        url = manage_url()
+        click.echo("This install is updated by whoever runs it." + (f" Manage it at {url}" if url else ""), err=True)
+        sys.exit(1)
     root = get_project_root()
 
     # 1. Stop service first so git pull won't conflict with running code
     ctx.invoke(stop)
 
-    # 2. Git pull
+    # 2. Git pull — same helper the Web console updater uses.
+    from cli.update_service import run_git_pull
+
     if os.path.isdir(os.path.join(root, ".git")):
         click.echo("Pulling latest code...")
-        ret = subprocess.call(["git", "pull"], cwd=root)
-        if ret != 0:
+        pull = run_git_pull(root)
+        if pull.returncode != 0:
+            if pull.stdout:
+                click.echo(pull.stdout, err=True)
             click.echo("Error: git pull failed.", err=True)
             sys.exit(1)
     else:
@@ -343,7 +381,7 @@ def update(ctx):
             "timeout /t 3 /nobreak >nul",
         ]
         if os.path.exists(req_file):
-            lines.append(f'echo Installing dependencies...')
+            lines.append('echo Installing dependencies...')
             lines.append(f'"{python}" -m pip install -r requirements.txt -q')
         lines += [
             "echo Reinstalling cow CLI...",
@@ -442,10 +480,11 @@ def logs(follow, lines):
 
 def _print_last_lines(file_path: str, n: int = 50):
     """Print the last N lines of a file (cross-platform)."""
+    _ensure_project_on_path()
+    from common.utils import tail_lines
+
     try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            all_lines = f.readlines()
-        for line in all_lines[-n:]:
+        for line in tail_lines(file_path, n):
             click.echo(line, nl=False)
     except Exception as e:
         click.echo(f"Error reading log file: {e}", err=True)

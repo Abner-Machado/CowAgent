@@ -1,0 +1,203 @@
+/* Knowledge base tree and graph.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* ============================================================
+   Knowledge View
+   ============================================================ */
+
+/* Tab toggle */
+.knowledge-tab, .memory-tab, .config-tab, .cfg-api-lang {
+    color: rgb(var(--cw-slate-500));
+}
+.knowledge-tab.active, .memory-tab.active, .config-tab.active, .cfg-api-lang.active {
+    background: #fff;
+    color: rgb(var(--cw-slate-700));
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+}
+.dark .knowledge-tab.active, .dark .memory-tab.active, .dark .config-tab.active, .dark .cfg-api-lang.active {
+    background: rgba(255,255,255,0.1);
+    color: rgb(var(--cw-slate-200));
+}
+
+/* File tree */
+.knowledge-tree-group {
+    margin-bottom: 2px;
+}
+.knowledge-tree-group-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 8px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    border: none;
+    background: none;
+    transition: background 0.15s, color 0.15s;
+    text-transform: capitalize;
+}
+.knowledge-tree-group-btn:hover {
+    background: rgba(0,0,0,0.04);
+    color: rgb(var(--cw-slate-700));
+}
+.dark .knowledge-tree-group-btn:hover {
+    background: rgba(255,255,255,0.06);
+    color: rgb(var(--cw-slate-200));
+}
+.knowledge-tree-group-btn i.chevron {
+    font-size: 8px;
+    transition: transform 0.15s;
+}
+.knowledge-tree-group.open > .knowledge-tree-group-btn .chevron {
+    transform: rotate(90deg);
+}
+.knowledge-tree-group-items {
+    display: none;
+}
+.knowledge-tree-group.open > .knowledge-tree-group-items {
+    display: block;
+}
+
+.knowledge-tree-file {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px 5px 24px;
+    border-radius: 6px;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    border: none;
+    background: none;
+    width: 100%;
+    text-align: left;
+    transition: background 0.15s, color 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.knowledge-tree-file:hover {
+    background: rgba(0,0,0,0.04);
+    color: rgb(var(--cw-slate-700));
+}
+.knowledge-tree-file.active {
+    background: rgb(var(--cw-primary-50));
+    color: rgb(var(--cw-primary-600));
+}
+
+.knowledge-actions {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+.knowledge-tree-file:hover .knowledge-actions,
+.knowledge-tree-group-btn:hover .knowledge-actions,
+.knowledge-tree-file:focus-within .knowledge-actions,
+.knowledge-tree-group-btn:focus-within .knowledge-actions {
+    opacity: 1;
+}
+.knowledge-action {
+    padding: 3px 5px;
+    border-radius: 5px;
+    color: rgb(var(--cw-slate-400));
+    font-size: 9px;
+}
+.knowledge-action:hover {
+    color: rgb(var(--cw-primary-600));
+    background: rgb(var(--cw-primary-600) / 0.08);
+}
+.knowledge-action.danger:hover {
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.08);
+}
+.dark .knowledge-tree-file:hover {
+    background: rgba(255,255,255,0.06);
+    color: rgb(var(--cw-slate-200));
+}
+.dark .knowledge-tree-file.active {
+    background: rgb(var(--cw-primary-400) / 0.1);
+    color: rgb(var(--cw-primary-400));
+}
+.knowledge-import-drag-over {
+    outline: 2px dashed rgb(var(--cw-primary-400) / 0.55);
+    outline-offset: 4px;
+    border-radius: 14px;
+}
+#knowledge-dialog-card.knowledge-document-dialog {
+    max-width: 760px;
+}
+#knowledge-document-content {
+    min-height: 320px;
+    line-height: 1.55;
+}
+
+/* Graph legend */
+.knowledge-graph-legend {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 11px;
+    color: rgb(var(--cw-slate-500));
+    z-index: 10;
+}
+.knowledge-graph-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+.knowledge-graph-legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+/* Graph tooltip */
+.knowledge-graph-tooltip {
+    position: absolute;
+    padding: 6px 10px;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 8px;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-700));
+    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    z-index: 20;
+}
+.dark .knowledge-graph-tooltip {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255,255,255,0.1);
+    color: rgb(var(--cw-slate-200));
+}
+
+/* Graph node label — the halo keeps it readable where links and nodes crowd */
+.knowledge-graph-label {
+    fill: rgb(var(--cw-slate-600));
+    paint-order: stroke;
+    stroke: rgba(255,255,255,0.9);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+}
+.dark .knowledge-graph-label {
+    fill: rgb(var(--cw-slate-300));
+    stroke: rgb(var(--cw-panel) / 0.9);
+}
+
+/* The viewer body already fills the documents panel, so the editor's text area
+   follows it rather than the viewport-derived default height in workspace.css,
+   which would overflow this panel by its header and padding. */
+#knowledge-viewer-body textarea.doc-editor {
+    height: 100%;
+}
+

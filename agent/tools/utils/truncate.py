@@ -236,8 +236,10 @@ def truncate_tail(content: str, max_lines: Optional[int] = None, max_bytes: Opti
         output_lines_arr.insert(0, line)
         output_bytes_count += line_bytes
     
-    # If exited due to line limit
-    if len(output_lines_arr) >= max_lines and output_bytes_count <= max_bytes:
+    # If exited due to line limit. A partially kept line means the byte limit
+    # was what actually cut the output, even when it also fills max_lines, so
+    # leave truncated_by as "bytes" in that case.
+    if not last_line_partial and len(output_lines_arr) >= max_lines and output_bytes_count <= max_bytes:
         truncated_by = "lines"
     
     output_content = '\n'.join(output_lines_arr)

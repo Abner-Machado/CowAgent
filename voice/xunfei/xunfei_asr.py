@@ -16,7 +16,6 @@
 # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
 
 import websocket
-import datetime
 import hashlib
 import base64
 import hmac
@@ -28,7 +27,6 @@ from wsgiref.handlers import format_date_time
 from datetime import datetime
 from time import mktime
 import _thread as thread
-import os
 import wave
 
 
@@ -199,7 +197,7 @@ def xunfei_asr(APPID,APISecret,APIKey,BusinessArgsASR,AudioFile):
     wsUrl = wsParam.create_url()
     ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.on_open = on_open
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    ws.run_forever(sslopt={"context": ssl.create_default_context()})
     #把字典的值合并起来做最后识别的输出
     whole_words = ""
     for i in sorted(whole_dict.keys()):

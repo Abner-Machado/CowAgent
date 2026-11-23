@@ -22,7 +22,10 @@ import plugins
 from plugins import Plugin, Event, EventContext, EventAction
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
+from common.atomic_write import write_json_atomic
+from common.deployment import is_mobile
 from common.log import logger
+from common.utils import tail_lines
 from common.i18n import t as _t
 from config import conf
 from cli import __version__
@@ -46,6 +49,9 @@ CLI_ONLY_COMMANDS = {"start", "stop", "restart"}
 # Commands that can only run from chat (need access to in-process memory)
 CHAT_ONLY_COMMANDS = set()  # context is allowed in both, but behaves differently
 
+# A kernel inside a mobile app has no browser to install.
+NOT_ON_MOBILE_COMMANDS = {"install-browser"}
+
 # Convenience shorthands for the slash form only. Values are *full command
 # strings* so an alias can carry arguments (e.g. "cc" -> "context clear").
 # These shorthands are deliberate and NOT derivable from prefix/typo rules:
@@ -63,6 +69,24 @@ DEFAULT_ALIASES = {
     "cfg": "config",
     "k":   "knowledge",
 }
+
+
+def _app_name() -> str:
+    """Product name shown in command output; a desktop build may rename it."""
+    return (os.environ.get("COW_APP_NAME") or "").strip() or "CowAgent"
+
+
+# Skills whose install is still running in a worker thread, keyed by
+# (agent_id, name). A timed-out install keeps writing after the chat command
+# has returned, so its key is released by the worker's done callback rather
+# than by the caller.
+_installing = set()
+_installing_guard = threading.Lock()
+
+
+def _forget_install(key) -> None:
+    with _installing_guard:
+        _installing.discard(key)
 
 
 @plugins.register(
@@ -330,6 +354,8 @@ class CowCliPlugin(Plugin):
                 f"⚠️ `cow {cmd}` 只能在命令行终端中执行。\n请在终端运行: cow {cmd}",
                 f"⚠️ `cow {cmd}` can only run in a terminal.\nRun it in your shell: cow {cmd}",
             )
+        if cmd in NOT_ON_MOBILE_COMMANDS and is_mobile():
+            return _t(f"⚠️ /{cmd} 在手机上不可用。", f"⚠️ /{cmd} is not available on a phone.")
 
         handler_attr = "_cmd_" + cmd.replace("-", "_")
         handler = getattr(self, handler_attr, None)
@@ -349,7 +375,7 @@ class CowCliPlugin(Plugin):
     def _cmd_help(self, args: str, e_context, **_) -> str:
         if _t("zh", "en") == "en":
             lines = [
-                "📋 CowAgent Commands",
+                f"📋 {_app_name()} Commands",
                 "",
                 "/help: Show this help",
                 "/version: Show version",
@@ -379,7 +405,7 @@ class CowCliPlugin(Plugin):
             ]
         else:
             lines = [
-                "📋 CowAgent 命令列表",
+                f"📋 {_app_name()} 命令列表",
                 "",
                 "/help: 显示此帮助",
                 "/version: 查看版本",
@@ -407,10 +433,14 @@ class CowCliPlugin(Plugin):
                 "",
                 "💡 也可以用 cow <command> 代替 /<command>",
             ]
-        return "\n".join(lines)
+        # The `cow` prefix is named after the default product; a renamed build
+        # keeps the slash form only in its help, as does a phone, with no terminal.
+        if os.environ.get("COW_APP_NAME") or is_mobile():
+            lines = [l for l in lines if "cow <command>" not in l]
+        return "\n".join(lines).rstrip()
 
     def _cmd_version(self, args: str, e_context, **_) -> str:
-        return f"CowAgent v{__version__}"
+        return f"{_app_name()} v{__version__}"
 
     # ------------------------------------------------------------------
     # tasks — read-only scheduler list scoped to the current chat.
@@ -424,9 +454,9 @@ class CowCliPlugin(Plugin):
         task_store = get_task_store()
         if task_store is None:
             from agent.tools.scheduler.task_store import TaskStore
-            from common.state_dir import scheduler_file
+            from common.state_dir import scheduler_file_global
 
-            task_store = TaskStore(str(scheduler_file()))
+            task_store = TaskStore(str(scheduler_file_global()))
 
         channel_type = ""
         receiver = ""
@@ -543,15 +573,16 @@ class CowCliPlugin(Plugin):
         from config import conf
 
         cfg = conf()
-        lines = [_t("📊 CowAgent 运行状态", "📊 CowAgent Status"), ""]
+        lines = [_t(f"📊 {_app_name()} 运行状态", f"📊 {_app_name()} Status"), ""]
 
         lines.append(_t(f"  版本: v{__version__}", f"  Version: v{__version__}"))
-        lines.append(_t(f"  进程: PID {os.getpid()}", f"  Process: PID {os.getpid()}"))
-
-        channel = cfg.get("channel_type", "unknown")
-        if isinstance(channel, list):
-            channel = ", ".join(channel)
-        lines.append(_t(f"  通道: {channel}", f"  Channel: {channel}"))
+        # Inside a phone app the process and channel are the app's own, the same every time.
+        if not is_mobile():
+            lines.append(_t(f"  进程: PID {os.getpid()}", f"  Process: PID {os.getpid()}"))
+            channel = cfg.get("channel_type", "unknown")
+            if isinstance(channel, list):
+                channel = ", ".join(channel)
+            lines.append(_t(f"  通道: {channel}", f"  Channel: {channel}"))
 
         model_name = cfg.get("model", "unknown")
         lines.append(_t(f"  模型: {model_name}", f"  Model: {model_name}"))
@@ -578,11 +609,38 @@ class CowCliPlugin(Plugin):
                     if v.get("enabled", True)
                 )
                 lines.append(_t(f"  已加载技能: {enabled}/{total}", f"  Loaded skills: {enabled}/{total}"))
+
+            lines.append(self._mcp_status_line(agent))
         else:
             lines.append("")
             lines.append(_t("  Agent: 未初始化 (首次对话后自动创建)", "  Agent: not initialized (created on first chat)"))
 
         return "\n".join(lines)
+
+    def _mcp_status_line(self, agent) -> str:
+        """One line of MCP servers, shown "ready/total" like the skills line.
+
+        Same source the web console uses (mcp.json, config.json fallback,
+        ToolManager runtime state), and reading it never boots a server.
+        The numerator counts only servers whose live status is "ready"; the
+        denominator counts every configured server (failed, disabled, and
+        not-yet-loaded included). No per-status breakdown ("就绪 2, 失败 1"
+        in parentheses) is shown here by design — the console's MCP page
+        carries that detail.
+        """
+        try:
+            from agent.tools.mcp.service import list_servers_with_status
+
+            servers = list_servers_with_status(agent.workspace_dir).get("servers") or []
+        except Exception as e:
+            logger.warning(f"[CowCli] status: failed to read MCP servers: {e}")
+            servers = []
+
+        ready = sum(1 for item in servers if item.get("status") == "ready")
+        return _t(
+            f"  已加载 MCP: {ready}/{len(servers)}",
+            f"  Loaded MCP: {ready}/{len(servers)}",
+        )
 
     # ------------------------------------------------------------------
     # logs
@@ -598,9 +656,7 @@ class CowCliPlugin(Plugin):
             return _t("未找到日志文件", "No log file found")
 
         try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                all_lines = f.readlines()
-            tail = all_lines[-num_lines:]
+            tail = tail_lines(log_file, num_lines)
             content = "".join(tail).strip()
             if not content:
                 return _t("日志为空", "Log is empty")
@@ -614,6 +670,10 @@ class CowCliPlugin(Plugin):
             os.path.join(project_root, "nohup.out"),
             os.path.join(project_root, "run.log"),
         ]
+        # Desktop and mobile builds log under their data directory instead.
+        data_dir = os.environ.get("COW_DATA_DIR")
+        if data_dir:
+            candidates.insert(0, os.path.join(os.path.expanduser(data_dir), "run.log"))
         import glob as glob_mod
         candidates.extend(sorted(glob_mod.glob(os.path.join(project_root, "logs", "*.log")), reverse=True))
         for f in candidates:
@@ -742,9 +802,6 @@ class CowCliPlugin(Plugin):
     _CONFIG_READABLE = _CONFIG_WRITABLE | {"channel_type"}
 
     def _cmd_config(self, args: str, e_context, **_) -> str:
-        from config import conf, load_config
-        import json as _json
-
         parts = args.strip().split(None, 1)
         if not parts:
             return self._config_show_all()
@@ -810,7 +867,10 @@ class CowCliPlugin(Plugin):
 
         if key == "model" and old_bot_type:
             from common import const
-            if old_bot_type not in (const.CUSTOM,):
+            # Aggregators and custom providers keep the model id they are given;
+            # re-inferring would switch them onto a wrong key.
+            keep_bot = old_bot_type in (const.CUSTOM, const.COWAGENT, const.LINKAI) or old_bot_type.startswith("custom:")
+            if not keep_bot:
                 resolved = self._resolve_bot_type_for_model(str(new_val))
                 if resolved:
                     updates["bot_type"] = resolved
@@ -821,11 +881,10 @@ class CowCliPlugin(Plugin):
         from config import get_data_root
         config_path = os.path.join(get_data_root(), "config.json")
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 file_config = _json.load(f)
             file_config.update(updates)
-            with open(config_path, "w", encoding="utf-8") as f:
-                _json.dump(file_config, f, indent=4, ensure_ascii=False)
+            write_json_atomic(config_path, file_config)
         except Exception as e:
             return _t(f"写入 config.json 失败: {e}", f"Failed to write config.json: {e}")
 
@@ -849,6 +908,15 @@ class CowCliPlugin(Plugin):
             load_config()
         except Exception as e:
             logger.warning(f"[CowCli] config reload warning: {e}")
+
+        if key in ("agent_max_context_tokens", "agent_max_steps"):
+            try:
+                from bridge.bridge import Bridge
+                agent_bridge = Bridge().get_agent_bridge()
+                if agent_bridge is not None:
+                    agent_bridge.apply_runtime_limits()
+            except Exception as e:
+                logger.warning(f"[CowCli] apply runtime limits failed: {e}")
 
         result = _t(f"✅ 配置已更新\n\n  {key}: {old_val} → {new_val}", f"✅ Config updated\n\n  {key}: {old_val} → {new_val}")
         if "bot_type" in updates and updates["bot_type"] != old_bot_type:
@@ -940,8 +1008,8 @@ class CowCliPlugin(Plugin):
                 "you can also run `cow install-browser` in a terminal.",
             )
         return _t(
-            "✅ 安装流程已结束。请重启 CowAgent 后使用 browser 工具。",
-            "✅ Installation finished. Restart CowAgent to use the browser tool.",
+            f"✅ 安装流程已结束。请重启 {_app_name()} 后使用 browser 工具。",
+            f"✅ Installation finished. Restart {_app_name()} to use the browser tool.",
         )
 
     # ------------------------------------------------------------------
@@ -952,21 +1020,24 @@ class CowCliPlugin(Plugin):
         parts = args.strip().split(None, 1)
         sub = parts[0].lower() if parts else ""
         sub_args = parts[1].strip() if len(parts) > 1 else ""
+        # An Agent with its own skill set must not have commands typed in its
+        # chat land on the shared library instead.
+        agent_id = self._current_agent_id(e_context)
 
         if sub == "list":
-            return self._skill_list(sub_args)
+            return self._skill_list(sub_args, agent_id=agent_id)
         elif sub == "search":
-            return self._skill_search(sub_args)
+            return self._skill_search(sub_args, agent_id=agent_id)
         elif sub == "install":
-            return self._skill_install(sub_args, e_context)
+            return self._skill_install(sub_args, agent_id=agent_id)
         elif sub == "uninstall":
-            return self._skill_uninstall(sub_args)
+            return self._skill_uninstall(sub_args, agent_id=agent_id)
         elif sub == "info":
-            return self._skill_info(sub_args)
+            return self._skill_info(sub_args, agent_id=agent_id)
         elif sub == "enable":
-            return self._skill_set_enabled(sub_args, True)
+            return self._skill_set_enabled(sub_args, True, agent_id=agent_id)
         elif sub == "disable":
-            return self._skill_set_enabled(sub_args, False)
+            return self._skill_set_enabled(sub_args, False, agent_id=agent_id)
         else:
             return _t(
                 "用法: /skill <子命令>\n\n"
@@ -989,26 +1060,48 @@ class CowCliPlugin(Plugin):
                 "disable <name>: Disable a skill",
             )
 
-    def _refresh_skill_manager(self):
+    def _refresh_skill_manager(self, agent_id=None):
         """Re-scan skill directories so skills_config.json reflects disk state."""
         try:
             from bridge.bridge import Bridge
             bridge = Bridge()
             agent_bridge = bridge.get_agent_bridge()
-            for _agent_id, _session_id, agent in agent_bridge.iter_agent_instances():
-                if agent and hasattr(agent, 'skill_manager') and agent.skill_manager:
+            for live_id, _session_id, agent in agent_bridge.iter_agent_instances():
+                if not (agent and getattr(agent, 'skill_manager', None)):
+                    continue
+                if not agent_id or live_id == agent_id:
                     agent.skill_manager.refresh_skills()
-                    break
+                    return
+            if agent_id:
+                # No live instance for this Agent yet: scanning its directory
+                # brings the config file in line just the same.
+                from agent.skills.manager import SkillManager
+                from cli.utils import get_skills_dir
+                SkillManager(custom_dir=get_skills_dir(agent_id))
         except Exception as e:
             logger.debug(f"[CowCli] skill refresh skipped: {e}")
 
-    def _skill_list_local(self) -> str:
+    def _skill_list_local(self, agent_id=None) -> str:
         from cli.utils import load_skills_config, get_skills_dir, get_builtin_skills_dir
-        self._refresh_skill_manager()
-        config = load_skills_config()
+        self._refresh_skill_manager(agent_id)
+        config = load_skills_config(agent_id)
+
+        # Scope to this Agent's selection: a subset picked in team.json means
+        # /skill list here shows only what this Agent actually draws on, not the
+        # whole shared library. ``None`` selection = every shared skill; an empty
+        # list is a deliberate "none" and must NOT fall through to a disk scan.
+        selection = self._agent_skill_selection(agent_id)
+        scoped = selection is not None
+        if scoped:
+            config = {n: e for n, e in config.items() if n in selection}
+            if not config:
+                return _t(
+                    "该智能体未启用任何技能。\n\n💡 在「智能体」中为它勾选技能",
+                    "This Agent has no skills enabled.\n\n💡 Pick skills for it under Agents",
+                )
 
         if not config:
-            skills_dir = get_skills_dir()
+            skills_dir = get_skills_dir(agent_id)
             builtin_dir = get_builtin_skills_dir()
             entries = []
             for d, source in [(builtin_dir, "builtin"), (skills_dir, "custom")]:
@@ -1036,7 +1129,7 @@ class CowCliPlugin(Plugin):
             source = entry.get("source", "")
             icon = "✅" if enabled else "⏸️"
             display = entry.get("display_name", "") or name
-            desc = entry.get("description", "")
+            desc = entry.get("display_description", "") or entry.get("description", "")
             if len(desc) > 50:
                 desc = desc[:47] + "…"
             line = f"{icon} {display}"
@@ -1054,26 +1147,54 @@ class CowCliPlugin(Plugin):
         lines.append(_t("💡 /skill info <名称>: 查看详情", "💡 /skill info <name>: Show details"))
         return "\n".join(lines)
 
-    def _skill_list(self, args: str) -> str:
+    def _skill_list(self, args: str, agent_id=None) -> str:
         parts = args.strip().split()
         if "--remote" in parts or "-r" in parts:
             page = 1
             for i, p in enumerate(parts):
                 if p == "--page" and i + 1 < len(parts) and parts[i + 1].isdigit():
                     page = max(1, int(parts[i + 1]))
-            return self._skill_list_remote(page=page)
-        return self._skill_list_local()
+            return self._skill_list_remote(page=page, agent_id=agent_id)
+        return self._skill_list_local(agent_id)
+
+    def _agent_skill_selection(self, agent_id):
+        """The set of skill names this Agent draws on, or ``None`` for "all".
+
+        Mirrors SkillManager's first gate: a profile with an explicit ``skills``
+        list is a subset; ``None``/absent means the full shared library.
+        """
+        try:
+            from agent.registry import get_agent_registry
+            profile = get_agent_registry().get(agent_id or None, require_enabled=False)
+            return None if profile.skills is None else set(profile.skills)
+        except Exception:
+            return None
+
+    def _current_agent_id(self, e_context):
+        """Resolve which Agent this /skill command is running inside, so the
+        listing can be scoped to that Agent's selection rather than the whole
+        shared library."""
+        if e_context is None:
+            return None
+        try:
+            from bridge.bridge import Bridge
+            agent_bridge = Bridge().get_agent_bridge()
+            return agent_bridge.route_context(e_context["context"])
+        except Exception:
+            return None
 
     _REMOTE_PAGE_SIZE = 10
 
-    def _skill_list_remote(self, page: int = 1) -> str:
+    def _skill_list_remote(self, page: int = 1, agent_id=None) -> str:
         import requests
-        from cli.utils import SKILL_HUB_API, load_skills_config
+        from cli.utils import custom_skill_hub, load_skills_config, skill_hub
         page_size = self._REMOTE_PAGE_SIZE
+        hub_api, hub_headers = skill_hub()
         try:
             resp = requests.get(
-                f"{SKILL_HUB_API}/skills",
+                f"{hub_api}/skills",
                 params={"page": page, "limit": page_size},
+                headers=hub_headers,
                 timeout=10,
             )
             resp.raise_for_status()
@@ -1088,7 +1209,7 @@ class CowCliPlugin(Plugin):
 
         total_pages = max(1, (total + page_size - 1) // page_size)
         page = min(page, total_pages)
-        installed = set(load_skills_config().keys())
+        installed = set(load_skills_config(agent_id).keys())
 
         lines = [_t("🌐 技能广场", "🌐 Skill Hub"), ""]
         for s in skills:
@@ -1112,17 +1233,21 @@ class CowCliPlugin(Plugin):
             lines.append(_t(f"💡 /skill list --remote --page {page - 1}: 上一页", f"💡 /skill list --remote --page {page - 1}: Previous page"))
         lines.append(_t("💡 /skill install <名称>: 安装技能", "💡 /skill install <name>: Install a skill"))
         lines.append(_t("💡 /skill search <关键词>: 搜索技能", "💡 /skill search <keyword>: Search skills"))
-        lines.append(_t("🌐 https://skills.cowagent.ai  在线浏览全部技能", "🌐 https://skills.cowagent.ai  Browse all skills online"))
+        # The hub site is the default product's; a renamed build or another
+        # registry leaves it out.
+        if not os.environ.get("COW_APP_NAME") and not custom_skill_hub():
+            lines.append(_t("🌐 https://skills.cowagent.ai  在线浏览全部技能", "🌐 https://skills.cowagent.ai  Browse all skills online"))
         return "\n".join(lines)
 
-    def _skill_search(self, query: str) -> str:
+    def _skill_search(self, query: str, agent_id=None) -> str:
         if not query:
             return _t("请指定搜索关键词: /skill search <关键词>", "Please specify a search keyword: /skill search <keyword>")
 
         import requests
-        from cli.utils import SKILL_HUB_API, load_skills_config
+        from cli.utils import load_skills_config, skill_hub
+        hub_api, hub_headers = skill_hub()
         try:
-            resp = requests.get(f"{SKILL_HUB_API}/skills/search", params={"q": query}, timeout=10)
+            resp = requests.get(f"{hub_api}/skills/search", params={"q": query}, headers=hub_headers, timeout=10)
             resp.raise_for_status()
             skills = resp.json().get("skills", [])
         except Exception as e:
@@ -1131,7 +1256,7 @@ class CowCliPlugin(Plugin):
         if not skills:
             return _t(f"未找到与「{query}」相关的技能", f"No skills found for \"{query}\"")
 
-        installed = set(load_skills_config().keys())
+        installed = set(load_skills_config(agent_id).keys())
         lines = [_t(f"🔍 搜索「{query}」({len(skills)} 个结果)", f"🔍 Search \"{query}\" ({len(skills)} results)"), ""]
         for s in skills:
             name = s.get("name", "")
@@ -1152,37 +1277,61 @@ class CowCliPlugin(Plugin):
 
     _INSTALL_TIMEOUT = 60
 
-    def _skill_install(self, name: str, e_context: EventContext) -> str:
+    def _skill_install(self, name: str, agent_id=None) -> str:
         if not name:
             return _t("请指定要安装的技能: /skill install <名称>", "Please specify a skill to install: /skill install <name>")
 
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
         from cli.commands.skill import install_skill
 
+        # An install that runs past the budget below cannot be cancelled:
+        # install_skill takes no token and writes as it downloads. So a repeat
+        # request must wait for the one already running instead of starting a
+        # second writer on the same directory.
+        key = (agent_id or "", name)
+        with _installing_guard:
+            if key in _installing:
+                return _t(f"技能 '{name}' 正在安装中，请稍候", f"'{name}' is already being installed, please wait")
+            _installing.add(key)
+
+        # Deliberately not `with ThreadPoolExecutor(...)`: that joins the worker
+        # on exit, so the timeout below would not return until the stalled
+        # install had finished anyway, and the user would sit on a frozen chat
+        # command for the whole download.
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(install_skill, name)
-                result = future.result(timeout=self._INSTALL_TIMEOUT)
+            future = pool.submit(install_skill, name, agent_id)
+        except Exception as e:
+            pool.shutdown(wait=False)
+            _forget_install(key)
+            return _t(f"安装失败: {e}", f"Install failed: {e}")
+        # Released when the worker really finishes, not when this returns.
+        future.add_done_callback(lambda _done: _forget_install(key))
 
-            if result.error:
-                return _t(f"安装失败: {result.error}", f"Install failed: {result.error}")
-
-            if not result.installed:
-                return "\n".join(result.messages) if result.messages else _t("未找到可安装的技能", "No installable skill found")
-
-            return self._format_install_result(result)
+        try:
+            result = future.result(timeout=self._INSTALL_TIMEOUT)
         except FuturesTimeout:
             return _t("安装超时，请稍后重试或检查网络连接", "Install timed out. Please retry later or check your network connection.")
         except Exception as e:
             return _t(f"安装失败: {e}", f"Install failed: {e}")
+        finally:
+            pool.shutdown(wait=False)
+
+        if result.error:
+            return _t(f"安装失败: {result.error}", f"Install failed: {result.error}")
+
+        if not result.installed:
+            return "\n".join(result.messages) if result.messages else _t("未找到可安装的技能", "No installable skill found")
+
+        return self._format_install_result(result, agent_id)
 
     @staticmethod
-    def _format_install_result(result) -> str:
+    def _format_install_result(result, agent_id=None) -> str:
         """Format InstallResult into a chat-friendly message."""
         from cli.commands.skill import _read_skill_description
         from cli.utils import get_skills_dir, load_skills_config
-        skills_dir = get_skills_dir()
-        config = load_skills_config()
+        skills_dir = get_skills_dir(agent_id)
+        config = load_skills_config(agent_id)
 
         lines = []
         for skill_name in result.installed:
@@ -1199,15 +1348,23 @@ class CowCliPlugin(Plugin):
 
         return "\n".join(lines)
 
-    def _skill_uninstall(self, name: str) -> str:
+    def _skill_uninstall(self, name: str, agent_id=None) -> str:
         if not name:
             return _t("请指定要卸载的技能: /skill uninstall <名称>", "Please specify a skill to uninstall: /skill uninstall <name>")
 
         import shutil
         import json
+        from cli.commands.skill import SkillInstallError, _check_skill_name
         from cli.utils import get_skills_dir
 
-        skills_dir = get_skills_dir()
+        # The name comes from chat and is passed to rmtree below. Use the raising
+        # check: the CLI variant calls sys.exit.
+        try:
+            _check_skill_name(name)
+        except SkillInstallError as e:
+            return _t(f"无法卸载: {e}", f"Cannot uninstall: {e}")
+
+        skills_dir = get_skills_dir(agent_id)
         skill_dir = os.path.join(skills_dir, name)
 
         if not os.path.exists(skill_dir):
@@ -1215,6 +1372,8 @@ class CowCliPlugin(Plugin):
 
         if not skill_dir:
             return _t(f"技能 '{name}' 未安装", f"Skill '{name}' is not installed")
+
+        shared = os.path.realpath(skills_dir) == os.path.realpath(get_skills_dir())
 
         shutil.rmtree(skill_dir)
 
@@ -1224,10 +1383,19 @@ class CowCliPlugin(Plugin):
                 with open(config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
                 config.pop(name, None)
-                with open(config_path, "w", encoding="utf-8") as f:
-                    json.dump(config, f, indent=4, ensure_ascii=False)
+                write_json_atomic(config_path, config)
             except Exception:
                 pass
+
+        # The skill is gone from the shared library, so scrub its name from any
+        # Agent's selection list in team.json instead of leaving dead entries.
+        # Removing an Agent's own copy leaves the shared one other Agents pick.
+        if shared:
+            try:
+                from agent.admin import get_agent_admin_service
+                get_agent_admin_service().prune_skill(name)
+            except Exception as e:
+                logger.debug(f"[CowCli] skill prune skipped: {e}")
 
         return _t(f"✅ 技能 '{name}' 已卸载", f"✅ Skill '{name}' uninstalled")
 
@@ -1263,13 +1431,24 @@ class CowCliPlugin(Plugin):
                 meta[key.strip()] = val.strip().strip('"').strip("'")
         return meta, body
 
-    def _skill_info(self, name: str) -> str:
+    def _skill_info(self, name: str, agent_id=None) -> str:
         if not name:
             return _t("请指定技能名称: /skill info <名称>", "Please specify a skill name: /skill info <name>")
 
+        # The name comes from chat and is joined into a path below: without
+        # this check, "/skill info ../../.." (or an absolute path) reads and
+        # echoes any SKILL.md on disk. _skill_uninstall already rejects the
+        # same input; info must not be the gap in the fence.
+        from cli.commands.skill import SkillInstallError, _check_skill_name
+
+        try:
+            _check_skill_name(name)
+        except SkillInstallError as e:
+            return _t(f"无法查看: {e}", f"Cannot view: {e}")
+
         from cli.utils import get_skills_dir, get_builtin_skills_dir
 
-        skills_dir = get_skills_dir()
+        skills_dir = get_skills_dir(agent_id)
         builtin_dir = get_builtin_skills_dir()
 
         skill_dir = None
@@ -1312,7 +1491,7 @@ class CowCliPlugin(Plugin):
             result += f"\n\n... ({len(lines) - 30} more lines)"
         return result
 
-    def _skill_set_enabled(self, name: str, enabled: bool) -> str:
+    def _skill_set_enabled(self, name: str, enabled: bool, agent_id=None) -> str:
         if not name:
             return _t(
                 f"请指定技能名称: /skill {'enable' if enabled else 'disable'} <名称>",
@@ -1322,7 +1501,7 @@ class CowCliPlugin(Plugin):
         import json
         from cli.utils import get_skills_dir
 
-        skills_dir = get_skills_dir()
+        skills_dir = get_skills_dir(agent_id)
         config_path = os.path.join(skills_dir, "skills_config.json")
 
         if not os.path.exists(config_path):
@@ -1338,8 +1517,7 @@ class CowCliPlugin(Plugin):
             return _t(f"技能 '{name}' 未在配置中找到", f"Skill '{name}' not found in config")
 
         config[name]["enabled"] = enabled
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
+        write_json_atomic(config_path, config)
 
         icon = "✅" if enabled else "⬚"
         if enabled:
@@ -1482,7 +1660,7 @@ class CowCliPlugin(Plugin):
 
     def _memory_status(self) -> str:
         """Show current memory index status."""
-        from agent.memory.embedding import detect_index_dim
+        from agent.memory.embedding import detect_index_dim, detect_chunker_version
         from config import conf
 
         agent = self._get_agent("")
@@ -1532,6 +1710,18 @@ class CowCliPlugin(Plugin):
                 warnings.append(_t(
                     f"  ⚠️ 索引中存量向量为 {index_dim} 维，与当前配置 {cfg_dim} 维不一致；运行 /memory rebuild-index 重建后向量检索才会生效",
                     f"  ⚠️ Existing vectors are {index_dim}-dim, mismatching the current {cfg_dim}-dim config; run /memory rebuild-index to make vector search work",
+                ))
+
+            # Index predates (or doesn't match) the current chunker. Chunked
+            # files only re-split when their content hash changes, so a chunker
+            # upgrade alone never refreshes old boundaries — suggest a rebuild.
+            # This is only a hint: rebuild re-embeds everything and is costly,
+            # so the user decides.
+            from agent.memory.chunker import TextChunker
+            if detect_chunker_version(memory_manager.storage) != TextChunker.CHUNKER_VERSION:
+                warnings.append(_t(
+                    "  ⚠️ 索引由旧版切分算法生成；建议运行 /memory rebuild-index 重建以与当前算法保持一致（重建成本较高，由你决定）",
+                    "  ⚠️ Index was built by an older chunking strategy; consider running /memory rebuild-index to bring it in line with the current one (a rebuild re-embeds everything, so it's your call)",
                 ))
 
         if warnings:
@@ -1726,8 +1916,6 @@ class CowCliPlugin(Plugin):
     @staticmethod
     def _create_standalone_flush_manager():
         """Create a MemoryFlushManager without a running agent (for pre-init dream)."""
-        from pathlib import Path
-        from config import conf
         from common.state_dir import state_root
         from agent.memory.summarizer import MemoryFlushManager
         from bridge.bridge import Bridge
@@ -1763,11 +1951,10 @@ class CowCliPlugin(Plugin):
         from config import get_data_root
         config_path = os.path.join(get_data_root(), "config.json")
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
                 file_config = _json.load(f)
             file_config["knowledge"] = enabled
-            with open(config_path, "w", encoding="utf-8") as f:
-                _json.dump(file_config, f, indent=4, ensure_ascii=False)
+            write_json_atomic(config_path, file_config)
         except Exception as e:
             return _t(f"⚠️ 内存中已切换，但写入 config.json 失败: {e}", f"⚠️ Switched in memory, but failed to write config.json: {e}")
 

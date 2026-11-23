@@ -42,7 +42,13 @@ export function usePushPoll(ready: boolean): void {
         if (cancelled) return
         if (data.status === 'success' && data.has_content && data.content) {
           const added = useChatStore.getState().receivePush(sid, data.content, data.request_id)
-          if (added) notify(sid, data.content)
+          // Scheduler executions (request_id "scheduler_<task>_<hash>") are
+          // notified by useSchedulerNotifyPoll instead — it forces a notice
+          // across ALL sessions (and manual "run now") and dedupes by run. Only
+          // notify here for ordinary proactive pushes, so a scheduled task the
+          // user happens to be viewing isn't announced twice.
+          const isScheduler = (data.request_id || '').startsWith('scheduler_')
+          if (added && !isScheduler) notify(sid, data.content)
           schedule(DELAY_HIT_MS)
           return
         }

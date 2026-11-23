@@ -73,6 +73,11 @@ class DashscopeBot(Bot):
         """Check if the model requires MultiModalConversation API"""
         return model_name.startswith(MULTIMODAL_MODEL_PREFIXES)
 
+    @classmethod
+    def model_supports_vision(cls, model_name: str) -> bool:
+        """Images only reach the model through the MultiModalConversation path."""
+        return cls._is_multimodal_model((model_name or "").lower())
+
     def reply(self, query, context=None):
         # acquire reply content
         if context.type == ContextType.TEXT:
@@ -288,23 +293,27 @@ class DashscopeBot(Bot):
             
             # Add thinking parameters for DashScope thinking-capable models.
             model_lower = model_name.lower()
-            # qwen3.8-max (and its -preview snapshot) always think and are
-            # controlled via reasoning_effort (default xhigh), not enable_thinking
-            # on/off. Treat the whole qwen3.8-max family the same way.
-            is_qwen38_effort_model = model_lower.startswith("qwen3.8-max")
+            # qwen3.8-max / qwen3.8-flash (and their -preview snapshots) are
+            # HYBRID thinking models: thinking is on by default but can be
+            # turned off via enable_thinking=false. When thinking is on they
+            # take reasoning_effort (default xhigh) instead of thinking_budget.
+            is_qwen38_effort_model = model_lower.startswith("qwen3.8-")
             supports_thinking = (
                 "qwen3" in model_lower
                 or "qwq" in model_lower
                 or model_lower.startswith(("glm-", "deepseek-v4-", "kimi/kimi-k3"))
             )
             if supports_thinking:
-                if is_qwen38_effort_model:
-                    # qwen3.8 effort models require enable_thinking=True but
-                    # should not expose raw thinking text in the response.
-                    parameters["preserve_thinking"] = False
+                # Honor the caller's thinking toggle. qwen3.8 is hybrid, so a
+                # disabled toggle must actually disable thinking (this is what
+                # lets a user avoid the long xhigh reasoning pass).
                 thinking = kwargs.get("thinking", {"type": "enabled"})
-                if thinking.get("type") == "enabled" or is_qwen38_effort_model:
+                if thinking.get("type") == "enabled":
                     parameters["enable_thinking"] = True
+                    if is_qwen38_effort_model:
+                        # Effort models keep the raw thinking text out of the
+                        # stored response but still stream reasoning_content.
+                        parameters["preserve_thinking"] = False
                     reasoning_effort = kwargs.get("reasoning_effort")
                     if reasoning_effort:
                         parameters["reasoning_effort"] = reasoning_effort
@@ -502,6 +511,17 @@ class DashscopeBot(Bot):
                 if tool_calls:
                     openai_chunk["choices"][0]["delta"]["tool_calls"] = self._convert_tool_calls_to_openai_format(tool_calls)
 
+                # Attach token usage (DashScope reports it, cumulative, per
+                # chunk) mapped to the OpenAI shape so the agent can show a real
+                # prompt_tokens count for the context indicator.
+                usage = resp_dict.get("usage")
+                if isinstance(usage, dict):
+                    openai_chunk["usage"] = {
+                        "prompt_tokens": usage.get("input_tokens", 0),
+                        "completion_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
+
                 yield openai_chunk
 
         except Exception as e:
@@ -646,6 +666,7 @@ class DashscopeBot(Bot):
                 # Check if this is a tool result message (user role with tool_result blocks)
                 if role == "user" and any(block.get("type") == "tool_result" for block in content):
                     # Convert each tool_result block to a separate tool message
+                    text_parts = []
                     for block in content:
                         if block.get("type") == "tool_result":
                             dashscope_messages.append({
@@ -653,6 +674,12 @@ class DashscopeBot(Bot):
                                 "content": block.get("content", ""),
                                 "tool_call_id": block.get("tool_use_id")  # DashScope uses 'tool_call_id'
                             })
+                        elif block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                    # Text next to tool results (e.g. a steering message sent
+                    # while tools ran) follows them as a user message.
+                    if text_parts:
+                        dashscope_messages.append({"role": "user", "content": "\n".join(text_parts)})
                 
                 # Check if this is an assistant message with tool_use blocks
                 elif role == "assistant":
@@ -692,8 +719,13 @@ class DashscopeBot(Bot):
                     
                     dashscope_messages.append(dashscope_msg)
                 else:
-                    # Other list content, keep as is
-                    dashscope_messages.append(msg)
+                    # Other list content, keep as is; OpenAI image blocks become
+                    # the {"image": url} parts MultiModalConversation expects.
+                    dashscope_messages.append({**msg, "content": [
+                        {"image": (block.get("image_url") or {}).get("url", "")}
+                        if isinstance(block, dict) and block.get("type") == "image_url" else block
+                        for block in content
+                    ]})
             else:
                 # Other formats, keep as is
                 dashscope_messages.append(msg)

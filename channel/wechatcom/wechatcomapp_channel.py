@@ -1,12 +1,11 @@
 # -*- coding=utf-8 -*-
 import io
 import os
-import sys
 import time
+from urllib.parse import urlparse
 
-import requests
 import web
-from wechatpy.enterprise import create_reply, parse_message
+from wechatpy.enterprise import parse_message
 from wechatpy.enterprise.crypto import WeChatCrypto
 from wechatpy.enterprise.exceptions import InvalidCorpIdException
 from wechatpy.exceptions import InvalidSignatureException, WeChatClientException
@@ -16,13 +15,21 @@ from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel
 from channel.wechatcom.wechatcomapp_client import WechatComAppClient
 from channel.wechatcom.wechatcomapp_message import WechatComAppMessage
+from common.i18n import t as _t
 from common.log import logger
+from common.media_download import MAX_FILE_BYTES, MAX_IMAGE_BYTES, download_bytes, download_to_file, remove_download
 from common.singleton import singleton
+from common import state_dir
 from common.utils import compress_imgfile, fsize, split_string_by_utf8_length, convert_webp_to_png, remove_markdown_symbol
-from config import conf, subscribe_msg
+from config import conf
 from voice.audio_convert import any_to_amr, split_audio
 
 MAX_UTF8_LEN = 2048
+
+# Total wall-clock budgets for remote downloads; the socket timeout alone does
+# not stop a server that keeps trickling bytes.
+_MAX_REMOTE_IMAGE_SECONDS = 60
+_MAX_REMOTE_FILE_SECONDS = 300
 
 
 @singleton
@@ -89,6 +96,12 @@ class WechatComAppChannel(ChatChannel):
             except Exception as e:
                 logger.warning(f"[wechatcom] Error stopping HTTP server: {e}")
             self._http_server = None
+        # The client owns a token-refresh thread; a channel that is replaced by
+        # a restart must not leave it polling for a client nobody uses.
+        try:
+            self.client.close()
+        except Exception as e:
+            logger.warning(f"[wechatcom] Error stopping the token refresher: {e}")
 
     def send(self, reply: Reply, context: Context):
         receiver = context["receiver"]
@@ -103,16 +116,20 @@ class WechatComAppChannel(ChatChannel):
                     time.sleep(0.5)  # 休眠0.5秒，防止发送过快乱序
             logger.info("[wechatcom] Do send text to {}: {}".format(receiver, reply_text))
         elif reply.type == ReplyType.VOICE:
+            owned = []
             try:
                 media_ids = []
                 file_path = reply.content
                 amr_file = os.path.splitext(file_path)[0] + ".amr"
+                owned += [file_path, amr_file]
                 any_to_amr(file_path, amr_file)
                 duration, files = split_audio(amr_file, 60 * 1000)
                 if len(files) > 1:
                     logger.info("[wechatcom] voice too long {}s > 60s , split into {} parts".format(duration / 1000.0, len(files)))
+                owned += files
                 for path in files:
-                    response = self.client.media.upload("voice", open(path, "rb"))
+                    with open(path, "rb") as f:
+                        response = self.client.media.upload("voice", f)
                     logger.debug("[wechatcom] upload voice response: {}".format(response))
                     media_ids.append(response["media_id"])
             except ImportError as e:
@@ -122,22 +139,34 @@ class WechatComAppChannel(ChatChannel):
             except WeChatClientException as e:
                 logger.error("[wechatcom] upload voice failed: {}".format(e))
                 return
-            try:
-                os.remove(file_path)
-                if amr_file != file_path:
-                    os.remove(amr_file)
-            except Exception:
-                pass
+            finally:
+                for path in owned:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
             for media_id in media_ids:
                 self.client.message.send_voice(self.agent_id, receiver, media_id)
                 time.sleep(1)
             logger.info("[wechatcom] sendVoice={}, receiver={}".format(reply.content, receiver))
-        elif reply.type == ReplyType.IMAGE_URL:  # 从网络下载图片
+        elif reply.type == ReplyType.IMAGE_URL:  # 本地文件或从网络下载图片
             img_url = reply.content
-            pic_res = requests.get(img_url, stream=True)
-            image_storage = io.BytesIO()
-            for block in pic_res.iter_content(1024):
-                image_storage.write(block)
+            local_path = img_url[7:] if img_url.startswith("file://") else img_url
+            if os.path.isfile(local_path):
+                # An image the agent generated itself arrives as a local path, so
+                # reading it is the only way it can ever reach the user; the file
+                # branch below already resolves "file://" this way.
+                with open(local_path, "rb") as image_file:
+                    image_storage = io.BytesIO(image_file.read())
+            else:
+                try:
+                    image_storage = io.BytesIO(download_bytes(
+                        img_url, MAX_IMAGE_BYTES, timeout=60, max_seconds=_MAX_REMOTE_IMAGE_SECONDS,
+                    ))
+                except Exception as e:
+                    # The exception text can carry the full (possibly signed) URL.
+                    logger.error(f"[wechatcom] image download failed: {type(e).__name__}")
+                    return
             sz = fsize(image_storage)
             if sz >= 10 * 1024 * 1024:
                 logger.info("[wechatcom] image too large, ready to compress, sz={}".format(sz))
@@ -175,6 +204,71 @@ class WechatComAppChannel(ChatChannel):
                 return
             self.client.message.send_image(self.agent_id, receiver, response["media_id"])
             logger.info("[wechatcom] sendImage, receiver={}".format(receiver))
+        elif reply.type in (ReplyType.FILE, ReplyType.VIDEO, ReplyType.VIDEO_URL):
+            # A file reply keeps the agent's prose beside the attachment, and
+            # nothing else sends it for us: the shared text-before-file handling
+            # in ChatChannel only covers IMAGE_URL.
+            if getattr(reply, "text_content", None):
+                self.client.message.send_text(self.agent_id, receiver, reply.text_content)
+            self._send_file(reply, receiver)
+        else:
+            logger.warning("[wechatcom] unsupported reply type: {}, fallback to text".format(reply.type))
+            self.client.message.send_text(self.agent_id, receiver, str(reply.content))
+
+    def _resolve_media_path(self, path_or_url: str):
+        """Resolve a ``file://`` path, URL or plain path to a local file.
+
+        Returns ``(path, downloaded)``; ``downloaded`` is set only for a fetched
+        temp file the caller must remove. Both are empty when unresolvable.
+        """
+        path = (path_or_url or "").strip()
+        downloaded = ""
+        if path.startswith("file://"):
+            path = path[7:]
+        if path.startswith(("http://", "https://")):
+            try:
+                ext = os.path.splitext(urlparse(path).path)[1] or ".bin"
+                local = state_dir.tmp_file("wechatcom_file", ext)
+                download_to_file(path, local, MAX_FILE_BYTES, timeout=60, max_seconds=_MAX_REMOTE_FILE_SECONDS)
+                path = local
+                downloaded = local
+            except Exception as e:
+                logger.error("[wechatcom] failed to fetch remote file: {}".format(type(e).__name__))
+                return "", ""
+        if not os.path.exists(path):
+            logger.error("[wechatcom] file not found: {}".format(path))
+            return "", ""
+        return path, downloaded
+
+    def _send_file(self, reply: Reply, receiver: str):
+        """Upload a file or video reply and hand WeCom the media id."""
+        path, downloaded = self._resolve_media_path(reply.content)
+        if not path:
+            self.client.message.send_text(
+                self.agent_id, receiver,
+                _t("[文件发送失败：找不到文件]", "[File send failed: file not found]"))
+            return
+        is_video = (reply.type in (ReplyType.VIDEO, ReplyType.VIDEO_URL)
+                    or getattr(reply, "file_type", "") == "video")
+        media_type = "video" if is_video else "file"
+        # The bridge stamps the document's real name on the reply; a cloud
+        # URL's last segment is a random hash and would rename the user's file.
+        name = getattr(reply, "file_name", "") or os.path.basename(path)
+        # Nothing sweeps the managed tmp dir, so a download is removed here.
+        try:
+            try:
+                with open(path, "rb") as f:
+                    response = self.client.media.upload(media_type, (name, f.read()))
+            except WeChatClientException as e:
+                logger.error("[wechatcom] upload {} failed: {}".format(media_type, e))
+                return
+            if is_video:
+                self.client.message.send_video(self.agent_id, receiver, response["media_id"])
+            else:
+                self.client.message.send_file(self.agent_id, receiver, response["media_id"])
+            logger.info("[wechatcom] send{}={}, receiver={}".format(media_type.capitalize(), path, receiver))
+        finally:
+            remove_download(downloaded)
 
 
 class Query:
@@ -188,7 +282,7 @@ class Query:
             nonce = params.nonce
             echostr = params.echostr
             echostr = channel.crypto.check_signature(signature, timestamp, nonce, echostr)
-        except InvalidSignatureException:
+        except (InvalidSignatureException, InvalidCorpIdException):
             raise web.Forbidden()
         return echostr
 

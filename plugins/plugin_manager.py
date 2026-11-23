@@ -6,27 +6,32 @@ import json
 import os
 import sys
 
+from common.atomic_write import write_json_atomic
 from common.log import logger
 from common.singleton import singleton
 from common.sorted_dict import SortedDict
-from config import conf, remove_plugin_config, write_plugin_config, get_data_root, get_resource_root
+from config import write_plugin_config, get_data_root, get_resource_root
 
 from .event import *
+from common.deployment import is_desktop, is_mobile
 
 
 def _plugins_resource_dir():
     """Read-only plugins source dir. In a frozen bundle it lives under the
-    resource root (sys._MEIPASS); from source it's the CWD-relative ./plugins."""
+    resource root (sys._MEIPASS); a mobile app keeps its kernel sources apart
+    from the working directory; from source it's the CWD-relative ./plugins."""
     if getattr(sys, "frozen", False):
         return os.path.join(get_resource_root(), "plugins")
+    if is_mobile():
+        return os.path.dirname(os.path.abspath(__file__))
     return "./plugins"
 
 
 def _plugins_data_dir():
     """Writable dir for plugin runtime config (plugins.json). In a frozen
-    bundle the resource dir is read-only, so redirect writes to the data root
-    (~/.cow); from source it stays the CWD-relative ./plugins."""
-    if getattr(sys, "frozen", False):
+    bundle or a mobile app the resource dir is read-only, so redirect writes to
+    the data root (~/.cow); from source it stays the CWD-relative ./plugins."""
+    if getattr(sys, "frozen", False) or is_mobile():
         d = os.path.join(get_data_root(), "plugins")
         os.makedirs(d, exist_ok=True)
         return d
@@ -57,35 +62,101 @@ class PluginManager:
             # 首次启动写入 plugins.json 时即为关闭状态，避免拦截用户消息。
             plugincls.enabled = kwargs.get("enabled", True)
             if self.current_plugin_path == None:
-                raise Exception("Plugin path not set")
+                raise RuntimeError("Plugin path not set")
             self.plugins[name.upper()] = plugincls
             logger.debug("Plugin %s_v%s registered, path=%s" % (name, plugincls.version, plugincls.path))
 
         return wrapper
 
     def save_config(self):
-        cfg_path = os.path.join(_plugins_data_dir(), "plugins.json")
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            json.dump(self.pconf, f, indent=4, ensure_ascii=False)
+        """Persist plugins.json through a sibling file, then swap it in.
+
+        Writing straight into plugins.json truncates it before the new bytes are
+        there, so anything that fails while serialising -- a full disk, an
+        interrupted update -- leaves a half-written store behind. The next start
+        then reads it with json.load, which cannot parse a truncated document,
+        and load_config has no guard around that. See load_config for why a
+        damaged store must not be allowed to abort the load.
+        """
+        write_json_atomic(os.path.join(_plugins_data_dir(), "plugins.json"), self.pconf)
+
+    @staticmethod
+    def _read_plugin_store(path: str):
+        """Return the plugin config stored at ``path``, or None if unusable.
+
+        Both "not there" and "there but damaged" answer None, so the caller can
+        move on to the next copy instead of aborting. json.load is the single
+        step that turns a half-written file into a crash, and the shape check
+        below keeps a file that parsed but lost its "plugins" mapping from
+        raising KeyError one line later.
+        """
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning("Unreadable plugin config %s, ignoring it: %s" % (path, e))
+            return None
+        if not isinstance(stored, dict) or not isinstance(stored.get("plugins"), dict):
+            logger.warning("Plugin config %s has no \"plugins\" mapping, ignoring it" % path)
+            return None
+        entries = stored["plugins"]
+        for name in list(entries):
+            entry = entries[name]
+            if not isinstance(entry, dict):
+                logger.warning("Plugin entry %s in %s is not an object, ignoring it" % (name, path))
+                del entries[name]
+                continue
+            # Both keys are read with a bare subscript from here on -- the sort
+            # below and scan_plugins -- so a hand-edited entry that lost one of
+            # them takes every plugin down with it. Fall back to the values the
+            # plugin's own registration uses (register/desire_priority).
+            priority = entry.get("priority")
+            if isinstance(priority, bool) or not isinstance(priority, (int, float)):
+                logger.warning("Plugin entry %s in %s has no numeric priority, using 0" % (name, path))
+                entry["priority"] = 0
+            if not isinstance(entry.get("enabled"), bool):
+                logger.warning("Plugin entry %s in %s has no enabled flag, using true" % (name, path))
+                entry["enabled"] = True
+        return stored
 
     def load_config(self):
         logger.debug("Loading plugins config...")
 
-        modified = False
         # Prefer the writable copy (data dir); fall back to the one shipped in
         # the resource dir (first run in a frozen bundle, before any save).
         data_cfg = os.path.join(_plugins_data_dir(), "plugins.json")
         res_cfg = os.path.join(_plugins_resource_dir(), "plugins.json")
         cfg_path = data_cfg if os.path.exists(data_cfg) else res_cfg
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                pconf = json.load(f)
-                pconf["plugins"] = SortedDict(lambda k, v: v["priority"], pconf["plugins"], reverse=True)
-        else:
-            modified = True
+
+        # A copy that exists but cannot be parsed is exactly the case this
+        # fallback is for -- a truncated write, an update interrupted partway --
+        # yet an os.path.exists check cannot tell it apart from a healthy file,
+        # so a damaged store used to abort the load instead of falling through.
+        # app.py loads plugins on first start and the desktop client does it on
+        # a daemon thread, so the raise became either a failed start or a
+        # silently dead plugin system with nothing in the log.
+        stored = None
+        source = None
+        for candidate in dict.fromkeys((cfg_path, res_cfg)):
+            stored = self._read_plugin_store(candidate)
+            if stored is not None:
+                source = candidate
+                break
+
+        if stored is None:
+            # Neither copy is usable: a first run, or a file that never made it
+            # to disk. Start from an empty store and write it out below.
             pconf = {"plugins": SortedDict(lambda k, v: v["priority"], reverse=True)}
+        else:
+            stored["plugins"] = SortedDict(lambda k, v: v["priority"], stored["plugins"], reverse=True)
+            pconf = stored
         self.pconf = pconf
-        if modified:
+        # The writable copy is the one that has to end up right: if we only got
+        # here through the shipped default (or through nothing at all), write a
+        # usable file back so the next start does not have to fall back again.
+        if source != data_cfg:
             self.save_config()
         return pconf
 
@@ -114,7 +185,7 @@ class PluginManager:
     def scan_plugins(self):
         logger.debug("Scanning plugins ...")
         plugins_dir = _plugins_resource_dir()
-        raws = [self.plugins[name] for name in self.plugins]
+        raws = {name: self.plugins[name] for name in self.plugins}
         for plugin_name in os.listdir(plugins_dir):
             plugin_path = os.path.join(plugins_dir, plugin_name)
             if os.path.isdir(plugin_path):
@@ -140,8 +211,9 @@ class PluginManager:
                         logger.warn("Failed to import plugin %s: %s" % (plugin_name, e))
                         continue
         pconf = self.pconf
-        news = [self.plugins[name] for name in self.plugins]
-        new_plugins = list(set(news) - set(raws))
+        # Compare by registry key: a reload registers a new class object.
+        new_plugins = [self.plugins[name] for name in self.plugins
+                       if name not in raws]
         modified = False
         for name, plugincls in self.plugins.items():
             rawname = plugincls.name
@@ -184,13 +256,15 @@ class PluginManager:
                 for event in instance.handlers:
                     if event not in self.listening_plugins:
                         self.listening_plugins[event] = []
-                    self.listening_plugins[event].append(name)
+                    if name not in self.listening_plugins[event]:
+                        self.listening_plugins[event].append(name)
         self.refresh_order()
         return failed_plugins
 
     def reload_plugin(self, name: str):
         name = name.upper()
-        remove_plugin_config(name)
+        # Keep the loaded config: a plugin only falls back to its own config.json,
+        # so settings from plugins/config.json would be lost. #reconf reloads config.
         if name in self.instances:
             for event in self.listening_plugins:
                 if name in self.listening_plugins[event]:
@@ -215,7 +289,7 @@ class PluginManager:
         plugins.json (bundle default or user copy) says. Runs after scan (which
         syncs enabled from plugins.json) and before activate, so denied plugins
         are never instantiated and never write into the read-only bundle."""
-        if os.environ.get("COW_DESKTOP") != "1":
+        if not is_desktop():
             return
         for name in list(self.plugins.keys()):
             if name.upper() in self.DESKTOP_DISABLED_PLUGINS and self.plugins[name].enabled:
@@ -322,12 +396,19 @@ class PluginManager:
             except Exception as e:
                 logger.error("Failed to install plugin, {}".format(e))
                 return False, "安装插件失败，请检查仓库地址是否正确"
-        dirname = os.path.join("./plugins", match.group(4))
+        # Only the last path segment names the clone directory, so subgroup
+        # URLs still work and nothing can point it outside ./plugins.
+        repo_name = match.group(4).rsplit("/", 1)[-1]
+        if repo_name in (".", "..") or not re.match(r"^[A-Za-z0-9_.-]+$", repo_name):
+            return False, "安装插件失败，仓库地址不合法"
+        dirname = os.path.join("./plugins", repo_name)
         try:
             repo = porcelain.clone(repo, dirname, checkout=True)
-            if os.path.exists(os.path.join(dirname, "requirements.txt")):
+            requirements_path = os.path.join(dirname, "requirements.txt")
+            if os.path.exists(requirements_path):
                 logger.info("detect requirements.txt，installing...")
-            pkgmgr.install_requirements(os.path.join(dirname, "requirements.txt"))
+                if pkgmgr.install_requirements(requirements_path):
+                    return False, "安装插件失败，依赖安装失败，请手动执行 pip install -r " + requirements_path
             return True, "安装插件成功，请使用 #scanp 命令扫描插件或重启程序，开启前请检查插件是否需要配置"
         except Exception as e:
             logger.error("Failed to install plugin, {}".format(e))
@@ -360,9 +441,11 @@ class PluginManager:
         dirname = self.plugins[name].path
         try:
             porcelain.pull(dirname, "origin")
-            if os.path.exists(os.path.join(dirname, "requirements.txt")):
+            requirements_path = os.path.join(dirname, "requirements.txt")
+            if os.path.exists(requirements_path):
                 logger.info("detect requirements.txt，installing...")
-            pkgmgr.install_requirements(os.path.join(dirname, "requirements.txt"))
+                if pkgmgr.install_requirements(requirements_path):
+                    return False, "更新插件失败，依赖安装失败，请手动执行 pip install -r " + requirements_path
             return True, "更新插件成功，请重新运行程序"
         except Exception as e:
             logger.error("Failed to update plugin, {}".format(e))

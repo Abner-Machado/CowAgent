@@ -9,8 +9,9 @@ import re
 from wechatpy.enterprise import WeChatClient
 
 from bridge.context import ContextType
-from channel.chat_message import ChatMessage
+from channel.chat_message import ChatMessage, safe_filename
 from common.log import logger
+from common.media_download import MAX_FILE_BYTES, MAX_IMAGE_BYTES, save_response
 from common import state_dir
 
 
@@ -79,8 +80,10 @@ class WechatKfMessage(ChatMessage):
             def download_image():
                 response = client.media.download(media_id)
                 if response.status_code == 200:
-                    with open(self.content, "wb") as f:
-                        f.write(response.content)
+                    try:
+                        save_response(response, self.content, MAX_IMAGE_BYTES)
+                    except Exception as e:
+                        logger.error(f"[wechat_kf] Failed to download image: {e}")
                 else:
                     logger.info(f"[wechat_kf] Failed to download image, {response.content}")
 
@@ -94,8 +97,10 @@ class WechatKfMessage(ChatMessage):
             def download_voice():
                 response = client.media.download(media_id)
                 if response.status_code == 200:
-                    with open(self.content, "wb") as f:
-                        f.write(response.content)
+                    try:
+                        save_response(response, self.content, MAX_FILE_BYTES)
+                    except Exception as e:
+                        logger.error(f"[wechat_kf] Failed to download voice: {e}")
                 else:
                     logger.info(f"[wechat_kf] Failed to download voice, {response.content}")
 
@@ -110,13 +115,24 @@ class WechatKfMessage(ChatMessage):
             def download_file():
                 response = client.media.download(media_id)
                 if response.status_code == 200:
-                    filename = _extract_filename(
-                        response.headers.get("Content-Disposition", "")
+                    # The name comes back from the server for the sender's own
+                    # upload, so it can carry a separator ("sub/x.pdf",
+                    # "../../x.txt") and stop being one path component; reduce
+                    # it first, like weixin, slack, discord, qq and dingtalk do.
+                    filename = safe_filename(
+                        _extract_filename(response.headers.get("Content-Disposition", ""))
                     ) or media_id
-                    self.content = os.path.join(_get_tmp_dir(), filename)
-                    with open(self.content, "wb") as f:
-                        f.write(response.content)
+                    save_path = os.path.join(_get_tmp_dir(), filename)
+                    try:
+                        save_response(response, save_path, MAX_FILE_BYTES)
+                    except Exception as e:
+                        # Leave content empty; the caller caches it as a readable file reference.
+                        self.content = ""
+                        logger.error(f"[wechat_kf] Failed to download file: {e}")
+                    else:
+                        self.content = save_path
                 else:
+                    self.content = ""
                     logger.info(f"[wechat_kf] Failed to download file, {response.content}")
 
             self._prepare_fn = download_file

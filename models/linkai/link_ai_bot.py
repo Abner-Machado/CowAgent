@@ -15,9 +15,16 @@ from bridge.reply import Reply, ReplyType
 from common.log import logger
 from config import conf, pconf
 import threading
-from common import memory, utils
+from common import memory, state_dir, utils
+from common.media_download import MAX_FILE_BYTES, download_to_file
 import base64
 import os
+from urllib.parse import urlparse
+
+# An overloaded endpoint can hold the stream open with only ": keep-alive"
+# comments. Each one resets the socket read timeout, so without this cap a
+# queued request can hang for many minutes.
+STREAM_KEEPALIVE_MAX_SECONDS = 180
 
 
 def _linkai_base_url():
@@ -57,10 +64,36 @@ def _explain_linkai_error(status_code, error_msg):
     return error_msg
 
 
+def _linkai_error_body(res) -> tuple:
+    """Return ``(message, kind)`` from a rejected response in any shape.
+
+    Handles ``{"code", "message"}``, ``{"detail"}``, the OpenAI ``{"error": {...}}``
+    shape and non-JSON bodies; ``kind`` is "" when the body has none.
+    """
+    text = getattr(res, "text", "") or ""
+    try:
+        data = res.json()
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or text or "Unknown error"
+            return str(message), str(error.get("type") or "")
+        if isinstance(error, str) and error:
+            return error, ""
+        for key in ("message", "detail", "msg"):
+            if data.get(key):
+                return str(data[key]), str(data.get("type") or data.get("code") or "")
+    return (text or "Unknown error"), ""
+
+
 class LinkAIBot(Bot, OpenAICompatibleBot):
     # authentication failed
     AUTH_FAILED_CODE = 401
     NO_QUOTA_CODE = 406
+    # call_with_tools takes the calling agent's id, sent only alongside client_id.
+    accepts_agent_id = True
 
     def __init__(self):
         super().__init__()
@@ -165,7 +198,7 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                             else:
                                 body["sender_name"] = context.kwargs.get("msg").from_user_nickname
 
-            except Exception as e:
+            except Exception:
                 pass
             file_id = context.kwargs.get("file_id")
             if file_id:
@@ -206,10 +239,9 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 return Reply(ReplyType.TEXT, reply_content)
 
             else:
-                response = res.json()
-                error = response.get("error")
+                error_msg, error_kind = _linkai_error_body(res)
                 logger.error(f"[LINKAI] chat failed, status_code={res.status_code}, "
-                             f"msg={error.get('message')}, type={error.get('type')}")
+                             f"msg={error_msg}, type={error_kind}")
 
                 if res.status_code >= 500:
                     # server error, need retry
@@ -335,10 +367,9 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 }
 
             else:
-                response = res.json()
-                error = response.get("error")
+                error_msg, error_kind = _linkai_error_body(res)
                 logger.error(f"[LINKAI] chat failed, status_code={res.status_code}, "
-                             f"msg={error.get('message')}, type={error.get('type')}")
+                             f"msg={error_msg}, type={error_kind}")
 
                 if res.status_code >= 500:
                     # server error, need retry
@@ -388,7 +419,6 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
             }
             url = _linkai_base_url() + "/v1/images/generations"
             res = requests.post(url, headers=headers, json=data, timeout=(5, 90))
-            t2 = time.time()
             image_url = res.json()["data"][0]["url"]
             logger.info("[OPEN_AI] image_url={}".format(image_url))
             return True, image_url
@@ -466,9 +496,10 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
                 if max_send_num and i >= max_send_num:
                     continue
                 i += 1
-                if url.endswith(".mp4"):
+                url_path = urlparse(url).path.lower()
+                if url_path.endswith(".mp4"):
                     reply_type = ReplyType.VIDEO_URL
-                elif url.endswith(file_type):
+                elif url_path.endswith(file_type):
                     reply_type = ReplyType.FILE
                     url = _download_file(url)
                     if not url:
@@ -485,15 +516,14 @@ class LinkAIBot(Bot, OpenAICompatibleBot):
 
 def _download_file(url: str):
     try:
-        file_path = "tmp"
-        if not os.path.exists(file_path):
-            os.makedirs(file_path)
-        file_name = url.split("/")[-1]  # 获取文件名
-        file_path = os.path.join(file_path, file_name)
-        response = requests.get(url)
-        with open(file_path, "wb") as f:
-            f.write(response.content)
-        return file_path
+        file_name = os.path.basename(urlparse(url).path) or "download"  # 获取文件名
+        # Save under the agent's managed tmp dir. A literal "tmp" resolves against
+        # the process CWD, which the packaged desktop app does not control and may
+        # not be able to write, and state_dir owns the layout anyway.
+        file_path = state_dir.tmp_dir() / file_name
+        # The remote side decides the size; stream under the shared cap.
+        download_to_file(url, str(file_path), MAX_FILE_BYTES, timeout=(5, 60))
+        return str(file_path)
     except Exception as e:
         logger.warn(e)
 
@@ -525,14 +555,76 @@ class LinkAISession(ChatGPTSession):
         return len(str(self.messages))
 
     def discard_exceeding(self, max_tokens, cur_tokens=None):
+        """Trim the history until it fits the configured context budget.
+
+        ``conversation_max_tokens`` caps how much history is carried into
+        the next request (1000 characters by default). The sibling sessions
+        loop until the history fits and drop the oldest message first, so
+        the recent turns survive.
+
+        This override used to remove a single (user, assistant) pair and
+        return, so the history stayed permanently over the budget -- about
+        twenty times it after a handful of turns -- and every request
+        carried that stale context to the API. It also never trimmed at all
+        when the history had no adjacent user/assistant pair.
+        """
         cur_tokens = self.calc_tokens()
-        if cur_tokens > max_tokens:
-            for i in range(0, len(self.messages)):
-                if i > 0 and self.messages[i].get("role") == "assistant" and self.messages[i - 1].get("role") == "user":
-                    self.messages.pop(i)
-                    self.messages.pop(i - 1)
-                    return self.calc_tokens()
+        while cur_tokens > max_tokens:
+            # Index 0 is the system prompt; it always stays.
+            if len(self.messages) <= 1:
+                break
+            if not self._drop_oldest_turn():
+                break
+            cur_tokens = self.calc_tokens()
         return cur_tokens
+
+    def _drop_oldest_turn(self) -> bool:
+        """Drop the oldest turn from the history.
+
+        A turn is a question together with its answer, so the history never
+        keeps half a turn. Returns False when nothing may be dropped any
+        more: the current turn alone is larger than the whole budget and has
+        to be kept so the turn can still be answered.
+        """
+        for index in range(1, len(self.messages)):
+            if self.messages[index].get("role") != "user":
+                continue
+            if index + 1 < len(self.messages) and \
+                    self.messages[index + 1].get("role") == "assistant":
+                if self._is_last_turn(index):
+                    # The current turn alone exceeds the budget. Keep it,
+                    # like the other sessions keep the current question,
+                    # and stop trimming.
+                    logger.warning(
+                        "user message exceed max_tokens. total_tokens={}".format(
+                            self.calc_tokens())
+                    )
+                    return False
+                # Drop the whole turn: the question and its answer.
+                self.messages.pop(index + 1)
+                self.messages.pop(index)
+                return True
+            if len(self.messages) == 2:
+                # The current question alone exceeds the budget. Keep it,
+                # like the other sessions do, and stop trimming.
+                logger.warning(
+                    "user message exceed max_tokens. total_tokens={}".format(
+                        self.calc_tokens())
+                )
+                return False
+            # A question without an answer after it: drop it on its own.
+            self.messages.pop(index)
+            return True
+        # No user turn left: drop the oldest remaining message.
+        self.messages.pop(1)
+        return True
+
+    def _is_last_turn(self, index: int) -> bool:
+        """True when the question at `index` is the last turn of the history."""
+        for later in range(index + 1, len(self.messages)):
+            if self.messages[later].get("role") == "user":
+                return False
+        return True
 
 
 # Add call_with_tools method to LinkAIBot class
@@ -594,11 +686,18 @@ def _linkai_call_with_tools(self, messages, tools=None, stream=False, **kwargs):
             "sender_id": session_id,
         }
 
+        if stream:
+            # LinkAI only appends the trailing usage chunk when this is set
+            body["stream_options"] = {"include_usage": True}
+
         try:
             from linkai import LinkAIClient
             client_id = LinkAIClient.fetch_client_id()
             if client_id:
                 body["client_id"] = client_id
+                # Several agents can share one client; this names the one calling.
+                if kwargs.get("agent_id"):
+                    body["agent_id"] = kwargs["agent_id"]
         except Exception:
             pass
 
@@ -636,12 +735,13 @@ def _linkai_call_with_tools(self, messages, tools=None, stream=False, **kwargs):
             return self._handle_linkai_sync_response(base_url, headers, body)
             
     except Exception as e:
+        error_msg = str(e)
         logger.error(f"[LinkAI] call_with_tools error: {e}")
         if stream:
             def error_generator():
                 yield {
                     "error": True,
-                    "message": str(e),
+                    "message": error_msg,
                     "status_code": 500
                 }
             return error_generator()
@@ -670,11 +770,7 @@ def _handle_linkai_sync_response(self, base_url, headers, body):
             # LinkAI response is already in OpenAI-compatible format
             return response
         else:
-            try:
-                error_data = res.json()
-                error_msg = error_data.get("error", {}).get("message", res.text)
-            except Exception:
-                error_msg = res.text or "Unknown error"
+            error_msg, _kind = _linkai_error_body(res)
             error_msg = _explain_linkai_error(res.status_code, error_msg)
             raise Exception(f"LinkAI API error: {res.status_code} - {error_msg}")
             
@@ -685,6 +781,7 @@ def _handle_linkai_sync_response(self, base_url, headers, body):
 def _handle_linkai_stream_response(self, base_url, headers, body):
     """Handle streaming LinkAI API response"""
     try:
+        last_data_at = time.time()
         res = requests.post(
             url=base_url + "/v1/chat/completions",
             json=body,
@@ -713,6 +810,22 @@ def _handle_linkai_stream_response(self, base_url, headers, body):
         for line in res.iter_lines():
             if line:
                 line = line.decode('utf-8')
+                if line.startswith(":"):
+                    if time.time() - last_data_at > STREAM_KEEPALIVE_MAX_SECONDS:
+                        logger.error(
+                            f"[LinkAI] Stream timeout: only keep-alive received for "
+                            f"{STREAM_KEEPALIVE_MAX_SECONDS}s"
+                        )
+                        yield {
+                            "error": True,
+                            "message": f"Stream timeout: only keep-alive received for {STREAM_KEEPALIVE_MAX_SECONDS}s",
+                            "status_code": 504,
+                        }
+                        return
+                    # Empty chunk lets the caller check for cancel while the server is queueing
+                    yield {}
+                    continue
+                last_data_at = time.time()
                 if line.startswith('data: '):
                     line = line[6:]  # Remove 'data: ' prefix
                     if line == '[DONE]':

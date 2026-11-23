@@ -1,6 +1,6 @@
 ## 插件说明
 
-基于 LinkAI 提供的知识库、Midjourney绘画、文档对话等能力对机器人的功能进行增强。平台地址: https://link-ai.tech/console
+基于 LinkAI 提供的知识库、Midjourney绘画、文档对话等能力对机器人的功能进行增强。平台地址: [https://link-ai.tech/console](https://link-ai.tech/console?utm_source=cowagent&utm_medium=readme&utm_campaign=plugin-linkai)
 
 ## 插件配置
 
@@ -31,7 +31,7 @@
 }
 ```
 
-根目录 `config.json` 中配置，`API_KEY` 在 [控制台](https://link-ai.tech/console/interface) 中创建并复制过来:
+根目录 `config.json` 中配置，`API_KEY` 在 [控制台](https://link-ai.tech/console/interface?utm_source=cowagent&utm_medium=readme&utm_campaign=plugin-linkai) 中创建并复制过来:
 
 ```bash
 "linkai_api_key": "Link_xxxxxxxxx"
@@ -41,11 +41,11 @@
 
  - 配置项中 `group_app_map` 部分是用于映射群聊与LinkAI平台上的应用， `midjourney` 部分是 mj 画图的配置，`summary` 部分是文档总结及对话功能的配置。三部分的配置相互独立，可按需开启
  - 实际 `config.json` 配置中应保证json格式，不应携带 '#' 及后面的注释
- - 如果是`docker`部署，可通过映射 `plugins/config.json` 到容器中来完成插件配置，参考[文档](https://github.com/zhayujie/chatgpt-on-wechat#3-%E6%8F%92%E4%BB%B6%E4%BD%BF%E7%94%A8)
+ - 如果是`docker`部署，可通过映射 `plugins/config.json` 到容器中来完成插件配置，参考[文档](https://github.com/zhayujie/CowAgent#3-%E6%8F%92%E4%BB%B6%E4%BD%BF%E7%94%A8)
 
 ## 插件使用
 
-> 使用插件中的知识库管理功能需要首先开启`linkai`对话，依赖全局 `config.json` 中的 `use_linkai` 和 `linkai_api_key` 配置；而midjourney绘画 和 summary文档总结对话功能则只需填写 `linkai_api_key` 配置，`use_linkai` 无论是否关闭均可使用。具体可参考 [详细文档](https://link-ai.tech/platform/link-app/wechat)。
+> 使用插件中的知识库管理功能需要首先开启`linkai`对话，依赖全局 `config.json` 中的 `use_linkai` 和 `linkai_api_key` 配置；而midjourney绘画 和 summary文档总结对话功能则只需填写 `linkai_api_key` 配置，`use_linkai` 无论是否关闭均可使用。具体可参考 [详细文档](https://link-ai.tech/platform/link-app/wechat?utm_source=cowagent&utm_medium=readme&utm_campaign=plugin-linkai)。
 
 完成配置后运行项目，会自动运行插件，输入 `#help linkai` 可查看插件功能。
 
@@ -98,7 +98,7 @@
 
 如果不想创建 `plugins/linkai/config.json` 配置，可以直接通过 `$linkai sum open` 指令开启该功能。
 
-也可以通过私聊(全局 `config.json` 中的 `linkai_app_code`)或者群聊绑定(通过`group_app_map`参数配置)的应用来开启该功能：在LinkAI平台 [应用配置](https://link-ai.tech/console/factory) 里添加并开启**内容总结**插件。
+也可以通过私聊(全局 `config.json` 中的 `linkai_app_code`)或者群聊绑定(通过`group_app_map`参数配置)的应用来开启该功能：在LinkAI平台 [应用配置](https://link-ai.tech/console/factory?utm_source=cowagent&utm_medium=readme&utm_campaign=plugin-linkai) 里添加并开启**内容总结**插件。
 
 #### 使用
 

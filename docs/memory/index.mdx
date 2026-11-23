@@ -1,6 +1,6 @@
 ---
 title: Long-term Memory
-description: CowAgent long-term memory system — file persistence, automatic writing, and hybrid retrieval
+description: "CowAgent's long-term memory: core memory in MEMORY.md, daily memories and dream diaries stored as workspace files, written automatically when context is trimmed and recalled with hybrid search."
 ---
 
 Long-term memory is stored in workspace files, persisting across sessions. The Agent loads historical memory on demand via retrieval tools during conversation, and automatically writes conversation summaries to long-term memory when context is trimmed.
@@ -39,7 +39,11 @@ The memory system supports hybrid retrieval modes:
 - **Keyword retrieval** — FTS5 full-text index matching with BM25 ranking
 - **Vector retrieval** — Embedding-based semantic similarity search, finds relevant memory even with different wording
 
-The Agent automatically triggers memory retrieval during conversation as needed, incorporating relevant historical information into context. Results are ranked by a combined score (default: 0.7 vector weight + 0.3 keyword weight). Daily memory scores decay over time (30-day half-life), while core memory does not decay.
+The Agent automatically triggers memory retrieval during conversation as needed, incorporating relevant historical information into context. Results are ranked by rank-normalizing the vector and keyword scores onto a common scale and taking a weighted average (default: 0.7 vector weight + 0.3 keyword weight). Because the top hit is always normalized to 1.0, `min_score` acts as a rank-position cutoff rather than an absolute relevance floor. Daily memory scores decay over time (30-day half-life), while core memory does not decay.
+
+<Tip>
+  For more precise ranking, rerank can optionally be enabled: run `pip install sentence-transformers`, then set `"rerank_provider": "local"` in the config, and results are reordered by a local rerank model (default `BAAI/bge-reranker-base`). It is off by default and has no effect unless configured.
+</Tip>
 
 ## Related Files
 
@@ -67,5 +71,8 @@ The memory management page in the Web console allows browsing memory files and d
 | Parameter | Description | Default |
 | --- | --- | --- |
 | `agent_workspace` | Workspace path, memory files stored under this directory | `~/cow` |
-| `agent_max_context_tokens` | Max context tokens; when exceeded, content is trimmed and summarized into memory | `50000` |
-| `agent_max_context_turns` | Max context turns; when exceeded, content is trimmed and summarized into memory | `20` |
+| `agent_max_context_tokens` | Max context tokens; when exceeded, content is trimmed and summarized into memory | `200000` |
+| `agent_max_context_turns` | Max context turns; when exceeded, content is trimmed and summarized into memory | `30` |
+| `rerank_provider` | Rerank service for memory retrieval; empty disables it, `local` uses a local cross-encoder | `""` |
+| `rerank_model` | Rerank model; empty uses the provider's default | `BAAI/bge-reranker-base` |
+| `memory.hit_boost` | Nudge frequently retrieved memories up the ranking (fading after about a week idle); off keeps ranking unchanged and searches write nothing | `false` |

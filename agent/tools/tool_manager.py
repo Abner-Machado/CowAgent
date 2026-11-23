@@ -2,10 +2,23 @@ import importlib
 import importlib.util
 import threading
 from pathlib import Path
-from typing import Dict, Any, Type
+from typing import Dict
 from agent.tools.base_tool import BaseTool
+from agent.tools.phone.base import PhoneTool
+from common.deployment import is_mobile
 from common.log import logger
 from config import conf
+
+# Tools that need a shell or a local browser, neither of which the mobile app
+# can provide.
+_MOBILE_UNAVAILABLE_TOOLS = frozenset({"bash", "browser"})
+
+
+def _available_here(tool_name: str, cls: type) -> bool:
+    if is_mobile():
+        return tool_name not in _MOBILE_UNAVAILABLE_TOOLS
+    # The mobile app carries these out on its phone; nothing else can.
+    return not issubclass(cls, PhoneTool)
 
 
 def _normalize_mcp_configs(raw) -> list:
@@ -176,6 +189,9 @@ class ToolManager:
                                     # Create a temporary instance to get the name
                                     temp_instance = cls()
                                     tool_name = temp_instance.name
+                                    if not _available_here(tool_name, cls):
+                                        logger.debug(f"Skipped tool {tool_name} (unavailable in this deployment)")
+                                        continue
                                     # Store the class, not the instance
                                     self.tool_classes[tool_name] = cls
                                     logger.debug(f"Loaded tool: {tool_name} from class {class_name}")
@@ -240,6 +256,8 @@ class ToolManager:
                                 # Create a temporary instance to get the name
                                 temp_instance = cls()
                                 tool_name = temp_instance.name
+                                if not _available_here(tool_name, cls):
+                                    continue
                                 # Store the class, not the instance
                                 self.tool_classes[tool_name] = cls
                             except ImportError as e:
@@ -279,9 +297,9 @@ class ToolManager:
                 for tool_name in missing_tools:
                     if tool_name == "google_search":
                         logger.warning(
-                            f"[ToolManager] Google Search tool is configured but may need API key.\n"
-                            f"  Get API key from: https://serper.dev\n"
-                            f"  Configure in config.json: tools.google_search.api_key"
+                            "[ToolManager] Google Search tool is configured but may need API key.\n"
+                            "  Get API key from: https://serper.dev\n"
+                            "  Configure in config.json: tools.google_search.api_key"
                         )
                     else:
                         logger.warning(f"[ToolManager] Tool '{tool_name}' is configured but could not be loaded.")
@@ -331,15 +349,26 @@ class ToolManager:
         if os.path.exists(mcp_json_path):
             try:
                 with open(mcp_json_path, "r", encoding="utf-8") as f:
-                    data = _json.load(f)
-                raw = data.get("mcpServers") or data.get("mcp_servers") or data
-                logger.info(f"[ToolManager] Loading MCP config from {mcp_json_path}")
-                return _normalize_mcp_configs(raw)
+                    text = f.read()
+                # Must match service.load_servers: a blank file counts as absent.
+                if text.strip():
+                    data = _json.loads(text)
+                    # An empty {"mcpServers": {}} means no servers, not a server
+                    # named "mcpServers".
+                    raw = data.get("mcpServers")
+                    if raw is None:
+                        raw = data.get("mcp_servers", data)
+                    # DEBUG: with N agents this fires N times for the same shared
+                    # mcp.json; the real boot is logged once at INFO further below.
+                    logger.debug(f"[ToolManager] Loading MCP config from {mcp_json_path}")
+                    from agent.tools.mcp.service import mcp_is_disabled
+                    return [cfg for cfg in _normalize_mcp_configs(raw) if not mcp_is_disabled(cfg)]
             except Exception as e:
                 logger.warning(f"[ToolManager] Failed to read {mcp_json_path}: {e}, falling back to config.json")
 
         raw = conf().get("mcp_servers", [])
-        return _normalize_mcp_configs(raw)
+        from agent.tools.mcp.service import mcp_is_disabled
+        return [cfg for cfg in _normalize_mcp_configs(raw) if not mcp_is_disabled(cfg)]
 
     def _load_mcp_tools(self):
         """
@@ -382,7 +411,9 @@ class ToolManager:
                 daemon=True,
                 name="mcp-loader",
             ).start()
-            logger.info(
+            # DEBUG: fires once per agent; with many agents sharing one mcp.json
+            # this is just noise. The actual server boot is logged at INFO.
+            logger.debug(
                 f"[ToolManager] MCP loading started in background "
                 f"({len(mcp_servers_config)} server(s) configured)"
             )
@@ -458,15 +489,33 @@ class ToolManager:
         with self._mcp_registry._registry_lock:
             client = self._mcp_registry._clients.pop(server_name, None)
         if client is not None:
+            # This client may be pooled and shared with other Agents on the same
+            # mcp.json. Drop the matching pool entry so a later reload re-boots a
+            # fresh subprocess rather than handing out the one we're stopping.
+            try:
+                pool = self._mcp_registry._shared_pool
+                with self._mcp_registry._shared_pool_lock:
+                    for k in [k for k, v in pool.items() if v is client]:
+                        pool.pop(k, None)
+            except Exception:
+                pass
             try:
                 client.shutdown()
             except Exception as e:
                 logger.warning(f"[MCP] Error shutting down '{server_name}': {e}")
         # Drop tools that belonged to this server.
+        retired = []
         for tool_name in list(self._mcp_tool_instances.keys()):
             tool = self._mcp_tool_instances.get(tool_name)
             if tool is not None and getattr(tool, "server_name", None) == server_name:
                 self._mcp_tool_instances.pop(tool_name, None)
+                retired.append(tool_name)
+        # ...and their description vectors, since _ensure_mcp_tool_vectors only fills
+        # missing names and a reused name would keep a stale embedding.
+        if retired:
+            with self._mcp_vector_lock:
+                for tool_name in retired:
+                    self._mcp_tool_vectors.pop(tool_name, None)
         self._mcp_status.pop(server_name, None)
 
     def _load_mcp_tools_async(self, mcp_servers_config):
@@ -486,12 +535,30 @@ class ToolManager:
             # Let the OAuth web callback bring a server online once authorized.
             set_reload_callback(self.reload_mcp_server)
 
+            mcp_json_path = self._mcp_json_path()
+
+            booted_any = False
             for cfg in mcp_servers_config:
                 server_name = cfg.get("name", "<unnamed>")
                 try:
-                    client = McpClient(cfg)
-                    if not client.initialize():
-                        if getattr(client, "needs_auth", False):
+                    # Reuse a subprocess already booted from the *same* mcp.json
+                    # with the *same* config, so several Agents sharing one
+                    # mcp.json don't each fork their own copy of every server.
+                    # Booting is serialized per key, so concurrent loader threads
+                    # racing on the same server end up sharing one subprocess.
+                    share_key = registry.shared_key(mcp_json_path, server_name, cfg)
+                    boot_failure = {}
+
+                    def _boot():
+                        c = McpClient(cfg)
+                        if c.initialize():
+                            return c
+                        boot_failure["needs_auth"] = getattr(c, "needs_auth", False)
+                        return None
+
+                    client, reused = registry.get_or_boot_shared(share_key, _boot)
+                    if client is None:
+                        if boot_failure.get("needs_auth"):
                             self._mcp_status[server_name] = "needs_auth"
                             logger.info(
                                 f"[MCP] Server '{server_name}' needs authorization — "
@@ -510,28 +577,45 @@ class ToolManager:
                         tool_name = schema.get("name", "")
                         if not tool_name:
                             continue
-                        mcp_tool = McpTool(client, schema, server_name)
+                        mcp_tool = McpTool(
+                            client, schema, server_name,
+                            name_prefix=cfg.get("tool_name_prefix", ""),
+                        )
                         # Atomic dict assignment is GIL-safe; readers iterate
                         # over a list() snapshot to avoid concurrent mutation.
-                        self._mcp_tool_instances[tool_name] = mcp_tool
-                        added.append(tool_name)
+                        self._mcp_tool_instances[mcp_tool.name] = mcp_tool
+                        added.append(mcp_tool.name)
 
                     # Register client into the shared registry only after its
                     # tools are visible, so callers never see a half-loaded server.
                     with registry._registry_lock:
                         registry._clients[server_name] = client
                     self._mcp_status[server_name] = "ready"
-                    logger.info(
-                        f"[MCP] Server '{server_name}' ready — "
-                        f"{len(added)} tool(s): {added}"
-                    )
+                    if reused:
+                        # A shared subprocess this Agent attached to; log quietly
+                        # so N Agents sharing one mcp.json don't repeat the line.
+                        logger.debug(
+                            f"[MCP] Server '{server_name}' reused — "
+                            f"{len(added)} tool(s) attached"
+                        )
+                    else:
+                        booted_any = True
+                        logger.info(
+                            f"[MCP] Server '{server_name}' ready — "
+                            f"{len(added)} tool(s): {added}"
+                        )
                 except Exception as e:
                     self._mcp_status[server_name] = "failed"
                     logger.warning(f"[MCP] Server '{server_name}' load failed: {e}")
 
             ready = sum(1 for s in self._mcp_status.values() if s == "ready")
             total = len(self._mcp_status)
-            logger.info(
+            # Only surface the summary at INFO when this loader actually booted a
+            # server. When every server was reused from the shared pool (the
+            # common case for the 2nd..Nth agent sharing one mcp.json) keep it at
+            # DEBUG to avoid N identical "loading complete" lines.
+            _complete_log = logger.info if booted_any else logger.debug
+            _complete_log(
                 f"[ToolManager] MCP loading complete: "
                 f"{ready}/{total} server(s) ready, "
                 f"{len(self._mcp_tool_instances)} tool(s) available"
@@ -681,6 +765,10 @@ class ToolManager:
         """Incrementally embed MCP tools that are not yet cached."""
         # Snapshot to avoid concurrent-mutation while the async loader runs.
         current = dict(self._mcp_tool_instances)
+        with self._mcp_vector_lock:
+            # Drop vectors for tools that no longer exist, e.g. after a partial load.
+            for stale in [n for n in self._mcp_tool_vectors if n not in current]:
+                self._mcp_tool_vectors.pop(stale, None)
         missing = [name for name in current if name not in self._mcp_tool_vectors]
         if not missing:
             return
@@ -727,12 +815,18 @@ class ToolManager:
         """
         tool_class = self.tool_classes.get(name)
         if tool_class:
-            # Create a new instance
-            tool_instance = tool_class()
-
-            # Apply configuration if available
-            if hasattr(self, 'tool_configs') and name in self.tool_configs:
-                tool_instance.config = self.tool_configs[name]
+            # Bash needs its selected backend before rendering its description.
+            # Read the instance-wide shell value live: managers may predate a save.
+            if name == "bash":
+                tool_config = dict(getattr(self, "tool_configs", {}).get(name) or {})
+                live_bash = (conf().get("tools") or {}).get("bash") or {}
+                if "windows_shell" in live_bash:
+                    tool_config["windows_shell"] = live_bash["windows_shell"]
+                tool_instance = tool_class(tool_config)
+            else:
+                tool_instance = tool_class()
+                if hasattr(self, 'tool_configs') and name in self.tool_configs:
+                    tool_instance.config = self.tool_configs[name]
 
             return tool_instance
 
@@ -752,7 +846,7 @@ class ToolManager:
         result = {}
         for name, tool_class in self.tool_classes.items():
             # Create a temporary instance to get schema
-            temp_instance = tool_class()
+            temp_instance = self.create_tool(name) if name == "bash" else tool_class()
             result[name] = {
                 "description": temp_instance.description,
                 "parameters": temp_instance.get_json_schema()

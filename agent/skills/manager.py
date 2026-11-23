@@ -3,15 +3,109 @@ Skill manager for managing skill lifecycle and operations.
 """
 
 import os
+import re
 import json
-from typing import Dict, List, Optional
-from pathlib import Path
+import threading
+import time
+from typing import Dict, Iterable, List, Optional
 from common.log import logger
-from agent.skills.types import Skill, SkillEntry, SkillSnapshot
+from agent.skills.types import SkillEntry, SkillSnapshot
 from agent.skills.loader import SkillLoader
 from agent.skills.formatter import format_skill_entries_for_prompt
 
 SKILLS_CONFIG_FILE = "skills_config.json"
+SKILLS_CONFIG_TMP_PREFIX = f".{SKILLS_CONFIG_FILE}."
+
+# Optional presentation fields an entry may carry, set by whoever installed or
+# created the skill rather than read from SKILL.md, so a rescan keeps them.
+# All optional: entries without them read exactly as before.
+#   display_name        - title shown in place of the name
+#   display_description - description shown in place of SKILL.md's; the
+#                         agent itself always reads SKILL.md's
+#   icon                - image URL shown beside it
+#   version             - version of the package the skill was installed from
+SKILL_DISPLAY_FIELDS = ("display_name", "display_description", "icon", "version")
+
+_ICON_URL_RE = re.compile(r"^https?://\S+$", re.IGNORECASE)
+
+
+def _display_text(value, max_len: int) -> str:
+    """A single-line presentation field, or ''."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:max_len]
+
+
+def _display_url(value) -> str:
+    """An http(s) image URL, or ''."""
+    url = value.strip() if isinstance(value, str) else ""
+    if len(url) > 2048 or not _ICON_URL_RE.match(url):
+        return ""
+    return url
+
+
+def apply_install_fields(entry: dict, fields: dict) -> bool:
+    """Copy what an installer says about a skill onto its skills_config entry.
+
+    ``fields`` may carry ``category`` and the SKILL_DISPLAY_FIELDS; values that
+    are missing or malformed are skipped. ``icon`` and ``version`` describe the
+    package just installed, so a reinstall without them drops the old ones;
+    ``display_name`` and ``display_description`` are not tied to a package and
+    are kept. Returns whether the entry changed.
+    """
+    before = dict(entry)
+    category = _display_text(fields.get("category"), 64)
+    if category:
+        entry["category"] = category
+    for key, max_len in (("display_name", 128), ("display_description", 1024)):
+        value = _display_text(fields.get(key), max_len)
+        if value:
+            entry[key] = value
+    for key, value in (("icon", _display_url(fields.get("icon"))),
+                       ("version", _display_text(fields.get("version"), 64))):
+        if value:
+            entry[key] = value
+        else:
+            entry.pop(key, None)
+    return entry != before
+
+
+def build_skill_manager(
+    agent_id: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+    config: Optional[Dict] = None,
+) -> "SkillManager":
+    """Build a manager pointed at the skills one Agent actually draws on.
+
+    Resolved through ``state_dir`` rather than joined with ``"skills"``: an
+    Agent without a directory of its own falls back to the shared one, which is
+    what makes an installed skill reachable from every Agent. The profile's
+    selection is what still lets them differ.
+    """
+    from common import state_dir
+    from common.runtime_identity import RuntimeIdentity, current_identity
+
+    identity = (
+        RuntimeIdentity(agent_id=agent_id) if agent_id else current_identity()
+    )
+    selection = None
+    try:
+        from agent.registry import get_agent_registry
+
+        profile = get_agent_registry().get(
+            identity.agent_id or None, require_enabled=False
+        )
+        selection = profile.skills
+    except Exception:
+        # An unresolvable Agent must not cost the caller its skills; the
+        # unfiltered shared set is the pre-selection behaviour.
+        pass
+
+    if workspace_dir:
+        custom_dir = state_dir.skills_dir(base=workspace_dir)
+    else:
+        custom_dir = state_dir.skills_dir(identity)
+    return SkillManager(custom_dir=str(custom_dir), config=config, selection=selection)
 
 
 class SkillManager:
@@ -22,6 +116,7 @@ class SkillManager:
         builtin_dir: Optional[str] = None,
         custom_dir: Optional[str] = None,
         config: Optional[Dict] = None,
+        selection: Optional[Iterable[str]] = None,
     ):
         """
         Initialize the skill manager.
@@ -29,12 +124,18 @@ class SkillManager:
         :param builtin_dir: Built-in skills directory (project root ``skills/``)
         :param custom_dir: Custom skills directory (workspace ``skills/``)
         :param config: Configuration dictionary
+        :param selection: Names this Agent draws on. ``None`` means all of them.
         """
         project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         self.builtin_dir = builtin_dir or os.path.join(project_root, 'skills')
         self.custom_dir = custom_dir or os.path.join(project_root, 'workspace', 'skills')
         self.config = config or {}
         self._skills_config_path = os.path.join(self.custom_dir, SKILLS_CONFIG_FILE)
+        # Which of the shared skills this Agent uses. Kept separate from
+        # skills_config.json because that file describes the instance-wide
+        # library, which every Agent reads and which one Agent turning a skill
+        # off for itself must not rewrite.
+        self.selection: Optional[set] = None if selection is None else set(selection)
 
         # skills_config: full skill metadata keyed by name
         # { "web-fetch": {"name": ..., "description": ..., "source": ..., "enabled": true}, ... }
@@ -44,13 +145,18 @@ class SkillManager:
         self.skills: Dict[str, SkillEntry] = {}
 
         # Load skills on initialization
-        self.refresh_skills()
+        self.refresh_skills(use_cache=True)
 
-    def refresh_skills(self):
-        """Reload all skills from builtin and custom directories, then sync config."""
+    def refresh_skills(self, use_cache: bool = False):
+        """Reload all skills from builtin and custom directories, then sync config.
+
+        :param use_cache: Reuse the parse of skill files unchanged on disk since
+            they were last read. Directories are always rescanned.
+        """
         self.skills = self.loader.load_all_skills(
             builtin_dir=self.builtin_dir,
             custom_dir=self.custom_dir,
+            use_cache=use_cache,
         )
         self._sync_skills_config()
         logger.debug(f"SkillManager: Loaded {len(self.skills)} skills")
@@ -58,27 +164,49 @@ class SkillManager:
     # ------------------------------------------------------------------
     # skills_config.json management
     # ------------------------------------------------------------------
-    def _load_skills_config(self) -> Dict[str, dict]:
-        """Load skills_config.json from custom_dir. Returns empty dict if not found."""
+    def _load_skills_config(self) -> Optional[Dict[str, dict]]:
+        """Load skills_config.json from custom_dir.
+
+        Returns an empty dict if the file doesn't exist, and None if it exists
+        but can't be read, so the caller never mistakes it for an empty config
+        and writes the defaults over the user's choices.
+        """
         if not os.path.exists(self._skills_config_path):
             return {}
         try:
-            with open(self._skills_config_path, "r", encoding="utf-8") as f:
+            with open(self._skills_config_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data
+            logger.warning(f"[SkillManager] {SKILLS_CONFIG_FILE} is not a JSON object, left as is")
         except Exception as e:
             logger.warning(f"[SkillManager] Failed to load {SKILLS_CONFIG_FILE}: {e}")
-        return {}
+        return None
 
-    def _save_skills_config(self):
-        """Persist skills_config to custom_dir/skills_config.json."""
+    def _save_skills_config(self, *, strict: bool = False):
+        """Persist skills_config to custom_dir/skills_config.json.
+
+        Written to a temporary file and renamed into place, so a concurrent
+        reader sees either the old file or the new one, never a partial write.
+        A failure is logged and swallowed unless ``strict`` is set.
+        """
         os.makedirs(self.custom_dir, exist_ok=True)
+        tmp_path = os.path.join(
+            self.custom_dir,
+            f"{SKILLS_CONFIG_TMP_PREFIX}{os.getpid()}.{threading.get_ident()}.tmp",
+        )
         try:
-            with open(self._skills_config_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.skills_config, f, indent=4, ensure_ascii=False)
+            os.replace(tmp_path, self._skills_config_path)
         except Exception as e:
             logger.error(f"[SkillManager] Failed to save {SKILLS_CONFIG_FILE}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            if strict:
+                raise
 
     def _sync_skills_config(self):
         """
@@ -87,14 +215,23 @@ class SkillManager:
         - New skills: use metadata.default_enabled as initial enabled state.
         - Existing skills: preserve their persisted enabled state.
         - Skills that no longer exist on disk are removed.
-        - name/description/source are always refreshed from the latest scan.
+        - name/description are always refreshed from the latest scan.
+        - source, category and SKILL_DISPLAY_FIELDS are kept from the file.
+        - installed_at (epoch seconds) is stamped when a skill first appears and
+          kept after; entries written before it existed go without, so an
+          existing file is not rewritten for it.
         """
-        saved = self._load_skills_config()
+        loaded = self._load_skills_config()
+        saved = loaded if loaded is not None else self.skills_config
         merged: Dict[str, dict] = {}
+        now = int(time.time())
 
         for name, entry in self.skills.items():
             skill = entry.skill
             prev = saved.get(name, {})
+            if not isinstance(prev, dict):
+                logger.warning(f"[SkillManager] Ignoring malformed config entry for {name}")
+                prev = {}
             category = prev.get("category", "skill")
 
             if name in saved:
@@ -109,21 +246,36 @@ class SkillManager:
                 "enabled": enabled,
                 "category": category,
             }
-            display_name = prev.get("display_name")
-            if display_name:
-                entry_dict["display_name"] = display_name
+            for key in SKILL_DISPLAY_FIELDS:
+                value = prev.get(key)
+                if value:
+                    entry_dict[key] = value
+            if name not in saved:
+                entry_dict["installed_at"] = now
+            elif isinstance(prev.get("installed_at"), int):
+                entry_dict["installed_at"] = prev["installed_at"]
             merged[name] = entry_dict
 
         self.skills_config = merged
-        self._save_skills_config()
+        # Rewritten only when something changed: this runs before every run,
+        # and an unreadable file is left for the user rather than replaced.
+        if loaded is not None and merged != loaded:
+            self._save_skills_config()
 
     def is_skill_enabled(self, name: str) -> bool:
         """
-        Check if a skill is enabled according to skills_config.
+        Check if a skill is enabled for this Agent.
+
+        A skill has to clear both gates: the instance-wide library switch in
+        skills_config.json, and this Agent's own selection. Narrowing rather
+        than overriding keeps "turn this off everywhere" working no matter which
+        Agents happen to have selected it.
 
         :param name: skill name
         :return: True if enabled (default True if not in config)
         """
+        if self.selection is not None and name not in self.selection:
+            return False
         entry = self.skills_config.get(name)
         if entry is None:
             return True
@@ -138,8 +290,14 @@ class SkillManager:
         """
         if name not in self.skills_config:
             raise ValueError(f"skill '{name}' not found in config")
-        self.skills_config[name]["enabled"] = enabled
-        self._save_skills_config()
+        entry = self.skills_config[name]
+        previous = entry.get("enabled", True)
+        entry["enabled"] = enabled
+        try:
+            self._save_skills_config(strict=True)
+        except Exception:
+            entry["enabled"] = previous
+            raise
 
     def get_skills_config(self) -> Dict[str, dict]:
         """

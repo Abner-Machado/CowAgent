@@ -1,0 +1,817 @@
+/* Shared controls: dropdowns, form fields, confirm dialog, tooltips.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* Confirm Modal */
+.confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.4);
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.confirm-overlay.visible { opacity: 1; }
+.confirm-modal {
+    background: #fff;
+    border-radius: 14px;
+    width: 380px;
+    max-width: 90vw;
+    padding: 28px 24px 20px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
+    transform: scale(0.92);
+    transition: transform 0.2s ease;
+}
+.confirm-overlay.visible .confirm-modal { transform: scale(1); }
+.dark .confirm-modal {
+    background: #1e1e1e;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.confirm-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: #1f2937;
+    margin-bottom: 8px;
+}
+.dark .confirm-title { color: #e5e7eb; }
+.confirm-message {
+    font-size: 14px;
+    color: #6b7280;
+    line-height: 1.5;
+    margin-bottom: 24px;
+}
+.dark .confirm-message { color: #9ca3af; }
+.confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+.confirm-btn {
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    transition: all 0.15s ease;
+}
+.confirm-btn-cancel {
+    background: #f3f4f6;
+    color: #374151;
+}
+.confirm-btn-cancel:hover { background: #e5e7eb; }
+.dark .confirm-btn-cancel {
+    background: rgba(255, 255, 255, 0.08);
+    color: #d1d5db;
+}
+.dark .confirm-btn-cancel:hover { background: rgba(255, 255, 255, 0.14); }
+.confirm-btn-ok {
+    background: #ef4444;
+    color: #fff;
+}
+.confirm-btn-ok:hover { background: #dc2626; }
+
+/* Web console updater — compact up-popover on the sidebar version row */
+#sidebar-version { color: inherit; position: relative; }
+.update-version-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.update-version-btn .fa-ellipsis {
+    font-size: 13px;
+    opacity: 0.75;
+}
+.update-menu {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: calc(100% - 4px);
+    z-index: 60;
+    padding: 5px;
+    border-radius: 10px;
+    background: #171717;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.5), 0 2px 8px -2px rgba(0, 0, 0, 0.4);
+    animation: slashMenuIn 0.15s ease-out;
+}
+.update-menu.hidden { display: none; }
+
+/* Every row is a single fixed-height line: icon slot + label (+ trailing).
+   The icon slot has a fixed size so labels always start at the same x, no
+   matter how the text/state changes. */
+.update-menu-item {
+    width: 100%;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 9px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: #d4d4d4;
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+}
+.update-menu-item:hover { background: rgba(255, 255, 255, 0.06); color: #fff; }
+.update-menu-icon {
+    position: relative;
+    flex-shrink: 0;
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    color: #8f8f8f;
+}
+.update-menu-item:hover .update-menu-icon { color: rgb(var(--cw-primary-400)); }
+.update-menu-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.update-menu-item.is-new .update-menu-label { color: #ef4444; }
+.update-menu-item.is-new:hover .update-menu-label { color: #ef4444; }
+.update-menu-item.is-ok .update-menu-label { color: rgb(var(--cw-primary-400)); }
+.update-menu-ext { flex-shrink: 0; font-size: 10px; color: #6b6b6b; }
+.update-menu-item.is-disabled { cursor: default; }
+.update-menu-item.is-disabled:hover { background: transparent; color: #d4d4d4; }
+.update-menu-item.is-disabled:hover .update-menu-icon { color: #8f8f8f; }
+
+/* Red dot flagging a newer version, pinned to the top-right of the icon slot
+   so it never shifts the label (mirrors the desktop NavRail badge). */
+.update-dot {
+    position: absolute;
+    top: -1px;
+    right: -2px;
+    width: 5px;
+    height: 5px;
+    border-radius: 999px;
+    background: #ef4444;
+    box-shadow: 0 0 0 1.5px #171717;
+    pointer-events: none;
+}
+.update-dot.hidden { display: none; }
+.fa-spin-update { animation: fa-spin 0.9s linear infinite; }
+
+/* Config form controls */
+#view-config input[type="text"],
+#view-config input[type="number"],
+#view-config input[type="password"] {
+    height: 40px;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+#view-config input:focus {
+    border-color: rgb(var(--cw-primary-400));
+    box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0.12);
+}
+#view-config input[type="text"]:hover,
+#view-config input[type="number"]:hover,
+#view-config input[type="password"]:hover {
+    border-color: rgb(var(--cw-slate-400));
+}
+.dark #view-config input[type="text"]:hover,
+.dark #view-config input[type="number"]:hover,
+.dark #view-config input[type="password"]:hover {
+    border-color: rgb(var(--cw-slate-500));
+}
+
+/* Custom dropdown */
+.cfg-dropdown {
+    position: relative;
+    outline: none;
+}
+.cfg-dropdown-selected {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 40px;
+    padding: 0 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: rgb(var(--cw-slate-50));
+    font-size: 0.875rem;
+    color: rgb(var(--cw-slate-800));
+    cursor: pointer;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+    user-select: none;
+}
+.dark .cfg-dropdown-selected {
+    border-color: rgb(var(--cw-slate-600));
+    background: rgba(255, 255, 255, 0.05);
+    color: rgb(var(--cw-slate-100));
+}
+.cfg-dropdown-selected:hover { border-color: rgb(var(--cw-slate-400)); }
+.dark .cfg-dropdown-selected:hover { border-color: rgb(var(--cw-slate-500)); }
+/* Read-only variant: renders like a filled field but never opens (e.g. the
+   task edit modal's frozen channel). Pointer + focus affordances are removed. */
+.cfg-dropdown-disabled { pointer-events: none; }
+.cfg-dropdown-disabled .cfg-dropdown-selected {
+    cursor: not-allowed;
+    background: rgb(var(--cw-slate-100));
+    color: rgb(var(--cw-slate-600));
+}
+.dark .cfg-dropdown-disabled .cfg-dropdown-selected {
+    background: #252525;
+    color: rgb(var(--cw-slate-300));
+}
+.cfg-dropdown-disabled .cfg-dropdown-arrow { opacity: 0.4; }
+/* A compact trigger for header rows, so the picker lines up with the pill
+   tabs beside it instead of towering over them. */
+.cfg-dropdown-sm .cfg-dropdown-selected {
+    height: 32px; padding: 0 0.5rem; font-size: 0.8125rem;
+}
+.cfg-dropdown-sm .cfg-dropdown-face .agent-avatar { width: 18px; height: 18px; }
+/* An even more compact trigger for rows that sit right next to the
+   agent-seg segmented control (e.g. the core-file picker), so both line up
+   at the same height instead of the dropdown towering over the tabs. */
+.cfg-dropdown-xs .cfg-dropdown-selected {
+    height: 28px; padding: 0 0.5rem; font-size: 12px; border-radius: 6px;
+}
+.cfg-dropdown-xs .cfg-dropdown-arrow { font-size: 10px; }
+.cfg-dropdown.open .cfg-dropdown-selected,
+.cfg-dropdown:focus .cfg-dropdown-selected {
+    border-color: rgb(var(--cw-primary-400));
+    box-shadow: 0 0 0 3px rgb(var(--cw-primary-400) / 0.12);
+}
+.cfg-dropdown-arrow {
+    font-size: 0.625rem;
+    color: rgb(var(--cw-slate-400));
+    transition: transform 0.2s ease;
+    flex-shrink: 0;
+    margin-left: 0.5rem;
+}
+.cfg-dropdown.open .cfg-dropdown-arrow { transform: rotate(180deg); }
+/* Avatar variant: a face sits left of the label in both the trigger and each
+   row. The trigger keeps its space-between layout, so face+text are grouped by
+   letting the text flex and the arrow stay pinned right. */
+.cfg-dropdown-avatar .cfg-dropdown-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Groups the trigger's avatar + label on the left so the arrow can sit at the
+   far right (the selected row uses space-between). */
+.cfg-dropdown-value { display: inline-flex; align-items: center; min-width: 0; }
+.cfg-dropdown-value .cfg-dropdown-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cfg-dropdown-face {
+    display: inline-flex; width: 20px; height: 20px; flex-shrink: 0; margin-right: 8px;
+}
+.cfg-dropdown-face:empty { display: none; }
+.cfg-dropdown-face .agent-avatar,
+.cfg-dropdown-item-face .agent-avatar { width: 20px; height: 20px; border-radius: 50%; }
+.cfg-dropdown-item-face {
+    display: inline-flex; width: 20px; height: 20px; flex-shrink: 0; margin-right: 8px;
+}
+.cfg-dropdown-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 50;
+    max-height: 240px;
+    overflow-y: auto;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: #ffffff;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 4px 10px -5px rgba(0, 0, 0, 0.04);
+    padding: 4px;
+}
+.dark .cfg-dropdown-menu {
+    border-color: rgb(var(--cw-slate-700));
+    background: #1e1e1e;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+}
+.cfg-dropdown.open .cfg-dropdown-menu { display: block; }
+/* A dropdown inside a scrolling modal body (e.g. the "add vendor" provider
+   picker) would otherwise be clipped by the body's overflow-y-auto. While one
+   is open, let the body overflow so the menu can extend past it; the menu's own
+   max-height keeps it from running off the modal. */
+.modal-scroll-body:has(.cfg-dropdown.open) { overflow: visible; }
+.modal-scroll-body:has(.cfg-dropdown.open) .cfg-dropdown.open { z-index: 60; }
+/* When flipped, anchor the menu above the control so it isn't clipped at the
+   bottom of the viewport (e.g. the last channel's config dropdown). */
+.cfg-dropdown.drop-up .cfg-dropdown-menu {
+    top: auto;
+    bottom: calc(100% + 4px);
+}
+.cfg-dropdown-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 0.875rem;
+    color: rgb(var(--cw-slate-700));
+    cursor: pointer;
+    transition: background 0.15s ease;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .cfg-dropdown-item { color: rgb(var(--cw-slate-300)); }
+.cfg-dropdown-item:hover { background: rgb(var(--cw-slate-100)); }
+.dark .cfg-dropdown-item:hover { background: rgba(255, 255, 255, 0.08); }
+.cfg-dropdown-item.active {
+    background: rgb(var(--cw-primary-400) / 0.1);
+    color: rgb(var(--cw-primary-600));
+    font-weight: 500;
+}
+.dark .cfg-dropdown-item.active {
+    background: rgb(var(--cw-primary-400) / 0.15);
+    color: rgb(var(--cw-primary-300));
+}
+/* When an item carries a hint (e.g. brand alias next to a technical model
+   id), label/hint are split into two spans so the hint sits on the right in
+   a dim, smaller weight. Without a hint the row stays a plain text node and
+   uses the default ellipsis behaviour, so no layout regressions for old call
+   sites. */
+.cfg-dropdown-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.cfg-dropdown-hint {
+    flex-shrink: 0;
+    margin-left: auto;
+    padding-left: 12px;
+    color: rgb(var(--cw-slate-400));
+    font-size: 12px;
+    font-weight: 400;
+}
+/* Small trailing pill after an avatar option's name, e.g. a "default" marker. */
+.cfg-dropdown-badge {
+    flex-shrink: 0;
+    margin-left: auto;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: rgb(var(--cw-slate-100));
+    color: rgb(var(--cw-slate-500));
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.5;
+}
+.dark .cfg-dropdown-badge {
+    background: rgba(255,255,255,.08);
+    color: rgb(var(--cw-slate-400));
+}
+.dark .cfg-dropdown-hint {
+    color: rgb(var(--cw-slate-500));
+}
+/* Multi-select variant: the trigger shows overlapping avatars of the chosen
+   members instead of a single face, and each row is a checklist item whose
+   tick appears only when selected. Selecting a row does NOT close the menu. */
+.cfg-dropdown-faces {
+    display: inline-flex;
+    flex-shrink: 0;
+    margin-right: 8px;
+}
+.cfg-dropdown-faces:empty { display: none; }
+.cfg-dropdown-faces .agent-avatar {
+    width: 18px; height: 18px; border-radius: 50%;
+    margin-left: -6px;
+    box-shadow: 0 0 0 2px #ffffff;
+}
+.cfg-dropdown-faces .agent-avatar:first-child { margin-left: 0; }
+.dark .cfg-dropdown-faces .agent-avatar { box-shadow: 0 0 0 2px #1e1e1e; }
+.cfg-dropdown-multi .cfg-dropdown-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cfg-dropdown-check.active { font-weight: 500; }
+/* "+N" pill trailing the overlapping avatars when the team has more members
+   than the trigger shows faces for. Sized to sit inline with the 18px faces. */
+.cfg-dropdown-more {
+    display: inline-flex;
+    align-items: center;
+    height: 18px;
+    padding: 0 5px;
+    margin-left: 2px;
+    border-radius: 999px;
+    background: rgb(var(--cw-slate-100));
+    color: rgb(var(--cw-slate-500));
+    font-size: 10px;
+    font-weight: 600;
+}
+.dark .cfg-dropdown-more { background: rgba(255,255,255,.1); color: rgb(var(--cw-slate-400)); }
+.cfg-dropdown-empty {
+    color: rgb(var(--cw-slate-400));
+    cursor: default;
+    justify-content: center;
+    font-size: 0.8125rem;
+}
+.cfg-dropdown-empty:hover { background: transparent; }
+.cfg-dropdown-item.active .cfg-dropdown-hint {
+    /* Tint the hint toward the brand colour on the active row so it doesn't
+       fight with the highlighted label tone. */
+    color: rgb(var(--cw-primary-600) / 0.65);
+}
+.dark .cfg-dropdown-item.active .cfg-dropdown-hint {
+    color: rgb(var(--cw-primary-300) / 0.6);
+}
+/* The active row gets a trailing brand-green checkmark via a Font Awesome
+   pseudo-element so every dropdown (chat / vision / image / asr / tts / etc.)
+   surfaces "this is what's currently selected" without per-call JS plumbing.
+   When a hint is present, the ✓ sits to its right with a small gap; without
+   a hint, margin-left:auto pushes the ✓ flush against the right edge. */
+.cfg-dropdown-item.active::after {
+    content: '\f00c';                  /* FontAwesome check glyph */
+    font-family: 'Font Awesome 6 Free', 'Font Awesome 5 Free', 'FontAwesome';
+    font-weight: 900;
+    margin-left: auto;
+    padding-left: 12px;
+    color: rgb(var(--cw-primary-400));
+    font-size: 11px;
+    flex-shrink: 0;
+}
+.cfg-dropdown-item.active:has(.cfg-dropdown-hint)::after {
+    /* When hint occupies the auto-margin slot, the ✓ no longer benefits
+       from `margin-left: auto`; replace it with a small fixed gap so the
+       ✓ trails the hint cleanly. */
+    margin-left: 0;
+    padding-left: 10px;
+}
+
+/* API Key masking via CSS (avoids browser password prompts) */
+.cfg-key-masked {
+    -webkit-text-security: disc;
+    text-security: disc;
+}
+
+/* Square icon buttons beside the chat API card's read-only fields */
+.cfg-api-btn {
+    flex-shrink: 0;
+    width: 38px;
+    border-radius: 8px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    color: rgb(var(--cw-slate-400));
+    font-size: 12px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.cfg-api-btn:hover { color: rgb(var(--cw-slate-600)); border-color: rgb(var(--cw-slate-300)); }
+.dark .cfg-api-btn { border-color: rgb(var(--cw-slate-600)); }
+.dark .cfg-api-btn:hover { color: rgb(var(--cw-slate-200)); border-color: rgb(var(--cw-slate-500)); }
+
+/* Provider logo image — vendors flagged as `provider-logo-invert-dark`
+   ship a black wordmark that disappears on the dark canvas; we invert their
+   luminance only in dark mode so the brand stays recognizable without
+   touching multi-color marks like Google/MiniMax. */
+.provider-logo-img {
+    object-fit: contain;
+    object-position: center;
+}
+.dark .provider-logo-invert-dark {
+    filter: invert(1) brightness(1.15);
+}
+
+/* Models page — provider dropdown rows.
+   Configured rows look like ordinary picker entries; the .active row's
+   trailing brand-green ✓ already announces "this is what's selected"
+   (handled globally by .cfg-dropdown-item.active::after above).
+   Unconfigured rows are visually subdued and carry a trailing gear icon
+   as a "click to set up" affordance. */
+.cap-provider-label {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.cap-provider-gear {
+    margin-left: auto;
+    padding-left: 12px;
+    color: rgb(var(--cw-slate-400));
+    font-size: 11px;
+    flex-shrink: 0;
+}
+.cap-provider-item.cap-provider-unconfigured {
+    color: rgb(var(--cw-slate-400));
+}
+.dark .cap-provider-item.cap-provider-unconfigured {
+    color: rgb(var(--cw-slate-500));
+}
+.cap-provider-item.cap-provider-unconfigured:hover {
+    color: rgb(var(--cw-slate-600));
+}
+.dark .cap-provider-item.cap-provider-unconfigured:hover {
+    color: rgb(var(--cw-slate-300));
+}
+.cap-provider-item.cap-provider-unconfigured:hover .cap-provider-gear {
+    color: rgb(var(--cw-slate-600));
+}
+.dark .cap-provider-item.cap-provider-unconfigured:hover .cap-provider-gear {
+    color: rgb(var(--cw-slate-300));
+}
+/* If the active row ever lands on an unconfigured vendor (defensive — the
+   click handler normally diverts to the modal), suppress the global ✓ so
+   the gear remains the sole trailing icon and the row keeps reading as
+   "needs setup" rather than "already selected". */
+.cap-provider-item.cap-provider-unconfigured.active::after {
+    content: none;
+}
+
+/* "Add vendor" modal picker — each configured row carries a static
+   brand-green ✓ via decorateVendorModalPicker so users can see what's set
+   up at a glance. The active row's global ✓ is suppressed here to avoid
+   showing two checks side by side on configured + selected rows. */
+.vendor-picker-item.active::after {
+    content: none;
+}
+.vendor-picker-configured-mark {
+    margin-left: auto;
+    padding-left: 12px;
+    color: rgb(var(--cw-primary-400));
+    font-size: 11px;
+    flex-shrink: 0;
+}
+/* "Custom" row is an add-new action: trailing + instead of ✓. */
+.vendor-picker-add-mark {
+    margin-left: auto;
+    padding-left: 12px;
+    color: rgb(var(--cw-slate-400));
+    font-size: 11px;
+    flex-shrink: 0;
+}
+
+/* Config field tooltip */
+.cfg-tip {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    color: rgb(var(--cw-slate-400));
+    cursor: help;
+    font-size: 12px;
+}
+.cfg-tip:hover { color: rgb(var(--cw-slate-500)); }
+.dark .cfg-tip:hover { color: rgb(var(--cw-slate-300)); }
+/* Floating tooltip portal — appended to <body> by JS so it isn't clipped
+   by overflow:hidden ancestors. */
+.cfg-tip-floating {
+    position: fixed;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    white-space: pre;
+    background: rgb(var(--cw-slate-800));
+    color: rgb(var(--cw-slate-200));
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s;
+    z-index: 9999;
+}
+.dark .cfg-tip-floating {
+    background: rgb(var(--cw-slate-700));
+    color: rgb(var(--cw-slate-100));
+}
+.cfg-tip-floating.show {
+    opacity: 1;
+}
+.cfg-tip-floating.is-wrap {
+    max-width: 280px;
+    white-space: pre-line;
+    line-height: 1.55;
+}
+
+
+/* ============================================================
+   Capabilities view: built-in tools, MCP tools, skills
+   ============================================================ */
+.cap-section-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: rgb(var(--cw-slate-400));
+}
+.dark .cap-section-title { color: rgb(var(--cw-slate-500)); }
+.cap-count {
+    padding: 0.125rem 0.5rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    background: rgb(var(--cw-slate-100));
+    color: rgb(var(--cw-slate-500));
+}
+.dark .cap-count { background: rgba(255,255,255,0.1); color: rgb(var(--cw-slate-400)); }
+.cap-count.hidden { display: none; }
+.cap-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: rgb(var(--cw-primary-500));
+    background: rgb(var(--cw-primary-50));
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+.cap-action-btn:hover { background: rgb(var(--cw-primary-100)); }
+.dark .cap-action-btn { color: rgb(var(--cw-primary-400)); background: rgb(var(--cw-primary-900) / 0.35); }
+.dark .cap-action-btn:hover { background: rgb(var(--cw-primary-900) / 0.55); }
+.cap-link-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.5rem;
+    border-radius: 0.5rem;
+    font-size: 0.75rem;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+.cap-link-btn:hover { color: rgb(var(--cw-slate-700)); background: rgb(var(--cw-slate-100)); }
+.dark .cap-link-btn { color: rgb(var(--cw-slate-400)); }
+.dark .cap-link-btn:hover { color: rgb(var(--cw-slate-200)); background: rgba(255,255,255,0.06); }
+.cap-link-btn.hidden { display: none; }
+.cap-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 1.75rem 1rem;
+    border: 1px dashed rgb(var(--cw-slate-200));
+    border-radius: 0.75rem;
+    text-align: center;
+}
+.dark .cap-empty { border-color: rgba(255,255,255,0.1); }
+.cap-empty.hidden { display: none; }
+.cap-empty-icon {
+    width: 2.5rem;
+    height: 2.5rem;
+    margin-bottom: 0.625rem;
+    border-radius: 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #FFFBEB;
+    color: #F59E0B;
+}
+.dark .cap-empty-icon { background: rgba(120,53,15,0.2); color: #FBBF24; }
+
+/* Segmented tabs inside the capability dialogs */
+.cap-tabs {
+    display: inline-flex;
+    padding: 2px;
+    border-radius: 0.5rem;
+    background: rgb(var(--cw-slate-100));
+}
+.dark .cap-tabs { background: rgba(255,255,255,0.08); }
+.cap-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
+    padding: 0.375rem 0.875rem;
+    border-radius: 0.375rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+.cap-tab:hover { color: rgb(var(--cw-slate-700)); }
+.cap-tab.active { background: #fff; color: rgb(var(--cw-slate-700)); box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+.dark .cap-tab { color: rgb(var(--cw-slate-400)); }
+.dark .cap-tab:hover { color: rgb(var(--cw-slate-200)); }
+.dark .cap-tab.active { background: rgba(255,255,255,0.12); color: rgb(var(--cw-slate-100)); }
+
+.cap-input {
+    width: 100%;
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: rgb(var(--cw-slate-50));
+    font-size: 0.875rem;
+    color: rgb(var(--cw-slate-800));
+    outline: none;
+    transition: border-color 0.15s ease;
+}
+input.cap-input { height: 40px; }
+.cap-input::placeholder { color: rgb(var(--cw-slate-400)); }
+.cap-input:focus { border-color: rgb(var(--cw-primary-500)); }
+.cap-input:disabled { color: rgb(var(--cw-slate-500)); background: rgb(var(--cw-slate-100)); cursor: not-allowed; }
+.dark .cap-input { border-color: rgb(var(--cw-slate-600)); background: rgba(255,255,255,0.05); color: rgb(var(--cw-slate-100)); }
+.dark .cap-input::placeholder { color: rgb(var(--cw-slate-500)); }
+.dark .cap-input:disabled { color: rgb(var(--cw-slate-400)); background: #252525; }
+.cap-input-mono { font-family: "JetBrains Mono", "Fira Code", Consolas, monospace; font-size: 0.75rem; line-height: 1.6; }
+.cap-label {
+    display: block;
+    margin-bottom: 0.375rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-600));
+}
+.dark .cap-label { color: rgb(var(--cw-slate-400)); }
+
+/* Result box under "Test connection" */
+.cap-result {
+    border-radius: 0.625rem;
+    padding: 0.75rem 0.875rem;
+    font-size: 0.8125rem;
+    border: 1px solid transparent;
+}
+.cap-result.ok { background: #f0fdf4; border-color: #bbf7d0; color: #166534; }
+.cap-result.fail { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+.cap-result.info { background: rgb(var(--cw-slate-50)); border-color: rgb(var(--cw-slate-200)); color: rgb(var(--cw-slate-600)); }
+.dark .cap-result.ok { background: rgba(22,101,52,0.18); border-color: rgba(34,197,94,0.25); color: #86efac; }
+.dark .cap-result.fail { background: rgba(153,27,27,0.2); border-color: rgba(248,113,113,0.25); color: #fca5a5; }
+.dark .cap-result.info { background: rgba(255,255,255,0.04); border-color: rgba(255,255,255,0.08); color: rgb(var(--cw-slate-300)); }
+.cap-chip {
+    display: inline-flex;
+    align-items: center;
+    max-width: 100%;
+    padding: 0.125rem 0.5rem;
+    border-radius: 0.375rem;
+    font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+    font-size: 0.6875rem;
+    background: rgba(255,255,255,0.7);
+    color: rgb(var(--cw-slate-700));
+    border: 1px solid rgb(var(--cw-slate-900) / 0.08);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dark .cap-chip { background: rgba(255,255,255,0.08); color: rgb(var(--cw-slate-200)); border-color: rgba(255,255,255,0.08); }
+
+/* Skill upload drop zone */
+.cap-dropzone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1rem;
+    border: 1.5px dashed rgb(var(--cw-slate-300));
+    border-radius: 0.75rem;
+    background: rgb(var(--cw-slate-50));
+    text-align: center;
+    transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.cap-dropzone.dragover { border-color: rgb(var(--cw-primary-500)); background: rgb(var(--cw-primary-50)); }
+.dark .cap-dropzone { border-color: rgba(255,255,255,0.15); background: rgba(255,255,255,0.03); }
+.dark .cap-dropzone.dragover { border-color: rgb(var(--cw-primary-400)); background: rgb(var(--cw-primary-900) / 0.25); }
+
+/* A newly installed card, briefly */
+@keyframes capFlash {
+    0% { box-shadow: 0 0 0 0 rgb(var(--cw-primary-500) / 0.55); }
+    100% { box-shadow: 0 0 0 10px rgb(var(--cw-primary-500) / 0); }
+}
+.cap-flash { animation: capFlash 1.2s ease-out 2; border-color: rgb(var(--cw-primary-400)) !important; }
+
+.skill-source-opt {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.625rem 0.5rem;
+    border-radius: 0.625rem;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: #fff;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-600));
+    cursor: pointer;
+    transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+}
+.skill-source-opt i { color: rgb(var(--cw-slate-400)); transition: color 0.15s ease; }
+.skill-source-opt:hover { border-color: rgb(var(--cw-slate-300)); background: rgb(var(--cw-slate-50)); }
+.skill-source-opt.active { border-color: rgb(var(--cw-primary-500)); background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-900)); }
+.skill-source-opt.active i { color: rgb(var(--cw-primary-500)); }
+.dark .skill-source-opt { border-color: rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); color: rgb(var(--cw-slate-300)); }
+.dark .skill-source-opt:hover { border-color: rgba(255,255,255,0.2); background: rgba(255,255,255,0.06); }
+.dark .skill-source-opt.active { border-color: rgb(var(--cw-primary-400)); background: rgb(var(--cw-primary-900) / 0.3); color: rgb(var(--cw-primary-100)); }
+.dark .skill-source-opt.active i { color: rgb(var(--cw-primary-400)); }
+
+.skill-preview-card {
+    border-radius: 0.75rem;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: #fff;
+    overflow: hidden;
+}
+.dark .skill-preview-card { border-color: rgba(255,255,255,0.1); background: rgba(255,255,255,0.02); }
+.skill-preview-card.unselected { opacity: 0.55; }
+.skill-preview-md {
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 0.875rem 1rem;
+    border-top: 1px solid rgb(var(--cw-slate-100));
+    background: #fafafa;
+    font-size: 0.8125rem;
+}
+.dark .skill-preview-md { border-color: rgba(255,255,255,0.06); background: rgba(0,0,0,0.15); }
+.skill-preview-files {
+    max-height: 200px;
+    overflow-y: auto;
+    padding: 0.625rem 1rem;
+    border-top: 1px solid rgb(var(--cw-slate-100));
+    font-family: "JetBrains Mono", "Fira Code", Consolas, monospace;
+    font-size: 0.6875rem;
+    line-height: 1.7;
+    color: rgb(var(--cw-slate-500));
+}
+.dark .skill-preview-files { border-color: rgba(255,255,255,0.06); color: rgb(var(--cw-slate-400)); }

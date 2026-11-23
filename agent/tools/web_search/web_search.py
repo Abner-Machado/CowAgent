@@ -1,27 +1,63 @@
-"""Web Search tool. Supports four backends with a unified response format:
+"""Web Search tool. Supports seventeen backends with a unified response format:
+  - deepseek (https://api-docs.deepseek.com/guides/search, official Search API)
   - bocha   (https://open.bochaai.com)
   - zhipu   (https://docs.bigmodel.cn/cn/guide/tools/web-search)
   - qianfan (https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy)
+  - cowagent (https://cowagent.ai, reuses the CowAgent model API key)
   - linkai  (https://link-ai.tech, fallback)
+  - anysearch (https://anysearch.com)
+  - serply  (https://serply.io, Google/Bing SERP API)
+  - tavily  (https://tavily.com, AI-optimized search API)
+  - outcrawl (https://outcrawl.ai, scrape and search API for AI agents)
+  - firecrawl (https://www.firecrawl.dev/?utm_source=cowagent&utm_medium=integration, context API for AI agents)
+  - context (https://context.dev, web search with query-relevant Highlights)
+  - specstream (https://specstream.ai/docs/search-api, web search and page extraction API)
+  - olostep (https://docs.olostep.com, web search, scraping and crawling API for AI agents)
+  - searchapi (https://www.searchapi.io, Google SERP API)
+  - searxng (https://docs.searxng.org, self-hosted meta search engine)
+  - keenable (https://keenable.ai, keyless tier behind an explicit opt-in)
 
 Provider selection
   - strategy 'auto' (default): pick the first configured provider in the
-    canonical order [bocha, zhipu, qianfan, linkai]. When the caller passes
-    an explicit `provider` it overrides the pick; an invalid/unconfigured
-    one silently falls back to the auto order.
+    canonical order [deepseek, bocha, qianfan, zhipu, cowagent, linkai, anysearch,
+    serply, tavily, outcrawl, firecrawl, context, specstream, olostep, searchapi, searxng, keenable].
+    Keenable counts as configured with a key or with the explicit `keenable_anonymous` opt-in (same contract as
+    `anysearch_anonymous`). When the caller passes an explicit `provider`
+    it overrides the pick; an invalid/unconfigured one silently falls back
+    to the auto order.
   - strategy 'fixed': use the configured provider; if its credential is
     missing at call time, silently fall back to auto order (no card hint).
+  - tools.web_search.disabled_providers: providers excluded from search even
+    though their credential is present (e.g. a model vendor key that should
+    only serve chat).
 
 Credentials
   - bocha   : tools.web_search.bocha_api_key  ->  env BOCHA_API_KEY
   - zhipu   : conf.zhipu_ai_api_key            ->  env ZHIPUAI_API_KEY
   - qianfan : conf.qianfan_api_key             ->  env QIANFAN_API_KEY
+  - cowagent: conf.cowagent_api_key            ->  env COWAGENT_API_KEY
   - linkai  : conf.linkai_api_key              ->  env LINKAI_API_KEY
+  - deepseek: conf.deepseek_api_key           ->  env DEEPSEEK_API_KEY
+  - anysearch : tools.web_search.anysearch_api_key  -> env ANYSEARCH_API_KEY
+  - serply  : tools.web_search.serply_api_key  ->  env SERPLY_API_KEY
+  - tavily  : tools.web_search.tavily_api_key  ->  env TAVILY_API_KEY
+  - outcrawl: tools.web_search.outcrawl_api_key  ->  env OUTCRAWL_API_KEY
+  - firecrawl: tools.web_search.firecrawl_api_key  ->  env FIRECRAWL_API_KEY
+  - context: tools.web_search.context_api_key  ->  env CONTEXT_DEV_API_KEY
+  - specstream: tools.web_search.specstream_api_key  ->  env SPECSTREAM_API_KEY
+  - olostep : tools.web_search.olostep_api_key  ->  env OLOSTEP_API_KEY
+  - searchapi: tools.web_search.searchapi_api_key  ->  env SEARCHAPI_API_KEY
+  - searxng : tools.web_search.searxng_url     ->  env SEARXNG_URL
+  - keenable: tools.web_search.keenable_api_key -> env KEENABLE_API_KEY (optional,
+              only lifts the rate limits of the keyless public endpoint);
+              keyless use is opt-in via tools.web_search.keenable_anonymous
 """
 
 import json
+import math
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode, urlsplit
 
 import requests
 
@@ -32,22 +68,40 @@ from config import conf
 
 DEFAULT_TIMEOUT = 30
 
-# Canonical fallback order. Empirically ordered by Chinese real-time
+# Canonical fallback order. deepseek (official search, reuses the model key)
+# comes first; the rest are empirically ordered by Chinese real-time
 # quality + relevance: bocha (best overall), qianfan (best for hot news),
-# zhipu (strong on long-form articles), linkai (cloud aggregator, last
-# resort).
-PROVIDER_ORDER = ("bocha", "qianfan", "zhipu", "linkai")
+# zhipu (strong on long-form articles), cowagent and linkai (aggregators),
+# anysearch, serply (global Google/Bing SERP, last since it isn't
+# benchmarked against the Chinese-market providers above), tavily, outcrawl,
+# firecrawl, context, specstream, olostep, searchapi, searxng, keenable (global index, keyless tier behind an explicit
+# opt-in; placed last so any provider the user paid for wins).
+PROVIDER_ORDER = ("deepseek", "bocha", "qianfan", "zhipu", "cowagent", "linkai", "anysearch", "serply", "tavily", "outcrawl", "firecrawl", "context", "specstream", "olostep", "searchapi", "searxng", "keenable")
 
 PROVIDER_LABELS = {
     "bocha":   "Bocha",
     "zhipu":   "Zhipu",
     "qianfan": "Baidu Qianfan",
+    "cowagent": "CowAgent",
     "linkai":  "LinkAI",
+    "deepseek": "DeepSeek",
+    "anysearch": "AnySearch",
+    "serply":  "Serply",
+    "tavily":  "Tavily",
+    "outcrawl": "Outcrawl",
+    "firecrawl": "Firecrawl",
+    "context": "Context.dev",
+    "specstream": "SpecStream",
+    "olostep": "Olostep",
+    "searchapi": "SearchApi",
+    "searxng": "SearXNG",
+    "keenable": "Keenable",
 }
 
 
 def _tools_web_search_conf() -> dict:
     """Return the tools.web_search config block (dict-like)."""
+    
     tools_cfg = conf().get("tools") or {}
     if not isinstance(tools_cfg, dict):
         return {}
@@ -55,34 +109,142 @@ def _tools_web_search_conf() -> dict:
     return block if isinstance(block, dict) else {}
 
 
+def deepseek_tools_url(api_base, name: str) -> str:
+    """DeepSeek tool endpoint under the configured deepseek_api_base."""
+    base = _conf_str(api_base, "https://api.deepseek.com/v1").rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    return f"{base}/v1/tools/{name}"
+
+
+def _conf_str(value, default: str = "") -> str:
+    """A stripped string config value; non-strings (hand-edited JSON) and blanks give ``default``."""
+    return (value.strip() if isinstance(value, str) else "") or default
+
+
 def _get_api_key(provider: str) -> str:
     """Resolve API key for a provider, with conf -> env fallback."""
     if provider == "bocha":
-        key = (_tools_web_search_conf().get("bocha_api_key") or "").strip()
+        key = _conf_str(_tools_web_search_conf().get("bocha_api_key"), "")
         return key or os.environ.get("BOCHA_API_KEY", "").strip()
     if provider == "zhipu":
-        key = (conf().get("zhipu_ai_api_key") or "").strip()
+        key = _conf_str(conf().get("zhipu_ai_api_key"), "")
         return key or os.environ.get("ZHIPUAI_API_KEY", "").strip()
     if provider == "qianfan":
-        key = (conf().get("qianfan_api_key") or "").strip()
+        key = _conf_str(conf().get("qianfan_api_key"), "")
         return key or os.environ.get("QIANFAN_API_KEY", "").strip()
+    if provider == "cowagent":
+        from models.cowagent_provider import resolve_cowagent_credentials
+        return resolve_cowagent_credentials()[0]
     if provider == "linkai":
-        key = (conf().get("linkai_api_key") or "").strip()
+        key = _conf_str(conf().get("linkai_api_key"), "")
         return key or os.environ.get("LINKAI_API_KEY", "").strip()
+    if provider == "deepseek":
+        key = _conf_str(conf().get("deepseek_api_key"), "")
+        return key or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    if provider == "anysearch":
+        key = _conf_str(_tools_web_search_conf().get("anysearch_api_key"), "")
+        return key or os.environ.get("ANYSEARCH_API_KEY", "").strip()
+    if provider == "serply":
+        key = _conf_str(_tools_web_search_conf().get("serply_api_key"), "")
+        return key or os.environ.get("SERPLY_API_KEY", "").strip()
+    if provider == "tavily":
+        key = _conf_str(_tools_web_search_conf().get("tavily_api_key"), "")
+        return key or os.environ.get("TAVILY_API_KEY", "").strip()
+    if provider == "outcrawl":
+        key = _conf_str(_tools_web_search_conf().get("outcrawl_api_key"), "")
+        return key or os.environ.get("OUTCRAWL_API_KEY", "").strip()
+    if provider == "firecrawl":
+        key = _conf_str(_tools_web_search_conf().get("firecrawl_api_key"), "")
+        return key or os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if provider == "context":
+        key = _conf_str(_tools_web_search_conf().get("context_api_key"), "")
+        return key or os.environ.get("CONTEXT_DEV_API_KEY", "").strip()
+    if provider == "specstream":
+        key = _conf_str(_tools_web_search_conf().get("specstream_api_key"), "")
+        return key or os.environ.get("SPECSTREAM_API_KEY", "").strip()
+    if provider == "olostep":
+        key = _conf_str(_tools_web_search_conf().get("olostep_api_key"), "")
+        return key or os.environ.get("OLOSTEP_API_KEY", "").strip()
+    if provider == "searchapi":
+        key = _conf_str(_tools_web_search_conf().get("searchapi_api_key"), "")
+        return key or os.environ.get("SEARCHAPI_API_KEY", "").strip()
+    if provider == "keenable":
+        key = _conf_str(_tools_web_search_conf().get("keenable_api_key"), "")
+        return key or os.environ.get("KEENABLE_API_KEY", "").strip()
     return ""
 
 
-def configured_providers() -> List[str]:
-    """Return configured providers in canonical order."""
-    return [p for p in PROVIDER_ORDER if _get_api_key(p)]
+def anonymous_opt_in(value) -> bool:
+    """Whether a config value explicitly enables keyless search. Anything not
+    clearly "on" (e.g. the string "false") stays off, since it sends queries
+    to a third party."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
 
+
+def _anysearch_anonymous_enabled() -> bool:
+    """Check if AnySearch anonymous mode is enabled via config."""
+    return anonymous_opt_in(_tools_web_search_conf().get("anysearch_anonymous"))
+
+
+def _keenable_anonymous_enabled() -> bool:
+    """Check if Keenable anonymous (keyless) mode is enabled via config."""
+    return anonymous_opt_in(_tools_web_search_conf().get("keenable_anonymous"))
+
+
+def _get_searxng_url() -> str:
+    """Resolve SearXNG instance URL from config or environment."""
+    url = _conf_str(_tools_web_search_conf().get("searxng_url"), "")
+    return url or os.environ.get("SEARXNG_URL", "").strip()
+
+
+def parse_provider_list(raw) -> List[str]:
+    """Normalize a provider list config value (list, or comma-separated string)."""
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list):
+        return []
+    return [p.strip().lower() for p in raw if isinstance(p, str) and p.strip()]
+
+
+def disabled_providers() -> List[str]:
+    """Providers the user switched off for search while keeping their credential."""
+    return parse_provider_list(_tools_web_search_conf().get("disabled_providers"))
+
+
+def configured_providers() -> List[str]:
+    """Configured providers in canonical order. anysearch and keenable qualify
+    with a real key OR an explicit anonymous opt-in (still last in fallback
+    order); nothing goes keyless unless the user turned it on. searxng
+    qualifies when an instance URL is configured. Providers listed in
+    tools.web_search.disabled_providers are skipped."""
+    disabled = set(disabled_providers())
+    result = []
+    for p in PROVIDER_ORDER:
+        if p in disabled:
+            continue
+        if _get_api_key(p):
+            result.append(p)
+        elif p == "anysearch" and _anysearch_anonymous_enabled():
+            result.append(p)
+        elif p == "searxng" and _get_searxng_url():
+            result.append(p)
+        elif p == "keenable" and _keenable_anonymous_enabled():
+            result.append(p)
+    return result
 
 def _configured_strategy() -> str:
-    return (_tools_web_search_conf().get("strategy") or "auto").strip().lower()
+    return _conf_str(_tools_web_search_conf().get("strategy"), "auto").lower()
 
 
 def _configured_provider() -> str:
-    return (_tools_web_search_conf().get("provider") or "").strip().lower()
+    return _conf_str(_tools_web_search_conf().get("provider"), "").lower()
 
 
 class WebSearch(BaseTool):
@@ -107,12 +269,16 @@ class WebSearch(BaseTool):
                 "description": (
                     "Time range filter. Options: "
                     "'noLimit' (default), 'oneDay', 'oneWeek', 'oneMonth', 'oneYear', "
-                    "or date range like '2025-01-01..2025-02-01'"
+                    "or date range like '2025-01-01..2025-02-01'. "
+                    "Honored by bocha/zhipu/qianfan/linkai/deepseek/keenable; ignored by anysearch. "
+                    "DeepSeek has no native freshness parameter, so it is translated into the "
+                    "documented after:/before: query operators."
                 )
             },
             "summary": {
                 "type": "boolean",
-                "description": "Whether to include text summary for each result (default: false)"
+                "description": "Whether to include text summary for each result (default: false). "
+                               "Bocha/linkai/deepseek/keenable only; ignored by anysearch."
             }
         },
         "required": ["query"]
@@ -123,7 +289,8 @@ class WebSearch(BaseTool):
 
     @staticmethod
     def is_available() -> bool:
-        """Tool is offered to the agent when at least one provider has a key."""
+        """Tool is offered to the agent when at least one provider has a key
+        or an explicit anonymous opt-in (anysearch_anonymous / keenable_anonymous)."""
         return bool(configured_providers())
 
     def get_json_schema(self) -> dict:
@@ -159,6 +326,9 @@ class WebSearch(BaseTool):
         Priority: caller-supplied (if configured) > fixed strategy (if
         configured) > first configured in PROVIDER_ORDER. Silent fallback
         when the desired one has no key.
+
+        anysearch/keenable only count as configured when they have a key or
+        their explicit anonymous opt-in, so neither is guaranteed to be here.
         """
         available = configured_providers()
         if not available:
@@ -177,6 +347,8 @@ class WebSearch(BaseTool):
             if pinned:
                 logger.warning(f"[WebSearch] pinned provider '{pinned}' unavailable, falling back to auto")
 
+        # available is already in canonical priority order, so its first entry
+        # is the highest-priority configured provider.
         return available[0]
 
     @staticmethod
@@ -206,10 +378,13 @@ class WebSearch(BaseTool):
 
         requested = args.get("provider")
         provider = self._resolve_provider(requested)
+        # Reachable on a fresh install where nothing is configured and no
+        # anonymous tier was opted into; guards the dispatch below.
         if not provider:
             return ToolResult.fail(
                 "Error: No search provider configured. "
-                "Configure one of BOCHA_API_KEY / zhipu_ai_api_key / qianfan_api_key / linkai_api_key."
+                "Configure one of BOCHA_API_KEY / zhipu_ai_api_key / qianfan_api_key / linkai_api_key / "
+                "deepseek_api_key / anysearch_api_key / SERPLY_API_KEY / TAVILY_API_KEY / OUTCRAWL_API_KEY / FIRECRAWL_API_KEY / CONTEXT_DEV_API_KEY / SPECSTREAM_API_KEY / OLOSTEP_API_KEY / SEARCHAPI_API_KEY / SEARXNG_URL."
             )
 
         # Always log the routing decision so multi-provider deployments can
@@ -229,8 +404,34 @@ class WebSearch(BaseTool):
                 return self._search_zhipu(query, count, freshness)
             if provider == "qianfan":
                 return self._search_qianfan(query, count, freshness)
+            if provider == "cowagent":
+                return self._search_cowagent(query, count, freshness, summary)
             if provider == "linkai":
                 return self._search_linkai(query, count, freshness)
+            if provider == "deepseek":
+                return self._search_deepseek(query, count, freshness, summary)
+            if provider == "anysearch":
+                return self._search_anysearch(query, count, freshness, summary)
+            if provider == "serply":
+                return self._search_serply(query, count)
+            if provider == "tavily":
+                return self._search_tavily(query, count)
+            if provider == "outcrawl":
+                return self._search_outcrawl(query, count)
+            if provider == "firecrawl":
+                return self._search_firecrawl(query, count)
+            if provider == "context":
+                return self._search_context(query, count)
+            if provider == "specstream":
+                return self._search_specstream(query, count)
+            if provider == "olostep":
+                return self._search_olostep(query, count)
+            if provider == "searchapi":
+                return self._search_searchapi(query, count)
+            if provider == "searxng":
+                return self._search_searxng(query, count)
+            if provider == "keenable":
+                return self._search_keenable(query, count, freshness, summary)
             return ToolResult.fail(f"Error: Unknown provider '{provider}'")
         except requests.Timeout:
             return ToolResult.fail(f"Error: Search request timed out after {DEFAULT_TIMEOUT}s")
@@ -272,7 +473,8 @@ class WebSearch(BaseTool):
             msg = data.get("msg") or "Unknown error"
             return ToolResult.fail(f"Error: bocha API error (code={api_code}): {msg}")
 
-        pages = (data.get("data") or {}).get("webPages", {}).get("value", []) or []
+        # No-result queries come back with "webPages": null, not a missing key.
+        pages = ((data.get("data") or {}).get("webPages") or {}).get("value", []) or []
         results = []
         for p in pages:
             item = {
@@ -285,7 +487,7 @@ class WebSearch(BaseTool):
             if p.get("summary"):
                 item["summary"] = p["summary"]
             results.append(item)
-        total = (data.get("data") or {}).get("webPages", {}).get("totalEstimatedMatches", len(results))
+        total = ((data.get("data") or {}).get("webPages") or {}).get("totalEstimatedMatches", len(results))
         return ToolResult.success({
             "query": query, "backend": "bocha",
             "total": total, "count": len(results), "results": results,
@@ -307,7 +509,7 @@ class WebSearch(BaseTool):
         # Zhipu Web Search expects `search_query` <= 70 chars; truncate
         # gracefully so a long agent-supplied query doesn't get rejected.
         trimmed_query = (query or "")[:70]
-        engine = (_tools_web_search_conf().get("zhipu_search_engine") or "search_pro").strip().lower()
+        engine = _conf_str(_tools_web_search_conf().get("zhipu_search_engine"), "search_pro").lower()
         if engine not in ("search_std", "search_pro", "search_pro_sogou", "search_pro_quark"):
             engine = "search_pro"
 
@@ -320,7 +522,7 @@ class WebSearch(BaseTool):
                 "oneDay", "oneWeek", "oneMonth", "oneYear", "noLimit"
             ) else "noLimit",
         }
-        content_size = (_tools_web_search_conf().get("zhipu_content_size") or "").strip().lower()
+        content_size = _conf_str(_tools_web_search_conf().get("zhipu_content_size"), "").lower()
         if content_size in ("medium", "high"):
             payload["content_size"] = content_size
 
@@ -483,4 +685,799 @@ class WebSearch(BaseTool):
         return ToolResult.success({
             "query": query, "backend": "linkai",
             "total": 1, "count": 1, "results": [{"content": str(raw)}],
+        })
+
+    # ------------------------------------------------------------------
+    # CowAgent (POST {api_base}/search)
+    # ------------------------------------------------------------------
+
+    def _search_cowagent(self, query: str, count: int, freshness: str, summary: bool) -> ToolResult:
+        from models.cowagent_provider import resolve_cowagent_credentials
+        api_key, api_base = resolve_cowagent_credentials()
+        payload = {
+            "query": query,
+            "count": max(1, min(int(count or 10), 50)),
+            "freshness": freshness or "noLimit",
+            "summary": bool(summary),
+        }
+        logger.debug(f"[WebSearch] cowagent: query='{query}', count={payload['count']}")
+        resp = requests.post(
+            f"{api_base}/search",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        if resp.status_code != 200:
+            err = data.get("error") if isinstance(data, dict) else None
+            msg = err.get("message") if isinstance(err, dict) else ""
+            if resp.status_code == 401:
+                return ToolResult.fail(f"Error: Invalid CowAgent API key. {msg}".rstrip())
+            return ToolResult.fail(f"Error: CowAgent API returned HTTP {resp.status_code}. {msg}".rstrip())
+
+        results = []
+        for p in (data.get("results") or []) if isinstance(data, dict) else []:
+            item = {
+                "title": p.get("title", ""),
+                "url": p.get("url", ""),
+                "snippet": p.get("snippet", ""),
+                "siteName": p.get("site_name", ""),
+                "datePublished": p.get("published_at", ""),
+            }
+            if p.get("summary"):
+                item["summary"] = p["summary"]
+            results.append(item)
+        return ToolResult.success({
+            "query": query, "backend": "cowagent",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # DeepSeek (official Search API)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _deepseek_build_query(query: str, freshness: str) -> str:
+        """Translate the shared freshness vocabulary into DeepSeek's query
+        operators. The Search API has no freshness parameter; the docs define
+        after:/before: operators (YYYY or YYYY-MM-DD), so the time filter is
+        appended to the query instead of being dropped silently."""
+        if not freshness or freshness == "noLimit":
+            return query
+        delta_days = {"oneDay": 1, "oneWeek": 7, "oneMonth": 30, "oneYear": 365}.get(freshness)
+        if delta_days:
+            from datetime import datetime, timedelta
+            after = (datetime.now() - timedelta(days=delta_days)).strftime("%Y-%m-%d")
+            return f"{query} after:{after}"
+        start, sep, end = freshness.partition("..")
+        if sep and start.strip() and end.strip():
+            return f"{query} after:{start.strip()} before:{end.strip()}"
+        return query
+
+    def _search_deepseek(self, query: str, count: int, freshness: str, summary: bool) -> ToolResult:
+        api_key = _get_api_key("deepseek")
+        url = deepseek_tools_url(conf().get("deepseek_api_base"), "search")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "query": self._deepseek_build_query(query, freshness),
+            "count": max(1, min(int(count or 10), 50)),
+        }
+
+        logger.debug(f"[WebSearch] deepseek: query='{payload['query']}', count={payload['count']}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid DeepSeek API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: DeepSeek API — insufficient balance. Top up at https://platform.deepseek.com")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: DeepSeek Search API rate limit reached (5 QPS per account).")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: DeepSeek Search API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        # Business-level errors use the OpenAI-compatible {"error": {...}}
+        # envelope, with param always null.
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"] or {}
+            return ToolResult.fail(f"Error: DeepSeek Search returned {err.get('code')}: {err.get('message', '')}")
+
+        items = data.get("results") or []
+        results = []
+        for it in items:
+            item = {
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "snippet": it.get("snippet", ""),
+                "siteName": it.get("site_name") or "",
+                "datePublished": it.get("date") or "",
+                # DeepSeek-specific signals, kept for callers that want them.
+                "authority": it.get("authority"),
+                "rerank_score": it.get("rerank_score"),
+            }
+            # The API always returns a long summary; only surface it when the
+            # caller asked for summaries, matching the shared `summary` flag.
+            if summary and it.get("summary"):
+                item["summary"] = it["summary"]
+            results.append(item)
+        return ToolResult.success({
+            "query": query, "backend": "deepseek",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    def _search_anysearch(self, query: str, count: int, freshness: str = "noLimit", summary: bool = False) -> ToolResult:
+        if freshness and freshness != "noLimit":
+            logger.warning(f"[WebSearch] anysearch does not support freshness ({freshness!r}); ignoring")
+        if summary:
+            logger.warning("[WebSearch] anysearch does not support summary; ignoring")
+        api_key = _get_api_key("anysearch")
+        url = "https://api.anysearch.com/v1/search"
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        # AnySearch also serves anonymous traffic with a daily free quota, so
+        # the Authorization header is only sent when a key is configured.
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        # AnySearch accepts 1-10 results; the shared tool schema allows 1-10.
+        max_results = max(1, min(int(count or 10), 10))
+        payload = {"query": query, "max_results": max_results, "format": "json"}
+        zone = _conf_str(_tools_web_search_conf().get("anysearch_zone"), "").lower()
+        if zone in ("cn", "intl"):
+            payload["zone"] = zone
+        # Forward any configured language; the API validates it. Whitelisting
+        # only zh-CN/en silently dropped every other language the user set.
+        language = _conf_str(_tools_web_search_conf().get("anysearch_language"), "")
+        if language:
+            payload["language"] = language
+        logger.debug(f"[WebSearch] anysearch: query='{query}', max_results={max_results}, has_key={bool(api_key)}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        # request_id is echoed in a response header and/or the JSON body.
+        # Capture it up front so every branch - including the error returns
+        # below - can surface it for support and log correlation. Only a
+        # non-empty string counts; an object/list/number id is ignored.
+        def _clean_request_id(value: Any) -> Optional[str]:
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        request_id = _clean_request_id(resp.headers.get("X-Request-ID"))
+        if not request_id:
+            try:
+                peek = resp.json()
+                request_id = _clean_request_id(peek.get("request_id")) if isinstance(peek, dict) else None
+            except ValueError:
+                request_id = None
+
+        def _fail(message: str) -> ToolResult:
+            """Fail, attaching request_id when the API provided one."""
+            if request_id:
+                return ToolResult.fail(
+                    f"{message} (request_id: {request_id})",
+                    ext_data={"request_id": request_id},
+                )
+            return ToolResult.fail(message)
+
+        if resp.status_code == 401:
+            if api_key:
+                return _fail("Error: Invalid AnySearch API key.")
+            return _fail(
+                "Error: AnySearch authentication failed. Try configuring an API key at https://anysearch.com")
+        if resp.status_code == 402:
+            if api_key:
+                return _fail("Error: AnySearch quota exhausted. Check usage at https://anysearch.com")
+            return _fail(
+                "Error: AnySearch anonymous quota exhausted. Configure an API key at https://anysearch.com for higher limits.")
+        if resp.status_code == 429:
+            return _fail("Error: AnySearch API rate limit reached.")
+        if resp.status_code != 200:
+            return _fail(f"Error: AnySearch API returned HTTP {resp.status_code}")
+
+        # A 200 does not guarantee a well-formed body; validate the documented
+        # envelope instead of degrading a malformed reply to empty results.
+        try:
+            data = resp.json()
+        except ValueError:
+            return _fail("Error: AnySearch API returned a non-JSON response.")
+        if not isinstance(data, dict):
+            return _fail("Error: AnySearch API returned a malformed response (expected a JSON object).")
+        request_id = request_id or _clean_request_id(data.get("request_id"))
+
+        # Success is business code 0. A missing or non-integer code is
+        # malformed; reject bool explicitly since it is an int subclass, so
+        # code=false does not slip through as 0.
+        api_code = data.get("code")
+        if isinstance(api_code, bool) or not isinstance(api_code, int):
+            return _fail("Error: AnySearch API returned a malformed response (missing or invalid 'code').")
+        if api_code != 0:
+            msg = data.get("message") or "Unknown error"
+            return _fail(f"Error: AnySearch API error (code={api_code}): {msg}")
+
+        # data must be an object carrying a results list; data:null or a wrong
+        # type is malformed rather than an empty result set.
+        body = data.get("data")
+        if not isinstance(body, dict):
+            return _fail("Error: AnySearch API returned a malformed response (missing 'data').")
+        raw_results = body.get("results")
+        if not isinstance(raw_results, list):
+            return _fail("Error: AnySearch API returned a malformed response ('data.results' is not a list).")
+
+        # Normalize each entry defensively: an item is usable only if it has
+        # a non-empty string url (the minimum identity of a search hit). Text
+        # fields present but not strings are treated as absent rather than
+        # trusted, so url:[], title:{} or a numeric/object content can neither
+        # leak a wrong type nor crash the snippet slice.
+        def _normalize_item(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+            url = item.get("url")
+            if not isinstance(url, str) or not url.strip():
+                return None
+            title = item.get("title")
+            snippet = item.get("snippet")
+            if not (isinstance(snippet, str) and snippet):
+                content = item.get("content")
+                snippet = content[:200] if isinstance(content, str) else ""
+            return {
+                "title": title if isinstance(title, str) else "",
+                "url": url,
+                "snippet": snippet,
+            }
+
+        normalized_all = []
+        for it in raw_results:
+            if not isinstance(it, dict):
+                continue
+            normalized = _normalize_item(it)
+            if normalized is not None:
+                normalized_all.append(normalized)
+
+        # A non-empty results list that yields nothing usable is malformed, not
+        # an empty result set; surface it instead of a misleading 0-hit success.
+        if raw_results and not normalized_all:
+            return _fail("Error: AnySearch API returned a malformed response (no usable results).")
+        # Partial drops are tolerated so a few bad rows never sink a good
+        # search, but the loss is reported instead of vanishing silently.
+        invalid_dropped = len(raw_results) - len(normalized_all)
+
+        # The API is documented to honour max_results, but never trust upstream
+        # to stay within it: trim the usable hits down to what was requested so
+        # `count` keeps meaning "rows in this response".
+        results = normalized_all[:max_results]
+        truncated_count = len(normalized_all) - len(results)
+
+        # metadata is optional and best-effort: a wrong-typed block (string,
+        # list, ...) must not fail an otherwise valid search, so treat anything
+        # that is not an object as absent.
+        meta = body.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+
+        # total_results feeds a count shown to the user; ignore negatives and
+        # non-integers (bool included) and fall back to the number of hits.
+        total = meta.get("total_results")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            total = len(results)
+
+        result = {
+            "query": query,
+            "backend": "anysearch",
+            "total": total,
+            "count": len(results),
+            "results": results,
+        }
+        if invalid_dropped:
+            result["dropped_count"] = invalid_dropped
+        if truncated_count:
+            result["truncated_count"] = truncated_count
+
+        if request_id:
+            result["request_id"] = request_id
+        # Only surface a finite, non-negative numeric latency; drop bool, NaN,
+        # Infinity and bad types.
+        search_time_ms = meta.get("search_time_ms")
+        if (isinstance(search_time_ms, (int, float))
+                and not isinstance(search_time_ms, bool)
+                and math.isfinite(search_time_ms)
+                and search_time_ms >= 0):
+            result["search_time_ms"] = search_time_ms
+
+        return ToolResult.success(result)
+
+    # ------------------------------------------------------------------
+    # Serply
+    # ------------------------------------------------------------------
+
+    def _search_serply(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("serply")
+        path = urlencode({"q": query, "num": max(1, min(int(count or 10), 50))})
+        headers = {
+            "X-Api-Key": api_key,
+            "Accept": "application/json",
+            # Serply sits behind Cloudflare, which rejects the default
+            # requests User-Agent, so send an explicit one.
+            "User-Agent": "CowAgent",
+        }
+
+        logger.debug(f"[WebSearch] serply: query='{query}', count={count}")
+        resp = requests.get(f"https://api.serply.io/v1/search/{path}", headers=headers, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Serply API key.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Serply API rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Serply API returned HTTP {resp.status_code}")
+
+        data = resp.json()
+        items = data.get("results") or []
+        results = []
+        for it in items:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("link", ""),
+                "snippet": it.get("description", ""),
+            })
+        return ToolResult.success({
+            "query": query, "backend": "serply",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # Keenable
+    # ------------------------------------------------------------------
+
+    def _search_keenable(self, query: str, count: int, freshness: str, summary: bool) -> ToolResult:
+        api_key = _get_api_key("keenable")
+        # Keenable serves anonymous traffic on a public endpoint that wants an
+        # app title instead of a key (rate limited per IP: 10 requests/s,
+        # 1000/hour). Reaching this branch without a key means the user set
+        # keenable_anonymous. A key switches to the authenticated endpoint,
+        # which only lifts those limits.
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Keenable-Title": "cowagent",
+        }
+        if api_key:
+            url = "https://api.keenable.ai/v1/search"
+            headers["X-API-Key"] = api_key
+        else:
+            url = "https://api.keenable.ai/v1/search/public"
+
+        payload: Dict[str, Any] = {
+            "query": query,
+            "max_results": max(1, min(int(count or 10), 50)),
+            # A hint, not a hard cap: the API rounds up to a word boundary.
+            "snippet_max_length": 1000 if summary else 300,
+        }
+        payload.update(self._keenable_build_freshness_filter(freshness))
+
+        logger.debug(
+            f"[WebSearch] keenable: query='{query}', max_results={payload['max_results']}, keyed={bool(api_key)}"
+        )
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Keenable API key.")
+        if resp.status_code == 429:
+            hint = "" if api_key else " Set keenable_api_key / KEENABLE_API_KEY to lift the keyless limit."
+            return ToolResult.fail(f"Error: Keenable API rate limit reached.{hint}")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Keenable API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        results = []
+        for it in data.get("results") or []:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                # `snippet` carries the page text; `description` is usually empty.
+                "snippet": it.get("snippet") or it.get("description") or "",
+                "datePublished": it.get("published_at") or "",
+            })
+        return ToolResult.success({
+            "query": query, "backend": "keenable",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    @staticmethod
+    def _keenable_build_freshness_filter(freshness: str) -> Dict[str, str]:
+        """Translate the shared freshness vocabulary into Keenable's
+        `published_after` / `published_before` (YYYY-MM-DD) request fields.
+        Accepts the named tokens and the `2025-01-01..2025-02-01` range form."""
+        if not freshness or freshness == "noLimit":
+            return {}
+        delta_days = {"oneDay": 1, "oneWeek": 7, "oneMonth": 30, "oneYear": 365}.get(freshness)
+        if delta_days:
+            from datetime import datetime, timedelta
+            return {"published_after": (datetime.now() - timedelta(days=delta_days)).strftime("%Y-%m-%d")}
+        start, sep, end = freshness.partition("..")
+        if sep and start.strip() and end.strip():
+            return {"published_after": start.strip(), "published_before": end.strip()}
+        return {}
+
+    # ------------------------------------------------------------------
+    # Tavily
+    # ------------------------------------------------------------------
+
+    def _search_tavily(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("tavily")
+        url = "https://api.tavily.com/search"
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        max_results = max(1, min(int(count or 10), 20))
+        search_depth = _conf_str(_tools_web_search_conf().get("tavily_search_depth"), "basic").lower()
+        if search_depth not in ("basic", "advanced"):
+            search_depth = "basic"
+
+        payload: Dict[str, Any] = {
+            "api_key": api_key,
+            "query": query,
+            "max_results": max_results,
+            "search_depth": search_depth,
+            "include_answer": False,
+        }
+
+        logger.debug(f"[WebSearch] tavily: query='{query}', max_results={max_results}, depth={search_depth}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Tavily API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: Tavily API quota exhausted. Check usage at https://tavily.com")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Tavily API rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Tavily API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        items = data.get("results") or []
+        results = []
+        for it in items:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "snippet": it.get("content") or it.get("snippet", ""),
+                "siteName": it.get("source") or "",
+                "score": it.get("score"),
+            })
+        return ToolResult.success({
+            "query": query, "backend": "tavily",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # Outcrawl
+    # ------------------------------------------------------------------
+
+    def _search_outcrawl(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("outcrawl")
+        url = "https://api.outcrawl.ai/v1/search"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        limit = max(1, min(int(count or 10), 20))
+        payload: Dict[str, Any] = {"query": query, "limit": limit}
+
+        logger.debug(f"[WebSearch] outcrawl: query='{query}', limit={limit}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Outcrawl API key.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Outcrawl API rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Outcrawl API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        results = []
+        for it in data.get("hits") or []:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "snippet": it.get("snippet", ""),
+            })
+        return ToolResult.success({
+            "query": query, "backend": "outcrawl",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # Firecrawl
+    # ------------------------------------------------------------------
+
+    def _search_firecrawl(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("firecrawl")
+        url = "https://api.firecrawl.dev/v2/search"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        limit = max(1, min(int(count or 10), 20))
+        payload: Dict[str, Any] = {"query": query, "limit": limit, "origin": "cowagent"}
+
+        logger.debug(f"[WebSearch] firecrawl: query='{query}', limit={limit}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Firecrawl API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: Firecrawl API credits exhausted.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Firecrawl API rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Firecrawl API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        if data.get("success") is False:
+            return ToolResult.fail(f"Error: Firecrawl API error: {data.get('error') or 'unknown error'}")
+        results = []
+        for it in (data.get("data") or {}).get("web") or []:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "snippet": it.get("description", ""),
+            })
+        return ToolResult.success({
+            "query": query, "backend": "firecrawl",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # Context.dev
+    # ------------------------------------------------------------------
+
+    def _search_context(self, query: str, count: int) -> ToolResult:
+        if len(query) > 500:
+            return ToolResult.fail("Error: Context.dev search queries must be at most 500 characters.")
+        try:
+            resp = requests.post(
+                "https://api.context.dev/v1/web/search",
+                headers={"Authorization": f"Bearer {_get_api_key('context')}", "Content-Type": "application/json"},
+                json={
+                    "query": query, "numResults": count,
+                    "highlightsOptions": {"enabled": True, "maxCharacters": 1000},
+                    "timeoutOpts": {"milliseconds": 25000, "behavior": "fail"},
+                },
+                timeout=DEFAULT_TIMEOUT, allow_redirects=False,
+            )
+            if resp.status_code != 200:
+                reason = {
+                    401: "Invalid Context.dev API key.",
+                    402: "Context.dev API credits exhausted.",
+                    403: "Context.dev API access denied.",
+                    429: "Context.dev API rate limit reached.",
+                }.get(resp.status_code, f"Context.dev API returned HTTP {resp.status_code}.")
+                return ToolResult.fail(f"Error: {reason}")
+            data = resp.json()
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                return ToolResult.fail("Error: Context.dev returned an invalid search response.")
+            if data.get("partial", False) is not False:
+                return ToolResult.fail("Error: Context.dev returned incomplete search results. Try again.")
+            results = []
+            for item in data["results"][:count]:
+                if not isinstance(item, dict) or not isinstance(item.get("title"), str) or not isinstance(item.get("url"), str):
+                    return ToolResult.fail("Error: Context.dev returned an invalid search result.")
+                title, url = item["title"].strip(), item["url"].strip()
+                parsed_url = urlsplit(url)
+                if not title or parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password:
+                    return ToolResult.fail("Error: Context.dev returned an invalid source URL or title.")
+                highlights = item.get("highlights")
+                snippet = ""
+                if highlights is not None:
+                    if not isinstance(highlights, dict) or highlights.get("code") not in (
+                        "SUCCESS", "NOT_REQUESTED", "TIMEOUT", "CONTENT_TOO_LARGE", "WEBSITE_ACCESS_ERROR", "WEBSITE_BLOCKED", "ERROR",
+                    ):
+                        return ToolResult.fail("Error: Context.dev returned invalid Highlights.")
+                    if highlights["code"] == "SUCCESS":
+                        passages = highlights.get("highlights")
+                        if not isinstance(passages, list) or any(not isinstance(passage, str) for passage in passages):
+                            return ToolResult.fail("Error: Context.dev returned invalid Highlights.")
+                        snippet = "\n".join(passage.strip() for passage in passages).strip()
+                if not snippet:
+                    description = item.get("description")
+                    if description is not None and not isinstance(description, str):
+                        return ToolResult.fail("Error: Context.dev returned an invalid search description.")
+                    snippet = "[Highlights unavailable; search description only.] " + (description or "")
+                results.append({"title": title, "url": url, "snippet": snippet})
+            return ToolResult.success({
+                "query": query, "backend": "context",
+                "total": len(results), "count": len(results), "results": results,
+            })
+        except requests.Timeout:
+            return ToolResult.fail(f"Error: Context.dev search timed out after {DEFAULT_TIMEOUT}s.")
+        except Exception:
+            # Transport and validation exceptions can contain credentials or upstream payloads.
+            return ToolResult.fail("Error: Context.dev search failed. Check your API key and provider availability.")
+
+    # ------------------------------------------------------------------
+    # SpecStream
+    # ------------------------------------------------------------------
+
+    def _search_specstream(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("specstream")
+        url = "https://api.specstream.ai/v1/web-search"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+        # The API has no result-count parameter, so the list is trimmed here.
+        limit = max(1, min(int(count or 10), 20))
+
+        logger.debug(f"[WebSearch] specstream: query='{query}', limit={limit}")
+        resp = requests.get(url, headers=headers, params={"q": query}, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid SpecStream API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: SpecStream balance is empty. Add funds at https://specstream.ai")
+        if resp.status_code == 503:
+            retry_after = (resp.headers or {}).get("Retry-After")
+            suffix = f" Retry after {retry_after} seconds." if retry_after else ""
+            return ToolResult.fail(f"Error: SpecStream API is temporarily unavailable.{suffix}")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: SpecStream API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = (resp.json() or {}).get("data") or {}
+        results = []
+        for it in (data.get("sources") or [])[:limit]:
+            results.append({
+                "title": it.get("title") or "",
+                "url": it.get("url") or "",
+                "snippet": it.get("snippet") or "",
+                "siteName": it.get("site") or "",
+                "datePublished": it.get("published") or "",
+            })
+        return ToolResult.success({
+            "query": query, "backend": "specstream",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # Olostep
+    # ------------------------------------------------------------------
+
+    def _search_olostep(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("olostep")
+        url = "https://api.olostep.com/v1/searches"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        # The API accepts a limit of 1 to 25 and answers HTTP 400 above that.
+        limit = max(1, min(int(count or 10), 25))
+        payload: Dict[str, Any] = {"query": query, "limit": limit}
+
+        logger.debug(f"[WebSearch] olostep: query='{query}', limit={limit}")
+        resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Olostep API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: Olostep API key is invalid or out of credits. Check https://www.olostep.com/dashboard")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Olostep API rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Olostep API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = (resp.json() or {}).get("result") or {}
+        results = []
+        for it in data.get("links") or []:
+            results.append({
+                "title": it.get("title") or "",
+                "url": it.get("url") or "",
+                "snippet": it.get("description") or "",
+            })
+        return ToolResult.success({
+            "query": query, "backend": "olostep",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # SearchApi
+    # ------------------------------------------------------------------
+
+    def _search_searchapi(self, query: str, count: int) -> ToolResult:
+        api_key = _get_api_key("searchapi")
+        url = "https://www.searchapi.io/api/v1/search"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+        # Google no longer honors a per-request result count, so the API
+        # returns one page (about 10 organic results) and the list is trimmed
+        # here. Only engine and q are sent; the key never travels in the URL.
+        limit = max(1, min(int(count or 10), 50))
+
+        logger.debug(f"[WebSearch] searchapi: query='{query}', limit={limit}")
+        resp = requests.get(url, headers=headers, params={"engine": "google", "q": query}, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid SearchApi API key.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: SearchApi rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: SearchApi returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json() or {}
+        results = []
+        for it in (data.get("organic_results") or [])[:limit]:
+            results.append({
+                "title": it.get("title") or "",
+                "url": it.get("link") or "",
+                "snippet": it.get("snippet") or "",
+                "siteName": it.get("source") or "",
+                "datePublished": it.get("date") or "",
+            })
+        return ToolResult.success({
+            "query": query, "backend": "searchapi",
+            "total": len(results), "count": len(results), "results": results,
+        })
+
+    # ------------------------------------------------------------------
+    # SearXNG (self-hosted meta search engine)
+    # ------------------------------------------------------------------
+
+    def _search_searxng(self, query: str, count: int) -> ToolResult:
+        base_url = _get_searxng_url().rstrip("/")
+        if not base_url:
+            return ToolResult.fail("Error: SearXNG instance URL not configured. Set tools.web_search.searxng_url or SEARXNG_URL.")
+
+        params = {
+            "q": query,
+            "format": "json",
+            "pageno": 1,
+        }
+        language = _conf_str(_tools_web_search_conf().get("searxng_language"), "")
+        if language:
+            params["language"] = language
+        categories = _conf_str(_tools_web_search_conf().get("searxng_categories"), "general")
+        if categories:
+            params["categories"] = categories
+
+        url = f"{base_url}/search?{urlencode(params)}"
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "CowAgent",
+        }
+
+        logger.debug(f"[WebSearch] searxng: query='{query}', instance={base_url}")
+        resp = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: SearXNG instance requires authentication.")
+        if resp.status_code == 403:
+            return ToolResult.fail("Error: SearXNG instance access forbidden. Check instance CORS/API settings.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: SearXNG rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: SearXNG returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            return ToolResult.fail("Error: SearXNG returned non-JSON response. Ensure the instance supports format=json.")
+
+        items = data.get("results") or []
+        results = []
+        for it in items[:max(1, min(int(count or 10), 50))]:
+            results.append({
+                "title": it.get("title", ""),
+                "url": it.get("url", ""),
+                "snippet": it.get("content") or it.get("snippet", ""),
+                "siteName": it.get("engine") or it.get("source") or "",
+                "score": it.get("score"),
+            })
+        return ToolResult.success({
+            "query": query, "backend": "searxng",
+            "total": len(results), "count": len(results), "results": results,
         })

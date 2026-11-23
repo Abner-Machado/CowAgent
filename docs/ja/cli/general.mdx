@@ -1,6 +1,6 @@
 ---
 title: 汎用コマンド
-description: ステータスの確認、設定管理、コンテキスト制御などのよく使うコマンド
+description: "help、status、cancel、steer、config、context などよく使うコマンド。チャットでは /、ターミナルでは cow を付けて実行し、状態確認や設定変更に使います。"
 ---
 
 以下のコマンドはチャットで `/` プレフィックス、ターミナルで `cow` プレフィックスで使用できます（一部はチャット専用）。
@@ -19,7 +19,7 @@ description: ステータスの確認、設定管理、コンテキスト制御�
 
 ## status
 
-現在のセッションとサービスの実行状態を表示します。プロセス情報、モデル設定、メッセージ数、読み込み済みスキル数を含みます。
+現在のセッションとサービスの実行状態を表示します。プロセス情報、モデル設定、メッセージ数、読み込み済みスキル数、読み込み済み MCP サーバー数（準備済み/設定済み）を含みます。
 
 ```text
 /status
@@ -62,17 +62,17 @@ Web コンソールでは、応答の実行中に指示を入力して「Steer a
 **設定項目を変更：**
 
 ```text
-/config model deepseek-v4-flash
+/config model deepseek-flash
 ```
 
 **変更可能な設定項目：**
 
 | 項目 | 説明 | 例 |
 | --- | --- | --- |
-| `model` | AI モデル名 | `deepseek-v4-flash` |
-| `agent_max_context_tokens` | 最大コンテキストトークン数 | `40000` |
+| `model` | AI モデル名 | `deepseek-flash` |
+| `agent_max_context_tokens` | 最大コンテキストトークン数 | `200000` |
 | `agent_max_context_turns` | 最大コンテキスト記憶ターン数 | `30` |
-| `agent_max_steps` | タスクごとの最大判断ステップ数 | `15` |
+| `agent_max_steps` | タスクごとの最大判断ステップ数 | `100` |
 | `enable_thinking` | ディープシンキングモードの有効化 | `true` / `false` |
 
 <Note>

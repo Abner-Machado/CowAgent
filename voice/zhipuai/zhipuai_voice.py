@@ -8,6 +8,8 @@ import requests
 
 from bridge.reply import Reply, ReplyType
 from common.log import logger
+from common.media_download import MediaTooLargeError, read_response
+from common.tmp_dir import TmpDir
 from config import conf
 from voice import audio_convert
 from voice.voice import Voice
@@ -100,7 +102,7 @@ class ZhipuAIVoice(Voice):
                 "Content-Type": "application/json",
             }
             response = requests.post(
-                url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT
+                url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT, stream=True
             )
 
             if response.status_code != 200:
@@ -108,6 +110,7 @@ class ZhipuAIVoice(Voice):
                     f"[ZhipuAIVoice] textToVoice failed: status={response.status_code} "
                     f"body={response.text[:500]} model={model} voice={voice_id}"
                 )
+                response.close()
                 return Reply(ReplyType.ERROR, "语音合成失败，请稍后再试")
 
             # Some errors come back as JSON / SSE with HTTP 200.
@@ -121,16 +124,24 @@ class ZhipuAIVoice(Voice):
                     f"[ZhipuAIVoice] textToVoice unexpected text response "
                     f"(content_type={ct}): {err}"
                 )
+                response.close()
                 return Reply(ReplyType.ERROR, "语音合成失败，请稍后再试")
 
-            audio_bytes = response.content
+            # Held in memory because the container is sniffed from the leading bytes.
+            try:
+                audio_bytes = read_response(response, MAX_FILE_BYTES)
+            except MediaTooLargeError:
+                logger.error(
+                    f"[ZhipuAIVoice] textToVoice audio too large: "
+                    f"over {MAX_FILE_BYTES} bytes, model={model}"
+                )
+                return Reply(ReplyType.ERROR, "语音合成失败，请稍后再试")
             ext = self._sniff_audio_ext(audio_bytes) or "wav"
 
             file_name = (
-                "tmp/" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                TmpDir().path() + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
                 + str(random.randint(0, 1000)) + "." + ext
             )
-            os.makedirs(os.path.dirname(file_name), exist_ok=True)
             with open(file_name, "wb") as f:
                 f.write(audio_bytes)
             logger.info(

@@ -50,7 +50,10 @@ module.exports = {
           2: 'var(--bg-surface-2)',
         },
         elevated: 'var(--bg-elevated)',
-        inset: 'var(--bg-inset)',
+        inset: {
+          DEFAULT: 'var(--bg-inset)',
+          2: 'var(--bg-inset-2)',
+        },
         content: {
           DEFAULT: 'var(--text-primary)',
           secondary: 'var(--text-secondary)',

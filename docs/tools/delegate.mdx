@@ -1,0 +1,85 @@
+---
+title: agent_delegate - Delegation
+description: "The agent_delegate tool lets one agent hand a task to another resident agent in a team session, which answers from its own workspace, memory and skills. Available only with two or more agents."
+---
+
+`agent_delegate` lets one Agent hand a task to another Agent in the session. The delegate is a persistent, full member with its own workspace, memory, skills, and sessions; it answers within its own environment, and the result returns to the caller rather than being sent to the user directly.
+
+This is the underlying capability behind [Agent team](/multi-agent/team) collaboration. For how a team is formed and how the lead Agent decides to delegate in a group chat, see the team documentation.
+
+<Note>
+`agent_delegate` appears only in a team session, that is, when the session has two or more enabled Agents. It is not visible in a single-Agent deployment.
+</Note>
+
+## Differences from Sub-Agents
+
+| | [Sub-Agent](/multi-agent/subagent) | Delegation |
+| --- | --- | --- |
+| Lifecycle | Created for one task, then discarded | Persistent Agent, configured in advance |
+| Workspace | Shared with the caller | Independent |
+| Memory | Has none of its own | Independent |
+| Identity | Anonymous | Appears in the Agent list, can bind to channels |
+
+Use a sub-Agent when you need to parallelize your own work. Use delegation only when the task genuinely belongs to someone else, that is, the Agent that owns that codebase, that knowledge base, or that customer relationship.
+
+## Synchronous Execution
+
+Delegation hands off the task, waits for the other Agent to answer, and then returns the reply. The call blocks until the other Agent finishes or the time budget runs out, so there is no status to poll and no handle to track.
+
+```
+agent_delegate(agent_id="research", task="...")
+  -> { status: "done", content: "..." }
+```
+
+Under the hood, this run is recorded in the target's workspace with the delegating run as its parent, so a delegation chain can be traced from either end.
+
+## Who Can Be Delegated To
+
+The eligible targets are the members of the current session. Delegation is always confined to the session and never hands a task to an Agent outside it, even if the allowlist would otherwise permit it. If the target is not a session member, the tool rejects the call and lists the targets that are actually available.
+
+## Parameters
+
+| Parameter | Description |
+| --- | --- |
+| `agent_id` | The ID of a session member |
+| `task` | A self-contained task description the other Agent can act on without seeing this session |
+
+## Boundaries
+
+Delegation happens between full Agents, so it comes with boundaries:
+
+| Boundary | Description |
+| --- | --- |
+| Membership | The target must be a member of the current session |
+| Allowlist | Who may reach whom; if unset, any Agent may delegate to any other |
+| Cycles | An Agent already in the chain cannot be delegated to again |
+| Depth | The maximum number of hops allowed in a chain |
+| Length | The upper limit on the text of a single task |
+| Time budget | The maximum time a single delegation run may take before it is abandoned |
+
+## Configuration
+
+```json
+{
+  "agent_delegation": {
+    "enabled": true,
+    "allowed_targets": {
+      "assistant": ["research", "support"],
+      "research": []
+    },
+    "max_depth": 3,
+    "timeout_seconds": 600,
+    "max_message_chars": 8000
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Set to `false`, or set the whole block to `false`, to not provide the tool at all |
+| `allowed_targets` | Unset | A mapping from a source Agent ID to the IDs it may reach, with `"*"` meaning any. If unset, all combinations are allowed. Targets are further confined to the members of the current session |
+| `max_depth` | `3` | The number of delegation hops in a chain (1-8) |
+| `timeout_seconds` | `600` | The time budget for a single delegation run (0.01-3600); a local run is cancelled when it expires |
+| `max_message_chars` | `8000` | The length limit for a single delegation task |
+
+An Agent configured with an empty array, like `"research"` above, can be delegated to but cannot delegate further.

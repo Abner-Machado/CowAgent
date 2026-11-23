@@ -1,13 +1,13 @@
 ---
 title: はじめに
-description: CowAgent - LLM を活用した AI スーパーアシスタント
+description: "CowAgent はオープンソースの AI スーパーアシスタント兼 Agent Harness です。タスクを計画してツールとスキルを使い、長期記憶とナレッジベースを持ち、自己進化し続けます。"
 ---
 
 <img src="https://cdn.link-ai.tech/doc/78c5dd674e2c828642ecc0406669fed7.png" alt="CowAgent" width="400px"/>
 
 **CowAgent** は、自律的なタスク計画、長期記憶、Skill システム、マルチモーダルメッセージ、複数モデル対応、マルチプラットフォームデプロイを備えた、LLM を活用した AI スーパーアシスタントです。
 
-CowAgent は自ら思考しタスクを計画し、コンピュータや外部リソースを操作し、Skill を作成・実行し、長期記憶により継続的に成長します。複数モデルの柔軟な切り替えをサポートし、テキスト、音声、画像、ファイルなどのマルチモーダルメッセージを処理でき、WeChat、Web、Feishu（飛書）、DingTalk（釘釘）、WeCom（企業微信）、WeChat公式アカウントに統合できます。お使いのパソコンやサーバー上で24時間365日稼働します。
+CowAgent は自ら思考しタスクを計画し、コンピュータや外部リソースを操作し、Skill を作成・実行し、長期記憶により継続的に成長します。複数モデルの柔軟な切り替えをサポートし、マルチエージェントチームを素早く構築でき、テキスト、音声、画像、ファイルなどのマルチモーダルメッセージを処理でき、WeChat、Web、Feishu（飛書）、DingTalk（釘釘）、WeCom（企業微信）、WeChat公式アカウントに統合できます。お使いのパソコンやサーバー上で24時間365日稼働します。
 
 <Frame>
   <video controls preload="metadata" playsInline className="w-full rounded-xl" src="https://cdn.cowagent.ai/desktop/video/cow-demo-en-v1.mp4" />
@@ -35,9 +35,6 @@ CowAgent は自ら思考しタスクを計画し、コンピュータや外部�
   <Card title="Skill システム" icon="puzzle-piece" href="/ja/skills/index">
     Skill の作成・実行エンジンを実装し、組み込み Skill を搭載。自然言語の会話を通じてカスタム Skill の開発もサポートしています。
   </Card>
-  <Card title="マルチモーダルメッセージ" icon="image" href="/ja/channels/web">
-    テキスト、画像、音声、ファイルなどのメッセージタイプの解析、処理、生成、送信をサポートします。
-  </Card>
   <Card title="ツールシステム" icon="wrench" href="/ja/tools/index">
     ファイル読み書き、ターミナル実行、ブラウザ操作、スケジュールタスク、メッセージ送信などの組み込みツールを提供。Agent が自律的にツールを呼び出して複雑なタスクを完了します。
   </Card>
@@ -49,6 +46,9 @@ CowAgent は自ら思考しタスクを計画し、コンピュータや外部�
   </Card>
   <Card title="マルチプラットフォームデプロイ" icon="server" href="/ja/channels/weixin">
     ローカルコンピュータやサーバー上で動作し、WeChat、Web、Feishu（飛書）、DingTalk（釘釘）、WeChat公式アカウント、WeCom（企業微信）アプリケーションに統合できます。
+  </Card>
+  <Card title="マルチエージェントチーム" icon="users" href="/ja/multi-agent/team">
+    それぞれ役割の異なる複数の Agent でチームを構成。グループチャット協働、タスク委譲、サブ Agent に対応し、Web コンソール・デスクトップクライアント・チャネル連携で利用できます。
   </Card>
 </CardGroup>
 
@@ -65,6 +65,12 @@ CowAgent は自ら思考しタスクを計画し、コンピュータや外部�
   <Tab title="Windows (PowerShell)">
     ```powershell
     irm https://cdn.link-ai.tech/code/cow/run.ps1 | iex
+    ```
+  </Tab>
+  <Tab title="Docker">
+    ```bash
+    curl -O https://cdn.link-ai.tech/code/cow/docker-compose.yml
+    docker compose up -d
     ```
   </Tab>
 </Tabs>

@@ -1,0 +1,824 @@
+/* Workspace panel, project picker, doc editor, file cards.
+   Split out of console.css; see channel/web/README.md for the
+   load order, which is load-bearing. */
+
+/* ============================================================
+   Workspace selector (project picker above the input)
+   ============================================================ */
+.workspace-selector-menu {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    width: 320px;
+    max-height: 380px;
+    overflow-y: auto;
+    padding: 6px;
+    border-radius: 12px;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.12), 0 2px 8px -2px rgba(0, 0, 0, 0.05);
+    z-index: 60;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.workspace-selector-menu.hidden { display: none; }
+.ws-sel-section-title {
+    padding: 6px 10px 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: rgb(var(--cw-slate-400));
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.ws-sel-item {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 8px 10px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: rgb(var(--cw-slate-700));
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+}
+.ws-sel-item:hover { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.ws-sel-item i { width: 15px; text-align: center; color: rgb(var(--cw-slate-500)); flex-shrink: 0; }
+.ws-sel-item:hover i { color: inherit; }
+.ws-sel-item .ws-sel-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ws-sel-item .ws-sel-path {
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.ws-sel-item.active { background: rgb(var(--cw-primary-50)); }
+.ws-sel-item.active .ws-sel-check { color: rgb(var(--cw-primary-600)); margin-left: auto; }
+.ws-sel-divider { height: 1px; margin: 5px 6px; background: #eef2f6; }
+.ws-sel-input-row { display: flex; gap: 6px; padding: 6px; }
+.ws-sel-input-row input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 9px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 8px;
+    font-size: 13px;
+    background: rgb(var(--cw-slate-50));
+    color: rgb(var(--cw-slate-700));
+    outline: none;
+}
+.ws-sel-input-row input:focus { border-color: rgb(var(--cw-primary-400)); }
+.ws-sel-input-row button {
+    padding: 6px 12px;
+    border: none;
+    border-radius: 8px;
+    background: rgb(var(--cw-primary-400));
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ws-sel-input-row button:hover { background: #3aa85c; }
+.ws-sel-crumb {
+    padding: 4px 10px 6px;
+    font-size: 11px;
+    color: rgb(var(--cw-slate-500));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.dark .workspace-selector-menu {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.dark .ws-sel-item { color: rgb(var(--cw-slate-200)); }
+.dark .ws-sel-item i { color: rgb(var(--cw-slate-400)); }
+.dark .ws-sel-item:hover,
+.dark .ws-sel-item.active { background: rgb(var(--cw-primary-400) / 0.1); color: rgb(var(--cw-primary-400)); }
+.dark .ws-sel-divider { background: rgba(255,255,255,0.08); }
+.dark .ws-sel-input-row input { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: rgb(var(--cw-slate-200)); }
+.dark .ws-sel-crumb { color: rgb(var(--cw-slate-400)); }
+
+/* ---- Folder picker modal (open project) ---- */
+.fp-btn {
+    width: 30px; height: 30px;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 8px; border: 1px solid rgb(var(--cw-slate-200)); background: rgb(var(--cw-slate-50));
+    color: rgb(var(--cw-slate-500)); font-size: 13px; cursor: pointer; transition: background .12s ease;
+}
+.fp-btn:hover:not([disabled]) { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); border-color: #cdeed8; }
+.fp-btn[disabled] { opacity: 0.4; cursor: default; }
+.dark .fp-btn { background: rgba(255,255,255,0.05); border-color: rgba(255,255,255,0.1); color: rgb(var(--cw-slate-400)); }
+.dark .fp-btn:hover:not([disabled]) { background: rgb(var(--cw-primary-400) / 0.12); color: rgb(var(--cw-primary-400)); }
+
+.fp-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer;
+    color: rgb(var(--cw-slate-700)); font-size: 14px; transition: background .1s ease;
+}
+.fp-row:hover { background: rgb(var(--cw-slate-100)); }
+.fp-row.selected { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.fp-row > i:first-child { color: #eab308; width: 16px; text-align: center; flex-shrink: 0; }
+.fp-row.selected > i:first-child { color: rgb(var(--cw-primary-600)); }
+.fp-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-into { color: rgb(var(--cw-slate-300)); font-size: 11px; padding: 4px; border-radius: 6px; flex-shrink: 0; }
+.fp-into:hover { background: rgba(0,0,0,0.06); color: rgb(var(--cw-slate-500)); }
+.dark .fp-row { color: rgb(var(--cw-slate-200)); }
+.dark .fp-row:hover { background: rgba(255,255,255,0.06); }
+.dark .fp-row.selected { background: rgb(var(--cw-primary-400) / 0.12); color: rgb(var(--cw-primary-400)); }
+.dark .fp-into:hover { background: rgba(255,255,255,0.1); }
+.fp-empty {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; height: 200px; color: rgb(var(--cw-slate-400)); font-size: 13px;
+}
+.fp-empty i { font-size: 22px; opacity: 0.5; }
+
+/* =====================================================================
+   Workspace Panel (preview + file manager)
+   ===================================================================== */
+.workspace-panel {
+    position: relative;
+    flex-shrink: 0;
+    width: 420px;
+    min-width: 280px;
+    max-width: 70vw;
+    height: 100%;
+    display: flex;
+    background: #ffffff;
+    border-left: 1px solid #e5e7eb;
+}
+.dark .workspace-panel {
+    background: rgb(var(--cw-panel));
+    border-left-color: rgba(255, 255, 255, 0.08);
+}
+.workspace-panel.hidden { display: none; }
+
+.workspace-inner {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.workspace-resizer {
+    position: absolute;
+    left: -3px;
+    top: 0;
+    bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    z-index: 20;
+}
+.workspace-resizer:hover,
+.workspace-resizer.dragging { background: rgb(var(--cw-primary-400) / 0.35); }
+
+.workspace-header {
+    height: 48px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 8px 0 10px;
+    border-bottom: 1px solid #e5e7eb;
+}
+.dark .workspace-header { border-bottom-color: rgba(255, 255, 255, 0.08); }
+
+.workspace-tabs { display: flex; gap: 2px; }
+.workspace-tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.workspace-tab i { font-size: 12px; }
+.workspace-tab:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-700)); }
+.workspace-tab.active { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); }
+.dark .workspace-tab { color: rgb(var(--cw-slate-400)); }
+.dark .workspace-tab:hover { background: rgba(255, 255, 255, 0.06); color: rgb(var(--cw-slate-200)); }
+.dark .workspace-tab.active { background: rgb(var(--cw-primary-400) / 0.12); color: rgb(var(--cw-primary-400)); }
+
+.workspace-header-actions { display: flex; align-items: center; gap: 2px; }
+.workspace-icon-btn {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    font-size: 13px;
+    color: rgb(var(--cw-slate-400));
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+}
+.workspace-icon-btn:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-700)); }
+.workspace-icon-btn.hidden { display: none; }
+.dark .workspace-icon-btn:hover { background: rgba(255, 255, 255, 0.08); color: rgb(var(--cw-slate-200)); }
+
+.workspace-body {
+    display: none;
+    flex: 1;
+    min-height: 0;
+    flex-direction: column;
+}
+.workspace-body.active { display: flex; }
+
+.workspace-file-title {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-500));
+    border-bottom: 1px solid rgb(var(--cw-slate-100));
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+.workspace-file-title.hidden { display: none; }
+.dark .workspace-file-title { color: rgb(var(--cw-slate-400)); border-bottom-color: rgba(255, 255, 255, 0.06); }
+
+.workspace-preview-content {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    position: relative;
+}
+.workspace-preview-content iframe {
+    width: 100%;
+    height: 100%;
+    border: 0;
+    display: block;
+    background: #fff;
+}
+.workspace-preview-content .ws-pad { padding: 16px; }
+.workspace-preview-content img.ws-media,
+.workspace-preview-content video.ws-media {
+    max-width: 100%;
+    display: block;
+    margin: 0 auto;
+    border-radius: 8px;
+}
+.workspace-preview-content audio.ws-media { width: 100%; margin-top: 12px; }
+.workspace-preview-content pre {
+    margin: 0;
+    padding: 16px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    white-space: pre;
+    overflow: auto;
+}
+
+/* Preview editor: fills the panel so the text area is the whole scroll area. */
+.workspace-preview-content .ws-editor {
+    width: 100%;
+    height: 100%;
+    display: block;
+    border: 0;
+    outline: none;
+    resize: none;
+    padding: 16px;
+    background: transparent;
+    color: rgb(var(--cw-slate-800));
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    tab-size: 4;
+    white-space: pre;
+    overflow: auto;
+}
+.dark .workspace-preview-content .ws-editor { color: rgb(var(--cw-slate-200)); }
+.workspace-icon-btn.ws-btn-busy { opacity: 0.5; pointer-events: none; }
+
+/* =====================================================================
+   Document editor (memory files, skill definitions)
+   ===================================================================== */
+
+/* Sized to the viewport rather than to the content: a text area that grows with
+   the document would push its own save button off the top of the page. */
+textarea.doc-editor {
+    display: block;
+    width: 100%;
+    height: calc(100dvh - 280px);
+    min-height: 240px;
+    border: 0;
+    outline: none;
+    resize: vertical;
+    background: transparent;
+    color: rgb(var(--cw-slate-800));
+    font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    tab-size: 4;
+    /* Wrap instead of scrolling sideways: these are prose documents, and a
+       horizontal scrollbar hides the end of every long paragraph. `anywhere`
+       covers the unbreakable cases (long URLs) that would still overflow. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.dark textarea.doc-editor { color: rgb(var(--cw-slate-200)); }
+
+.doc-action-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 8px;
+    font-size: 13px;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+}
+.doc-action-btn:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-700)); }
+.dark .doc-action-btn { border-color: rgba(255, 255, 255, 0.1); color: rgb(var(--cw-slate-400)); }
+.dark .doc-action-btn:hover { background: rgba(255, 255, 255, 0.1); color: rgb(var(--cw-slate-200)); }
+
+/* primary-500 / primary-600 from the Tailwind theme in chat.html. */
+.doc-action-btn-primary {
+    border-color: transparent;
+    background: rgb(var(--cw-primary-500));
+    color: #fff;
+}
+.doc-action-btn-primary:hover { background: rgb(var(--cw-primary-600)); color: #fff; }
+.dark .doc-action-btn-primary { border-color: transparent; background: rgb(var(--cw-primary-500)); color: #fff; }
+.dark .doc-action-btn-primary:hover { background: rgb(var(--cw-primary-600)); color: #fff; }
+
+.doc-action-btn.doc-btn-busy { opacity: 0.5; pointer-events: none; }
+
+/* Unsaved-changes marker beside the file name in a viewer title. */
+.doc-dirty-dot { color: rgb(var(--cw-primary-500)); }
+
+/* The attach menu of the skill create dialog: the composer's menu card, hung
+   under the right edge of its button instead of over the composer. Written with
+   both classes so it wins over `.attach-menu` whichever sheet loads last.
+
+   Opening upwards, as it does over the composer: the attachments are the last
+   field of a dialog that scrolls, so a menu dropped below the button would be
+   clipped by the dialog's own overflow. */
+.attach-menu.skill-attach-menu {
+    left: auto;
+    right: 0;
+    min-width: 132px;
+}
+
+/* The skill viewer's one card: file list and document side by side. Capped
+   to the viewport so each half scrolls on its own; the list stretches to the
+   document's height, so its divider runs the full card. */
+.skill-viewer-card { max-height: calc(100dvh - 220px); }
+
+/* The switch that folds the skill file list away and brings it back. It rides
+   the border the list sits against - centred on the divider while the list is
+   out (14rem is the panel's w-56), on the card's own left edge once it is
+   folded - level with the list's title. The half pixel centres it on a 1px
+   line rather than beside it. */
+.skill-files-switch {
+    position: absolute;
+    top: 10px;
+    left: 0.5px;
+    z-index: 5;
+    transform: translateX(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 9999px;
+    background: #fff;
+    box-shadow: 0 1px 2px rgb(var(--cw-slate-900) / 0.06);
+    font-size: 9px;
+    color: rgb(var(--cw-slate-400));
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.skill-files-switch.is-open { left: calc(14rem + 0.5px); }
+.skill-files-switch.hidden { display: none; }
+.skill-files-switch:hover { color: rgb(var(--cw-primary-600)); border-color: rgb(var(--cw-primary-200)); box-shadow: 0 1px 3px rgb(var(--cw-slate-900) / 0.1); }
+.dark .skill-files-switch { background: rgb(var(--cw-panel)); border-color: rgba(255, 255, 255, 0.12); color: rgb(var(--cw-slate-500)); }
+.dark .skill-files-switch:hover { color: rgb(var(--cw-primary-400)); border-color: rgb(var(--cw-primary-400) / 0.4); }
+
+/* A SKILL.md's frontmatter, lifted out of the prose into a key/value card.
+   The label column sizes to the longest key up to a cap; past it a dotted
+   path wraps at its dots (the markup puts a <wbr> after each) rather than
+   squeezing the values. One line height for both columns so every row's
+   label sits level with its value. */
+.skill-frontmatter {
+    display: grid;
+    grid-template-columns: minmax(5rem, 9rem) minmax(0, 1fr);
+    column-gap: 16px;
+    row-gap: 6px;
+    margin: 0 0 24px;
+    padding: 12px 16px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 10px;
+    background: rgb(var(--cw-slate-50));
+    line-height: 22px;
+}
+.skill-frontmatter dt {
+    /* The console's mono stack (tailwind.config in chat.html), not the
+       system's: on Windows `ui-monospace` falls through to a hairline face. */
+    font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-400));
+    overflow-wrap: break-word;
+}
+.skill-frontmatter dd {
+    margin: 0;
+    font-size: 13px;
+    color: rgb(var(--cw-slate-700));
+    overflow-wrap: anywhere;
+}
+.dark .skill-frontmatter { background: rgba(255, 255, 255, 0.03); border-color: rgba(255, 255, 255, 0.08); }
+.dark .skill-frontmatter dt { color: rgb(var(--cw-slate-500)); }
+.dark .skill-frontmatter dd { color: rgb(var(--cw-slate-200)); }
+
+/* Skill file tree: the files a skill directory holds beside its SKILL.md.
+   Indentation comes from an inline padding-left per row, so the padding here
+   only sets the other three sides. */
+.skill-file-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    /* Inset from the panel's edges, so the active row reads as a pill rather
+       than a stripe running into the divider. */
+    width: calc(100% - 12px);
+    margin: 1px 6px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: none;
+    background: none;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-500));
+    cursor: pointer;
+    text-align: left;
+    transition: background 0.15s, color 0.15s;
+}
+.skill-file-row:hover { background: rgba(0, 0, 0, 0.04); color: rgb(var(--cw-slate-700)); }
+.skill-file-row.active { background: rgb(var(--cw-primary-50)); color: rgb(var(--cw-primary-600)); font-weight: 500; }
+/* A directory folds rather than opens, so it is never the active row. */
+.skill-file-row.skill-file-dir { color: rgb(var(--cw-slate-600)); }
+/* Reserved even where there is nothing to fold, so the names in one directory
+   all start at the same column. */
+.skill-file-caret { flex-shrink: 0; width: 9px; font-size: 9px; opacity: 0.6; text-align: center; }
+.skill-file-icon { flex-shrink: 0; width: 14px; font-size: 12px; opacity: 0.8; }
+.skill-file-dir .skill-file-icon { color: rgb(var(--cw-slate-400)); opacity: 1; }
+/* Tabular figures so the sizes line up as a column rather than jittering. */
+.skill-file-size {
+    flex-shrink: 0;
+    font-size: 10px;
+    color: rgb(var(--cw-slate-400));
+    font-variant-numeric: tabular-nums;
+}
+.dark .skill-file-size { color: rgb(var(--cw-slate-500)); }
+.dark .skill-file-row { color: rgb(var(--cw-slate-400)); }
+.dark .skill-file-row:hover { background: rgba(255, 255, 255, 0.06); color: rgb(var(--cw-slate-200)); }
+.dark .skill-file-row.active { background: rgb(var(--cw-primary-400) / 0.1); color: rgb(var(--cw-primary-400)); }
+.dark .skill-file-row.skill-file-dir { color: rgb(var(--cw-slate-300)); }
+.dark .skill-file-dir .skill-file-icon { color: rgb(var(--cw-slate-500)); }
+
+.workspace-empty {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    color: rgb(var(--cw-slate-400));
+    font-size: 13px;
+    padding: 24px;
+    text-align: center;
+}
+.workspace-empty > i { font-size: 26px; opacity: 0.4; }
+.ws-empty-name {
+    max-width: 100%;
+    font-size: 14px;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-700));
+    overflow-wrap: anywhere;
+}
+.dark .ws-empty-name { color: rgb(var(--cw-slate-200)); }
+.ws-empty-action {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 32px;
+    margin-top: 6px;
+    padding: 0 14px;
+    border-radius: 8px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: #fff;
+    color: rgb(var(--cw-slate-700));
+    font-size: 13px;
+    font-weight: 500;
+    text-decoration: none;
+    transition: border-color .15s, background-color .15s, color .15s;
+}
+.ws-empty-action i { font-size: 12px; color: rgb(var(--cw-primary-400)); }
+.ws-empty-action:hover { border-color: rgb(var(--cw-primary-400)); background: #f6fdf8; color: rgb(var(--cw-slate-800)); }
+.dark .ws-empty-action { border-color: rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.04); color: rgb(var(--cw-slate-200)); }
+.dark .ws-empty-action:hover { border-color: rgb(var(--cw-primary-400)); background: rgb(var(--cw-primary-400) / 0.1); color: #fff; }
+
+/* Files tab */
+.workspace-files-toolbar {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+}
+.workspace-search {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    height: 32px;
+    border-radius: 8px;
+    background: rgb(var(--cw-slate-100));
+}
+.workspace-search i { font-size: 11px; color: rgb(var(--cw-slate-400)); }
+.workspace-search input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: none;
+    font-size: 13px;
+    color: rgb(var(--cw-slate-700));
+}
+.dark .workspace-search { background: rgba(255, 255, 255, 0.06); }
+.dark .workspace-search input { color: rgb(var(--cw-slate-200)); }
+
+.workspace-breadcrumb {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 0 12px 8px;
+    font-size: 12px;
+    color: rgb(var(--cw-slate-400));
+}
+.workspace-breadcrumb .crumb { cursor: pointer; border-radius: 4px; padding: 1px 4px; display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.workspace-breadcrumb .crumb:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-700)); }
+.dark .workspace-breadcrumb .crumb:hover { background: rgba(255, 255, 255, 0.08); color: rgb(var(--cw-slate-200)); }
+.workspace-breadcrumb .sep { opacity: 0.5; }
+.workspace-breadcrumb .crumb-root {
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;         /* keep the meaningful tail (project name) visible */
+    text-align: left;
+    font-size: 11px;
+    opacity: 0.9;
+}
+
+.workspace-file-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 6px 12px;
+}
+.ws-file-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.12s ease;
+}
+.ws-file-row:hover { background: rgb(var(--cw-slate-100)); }
+.dark .ws-file-row:hover { background: rgba(255, 255, 255, 0.06); }
+.ws-file-row.active { background: rgb(var(--cw-primary-50)); }
+.dark .ws-file-row.active { background: rgb(var(--cw-primary-400) / 0.12); }
+.ws-file-row > i {
+    width: 16px;
+    text-align: center;
+    font-size: 13px;
+    flex-shrink: 0;
+}
+.ws-file-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    color: rgb(var(--cw-slate-700));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .ws-file-name { color: rgb(var(--cw-slate-200)); }
+.ws-file-meta {
+    flex-shrink: 0;
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+}
+.ws-file-path {
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* File icon colors by kind */
+.ws-icon-directory { color: #f59e0b; }
+.ws-icon-html { color: #f97316; }
+.ws-icon-markdown { color: #6366f1; }
+.ws-icon-image { color: #10b981; }
+.ws-icon-video { color: #ec4899; }
+.ws-icon-audio { color: #8b5cf6; }
+.ws-icon-pdf { color: #ef4444; }
+.ws-icon-csv { color: #14b8a6; }
+.ws-icon-code { color: #3b82f6; }
+.ws-icon-office { color: #2563eb; }
+.ws-icon-text,
+.ws-icon-file { color: rgb(var(--cw-slate-400)); }
+
+/* =====================================================================
+   Artifact / File Cards in messages
+   ===================================================================== */
+.file-card-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 0;
+}
+.file-card {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 100%;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid rgb(var(--cw-slate-200));
+    background: #fff;
+    cursor: pointer;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+.file-card:hover {
+    border-color: rgb(var(--cw-primary-400));
+    box-shadow: 0 2px 10px -2px rgb(var(--cw-primary-400) / 0.25);
+}
+.dark .file-card { background: #232323; border-color: rgba(255, 255, 255, 0.1); }
+.dark .file-card:hover { border-color: rgb(var(--cw-primary-400)); }
+.file-card > i.file-card-icon { font-size: 16px; flex-shrink: 0; }
+.file-card-info { min-width: 0; flex: 1; }
+.file-card-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: rgb(var(--cw-slate-700));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.dark .file-card-name { color: rgb(var(--cw-slate-200)); }
+.file-card-sub {
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.file-card-actions { display: flex; gap: 2px; flex-shrink: 0; }
+.file-card-btn {
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 6px;
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+}
+.file-card-btn:hover { background: rgb(var(--cw-slate-100)); color: rgb(var(--cw-slate-700)); }
+.dark .file-card-btn:hover { background: rgba(255, 255, 255, 0.08); color: rgb(var(--cw-slate-200)); }
+
+/* Inline path chip (fallback for paths mentioned only in text) */
+.file-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 1px 7px;
+    margin: 0 1px;
+    border-radius: 6px;
+    background: rgb(var(--cw-slate-100));
+    border: 1px solid rgb(var(--cw-slate-200));
+    font-size: 0.88em;
+    color: rgb(var(--cw-slate-700));
+    cursor: pointer;
+    vertical-align: baseline;
+    text-decoration: none;
+}
+.file-chip:hover { border-color: rgb(var(--cw-primary-400)); color: rgb(var(--cw-primary-600)); }
+.file-chip i { font-size: 0.85em; opacity: 0.7; }
+.dark .file-chip { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.1); color: rgb(var(--cw-slate-200)); }
+.dark .file-chip:hover { border-color: rgb(var(--cw-primary-400)); color: rgb(var(--cw-primary-400)); }
+
+/* =====================================================================
+   Mention (@) menu
+   ===================================================================== */
+.mention-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 300px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid rgb(var(--cw-slate-200));
+    border-radius: 12px;
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.1), 0 2px 8px -2px rgba(0, 0, 0, 0.04);
+    z-index: 50;
+    padding: 4px;
+    animation: slashMenuIn 0.15s ease-out;
+}
+.mention-menu.hidden { display: none; }
+.dark .mention-menu {
+    background: rgb(var(--cw-panel));
+    border-color: rgba(255, 255, 255, 0.1);
+    box-shadow: 0 8px 30px -6px rgba(0, 0, 0, 0.35), 0 2px 8px -2px rgba(0, 0, 0, 0.15);
+}
+.mention-item {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+}
+.mention-item:hover,
+.mention-item.active { background: rgb(var(--cw-primary-50)); }
+.dark .mention-item:hover,
+.dark .mention-item.active { background: rgb(var(--cw-primary-400) / 0.1); }
+.mention-item > i { width: 15px; text-align: center; font-size: 12px; flex-shrink: 0; }
+.mention-item .m-name {
+    font-size: 13px;
+    color: rgb(var(--cw-slate-700));
+    flex-shrink: 0;
+    max-width: 45%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dark .mention-item .m-name { color: rgb(var(--cw-slate-200)); }
+.mention-item .m-path {
+    font-size: 11px;
+    color: rgb(var(--cw-slate-400));
+    flex: 1;
+    min-width: 0;
+    text-align: right;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+}
+.mention-empty { padding: 10px; font-size: 12px; color: rgb(var(--cw-slate-400)); text-align: center; }
+
+/* Drop target highlight when dragging a workspace file into the chat */
+.chat-main.ws-drop-active::after {
+    content: '';
+    position: absolute;
+    inset: 8px;
+    border: 2px dashed rgb(var(--cw-primary-400));
+    border-radius: 14px;
+    background: rgb(var(--cw-primary-400) / 0.06);
+    pointer-events: none;
+    z-index: 30;
+}
+
+/* Mobile: workspace panel takes over the chat view */
+@media (max-width: 768px) {
+    .workspace-panel {
+        position: absolute;
+        inset: 0;
+        width: 100% !important;
+        max-width: none;
+        z-index: 46;
+    }
+    .workspace-resizer { display: none; }
+}
+

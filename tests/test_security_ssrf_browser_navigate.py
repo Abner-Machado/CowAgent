@@ -72,6 +72,12 @@ class TestBrowserNavigateSSRF(unittest.TestCase):
         patcher = patch.object(BrowserTool, "_get_service", return_value=self.stub)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # These tests cover the SSRF guard, which runs after the engine
+        # readiness probe; on CI no browser engine is installed, so stub the
+        # probe out to keep the navigation path reachable.
+        ready_patcher = patch.object(BrowserTool, "_check_engine_ready", return_value=None)
+        ready_patcher.start()
+        self.addCleanup(ready_patcher.stop)
 
     # --- Link-local / cloud-metadata: rejected before any service call ---
 

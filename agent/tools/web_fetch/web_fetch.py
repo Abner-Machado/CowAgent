@@ -4,27 +4,39 @@ Web Fetch tool - Fetch and extract readable content from web pages and remote fi
 Supports:
 - HTML web pages: extracts readable text content
 - Document files (PDF, Word, TXT, Markdown, etc.): downloads to workspace/tmp and parses content
+- Plain text downloads: prefers a declared HTTP charset, then existing decoding fallbacks
+- DeepSeek Fetch backend (opt-in via tools.web_fetch.provider="deepseek"):
+  returns the page as Markdown through DeepSeek's official Fetch API
+  (https://api-docs.deepseek.com/guides/search)
+- Olostep backend (opt-in via tools.web_fetch.provider="olostep"):
+  returns the rendered page as Markdown through Olostep's Scrape API
+  (https://docs.olostep.com/features/scrapes)
 """
 
 import os
 import re
 import uuid
+from html.parser import HTMLParser
 from typing import Dict, Any, Optional, Set
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urljoin
 
 import requests
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from agent.tools.utils.truncate import truncate_head, format_size
-from agent.tools.utils.url_safety import validate_url_safe
+from agent.tools.utils.url_safety import validate_url_safe, safe_get
 from common.log import logger
+from common.media_download import MediaTooLargeError, read_response, save_response
+from config import conf
 
 
 DEFAULT_TIMEOUT = 30
+# A slow sender never trips the per-read timeout, so a page read is capped as a whole.
+PAGE_READ_SECONDS = 60
+# Olostep waits about 55s for a scrape before it answers HTTP 504, so the
+# client waits a little longer than that to receive the 504.
+OLOSTEP_TIMEOUT = 60
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-# Cap on how many redirects we follow; each hop's target is re-validated
-# against the SSRF guard so a public URL cannot bounce us into an internal one.
-MAX_REDIRECTS = 10
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
@@ -47,6 +59,70 @@ _META_HTTP_EQUIV_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Charset labels that browsers decode with a superset codec, per the WHATWG
+# Encoding Standard (https://encoding.spec.whatwg.org/#names-and-labels).
+# Pages rely on the superset (gb2312 pages use GBK characters, ISO-8859-1
+# pages use windows-1252 quotes), and Python's narrower codec garbles them.
+# All of the standard's labels for these encodings are listed, including ones
+# Python doesn't know at all, such as x-sjis and windows-874.
+_BROWSER_CHARSETS = {
+    label: codec
+    for codec, labels in (
+        ("gb18030", "chinese csgb2312 csiso58gb231280 gb2312 gb_2312 gb_2312-80 gbk iso-ir-58 x-gbk"),
+        ("cp932", "csshiftjis ms932 ms_kanji shift-jis shift_jis sjis windows-31j x-sjis"),
+        ("cp949", "cseuckr csksc56011987 euc-kr iso-ir-149 korean ks_c_5601-1987 ks_c_5601-1989 ksc5601 "
+                  "ksc_5601 windows-949"),
+        ("big5hkscs", "big5 big5-hkscs cn-big5 csbig5 x-x-big5"),
+        ("cp1252", "ansi_x3.4-1968 ascii cp1252 cp819 csisolatin1 ibm819 iso-8859-1 iso-ir-100 iso8859-1 "
+                   "iso88591 iso_8859-1 iso_8859-1:1987 l1 latin1 us-ascii windows-1252 x-cp1252"),
+        ("cp1254", "cp1254 csisolatin5 iso-8859-9 iso-ir-148 iso8859-9 iso88599 iso_8859-9 iso_8859-9:1989 "
+                   "l5 latin5 windows-1254 x-cp1254"),
+        ("cp874", "dos-874 iso-8859-11 iso8859-11 iso885911 tis-620 windows-874"),
+    )
+    for label in labels.split()
+}
+
+
+def _tools_web_fetch_conf() -> dict:
+    """Return the tools.web_fetch config block (dict-like)."""
+    tools_cfg = conf().get("tools") or {}
+    if not isinstance(tools_cfg, dict):
+        return {}
+    block = tools_cfg.get("web_fetch") or {}
+    return block if isinstance(block, dict) else {}
+
+
+def _conf_str(value, default: str = "") -> str:
+    """A stripped string config value; non-strings (hand-edited JSON) and blanks give ``default``."""
+    return (value.strip() if isinstance(value, str) else "") or default
+
+
+def _fetch_provider() -> str:
+    """The fetch backend: "direct" (default, fetch and parse locally),
+    "deepseek" (DeepSeek's official Fetch API, returns the page as Markdown)
+    or "olostep" (Olostep's Scrape API, returns the rendered page as Markdown).
+    Unknown values fail loudly so a typo never silently changes backends."""
+    provider = _conf_str(_tools_web_fetch_conf().get("provider"), "direct").lower()
+    if provider not in ("direct", "deepseek", "olostep"):
+        raise ValueError(
+            f"Unknown tools.web_fetch.provider {provider!r}; expected 'direct', 'deepseek' or 'olostep'"
+        )
+    return provider
+
+
+def _deepseek_api_key() -> str:
+    """The DeepSeek model key, which the Fetch API also accepts."""
+    key = _conf_str(conf().get("deepseek_api_key"), "")
+    return key or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+
+def _olostep_api_key() -> str:
+    """The Olostep key of the web_search provider, which the Scrape API also accepts."""
+    tools_cfg = conf().get("tools") or {}
+    block = tools_cfg.get("web_search") or {} if isinstance(tools_cfg, dict) else {}
+    key = _conf_str(block.get("olostep_api_key") if isinstance(block, dict) else "", "")
+    return key or os.environ.get("OLOSTEP_API_KEY", "").strip()
+
 
 def _extract_charset_from_content_type(content_type: str) -> Optional[str]:
     """Extract charset from Content-Type header value."""
@@ -65,9 +141,14 @@ def _extract_charset_from_html_meta(raw_bytes: bytes) -> Optional[str]:
     return None
 
 
+def _browser_charset(label: str) -> str:
+    """The codec a browser decodes a charset label with, or the label itself."""
+    return _BROWSER_CHARSETS.get(label.lower(), label)
+
+
 def _get_url_suffix(url: str) -> str:
     """Extract file extension from URL path, ignoring query params."""
-    path = urlparse(url).path
+    path = unquote(urlparse(url).path)
     return os.path.splitext(path)[-1].lower()
 
 
@@ -75,6 +156,115 @@ def _is_document_url(url: str) -> bool:
     """Check if URL points to a downloadable document file."""
     suffix = _get_url_suffix(url)
     return suffix in ALL_DOC_SUFFIXES
+
+
+def _parse_content_length(response: requests.Response) -> int:
+    """Content-Length as a non-negative int, or 0 when absent or malformed."""
+    try:
+        return max(int(response.headers.get("Content-Length", 0)), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Stands in for a <pre> block while the text around it is normalized. Page text
+# can't contain it: the parser drops NUL characters, as browsers do.
+_PRE_MARK = "\0"
+
+
+class _PageTextParser(HTMLParser):
+    """Keep text and block boundaries without treating quoted attributes as text.
+
+    The text of each <pre> block is kept as written, in ``pre_blocks``, and
+    ``parts`` holds _PRE_MARK in its place. Images become Markdown images when
+    their source resolves to an http(s) URL against ``base_url``.
+    """
+
+    _BLOCK_TAGS = frozenset({
+        "address", "article", "aside", "blockquote", "caption", "center",
+        "dd", "details", "dialog", "div", "dl", "dt", "fieldset", "figcaption",
+        "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section",
+        "summary", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "ul",
+    })
+
+    def __init__(self, base_url: str = ""):
+        # Decode character references once, in text rather than in markup.
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self.hidden_tag = None
+        self.pre_blocks = []
+        self.pre_parts = []
+        self.pre_depth = 0
+        self.base_url = base_url
+        self.seen_images = set()
+
+    def handle_starttag(self, tag, attrs):
+        if self.hidden_tag:
+            return
+        if tag in ("script", "style"):
+            self.hidden_tag = tag
+        elif tag == "br" or tag in self._BLOCK_TAGS:
+            self._line_break(forced=tag == "br")
+        elif tag == "img" and not self.pre_depth:
+            self._image(dict(attrs))
+        if tag == "pre":
+            self.pre_depth += 1
+
+    def _image(self, attrs):
+        # Tracking pixels carry no content.
+        if (attrs.get("width") or "").strip() in ("0", "1") or (attrs.get("height") or "").strip() in ("0", "1"):
+            return
+        # Lazy-loaded images keep the real source in a data attribute.
+        src = next((v.strip() for v in (attrs.get("src"), attrs.get("data-src"), attrs.get("data-original"))
+                    if v and v.strip() and not v.strip().lower().startswith("data:")), "")
+        if not src:
+            return
+        url = urljoin(self.base_url, src) if self.base_url else src
+        if urlparse(url).scheme not in ("http", "https") or url in self.seen_images:
+            return
+        self.seen_images.add(url)
+        alt = re.sub(r"[\[\]\s]+", " ", attrs.get("alt") or "").strip()
+        url = url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+        self.parts.append(f"![{alt}]({url})")
+
+    def handle_endtag(self, tag):
+        if self.hidden_tag:
+            if tag == self.hidden_tag:
+                self.hidden_tag = None
+        elif tag in self._BLOCK_TAGS:
+            if tag == "pre" and self.pre_depth:
+                self.pre_depth -= 1
+                if not self.pre_depth:
+                    self._end_pre()
+            self._line_break()
+
+    def handle_data(self, data):
+        data = data.replace(_PRE_MARK, "")
+        if data and not self.hidden_tag:
+            (self.pre_parts if self.pre_depth else self.parts).append(data)
+
+    def close(self):
+        super().close()
+        if self.pre_depth:  # an unclosed <pre> runs to the end of the page
+            self.pre_depth = 0
+            self._end_pre()
+
+    def _line_break(self, forced=False):
+        if not self.pre_depth:
+            self.parts.append("\n")
+        elif forced or (self.pre_parts and not self.pre_parts[-1].endswith("\n")):
+            # Inside <pre>, a block starts a new line but doesn't add a blank one.
+            self.pre_parts.append("\n")
+
+    def _end_pre(self):
+        # As in browsers, CRLF and CR are newlines and the newline right after <pre>
+        # is skipped; other leading blank lines and the trailing whitespace go too.
+        text = re.sub(r"\r\n?", "\n", "".join(self.pre_parts))
+        text = re.sub(r"^\s*\n", "", text).rstrip()
+        self.pre_parts = []
+        if text:
+            self.pre_blocks.append(text)
+            self.parts.append(_PRE_MARK)
 
 
 class WebFetch(BaseTool):
@@ -103,7 +293,9 @@ class WebFetch(BaseTool):
         self.cwd = self.config.get("cwd", os.getcwd())
 
     def execute(self, args: Dict[str, Any]) -> ToolResult:
-        url = args.get("url", "").strip()
+        # `{"url": null}` has the key present, so the dict default never
+        # applies; `or` also covers the explicit null.
+        url = (args.get("url") or "").strip()
         if not url:
             return ToolResult.fail("Error: 'url' parameter is required")
 
@@ -112,166 +304,301 @@ class WebFetch(BaseTool):
             return ToolResult.fail("Error: Invalid URL (must start with http:// or https://)")
 
         # SSRF guard: reject URLs that resolve to private/loopback/link-local/
-        # cloud-metadata addresses before any request is issued.
+        # cloud-metadata addresses before any request is issued. Applies to
+        # every backend, including DeepSeek Fetch and Olostep (the URL still
+        # leaves this machine's policy boundary via their API).
         try:
             validate_url_safe(url)
+        except ValueError as e:
+            return ToolResult.fail(f"Error: {e}")
+
+        try:
+            provider = _fetch_provider()
         except ValueError as e:
             return ToolResult.fail(f"Error: {e}")
 
         if _is_document_url(url):
             return self._fetch_document(url)
 
+        if provider == "deepseek":
+            return self._fetch_deepseek(url)
+
+        if provider == "olostep":
+            return self._fetch_olostep(url)
+
         return self._fetch_webpage(url)
+
+    # ---- DeepSeek Fetch backend ----
+
+    def _fetch_deepseek(self, url: str) -> ToolResult:
+        """Fetch a page as Markdown through DeepSeek's official Fetch API.
+
+        Useful for pages the direct backend cannot render (JS-heavy sites);
+        billed per successful request, so it stays opt-in.
+        """
+        api_key = _deepseek_api_key()
+        if not api_key:
+            return ToolResult.fail(
+                "Error: tools.web_fetch.provider is 'deepseek' but no DeepSeek API key is configured. "
+                "Set deepseek_api_key or the DEEPSEEK_API_KEY environment variable."
+            )
+
+        from agent.tools.web_search.web_search import deepseek_tools_url
+        endpoint = deepseek_tools_url(conf().get("deepseek_api_base"), "fetch")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        logger.debug(f"[WebFetch] deepseek: url='{url}'")
+        try:
+            resp = requests.post(endpoint, headers=headers, json={"url": url}, timeout=DEFAULT_TIMEOUT)
+        except requests.Timeout:
+            return ToolResult.fail(f"Error: DeepSeek Fetch request timed out after {DEFAULT_TIMEOUT}s")
+        except requests.ConnectionError:
+            return ToolResult.fail("Error: Failed to connect to DeepSeek Fetch API")
+        except Exception as e:
+            logger.error(f"[WebFetch] DeepSeek Fetch unexpected error: {e}", exc_info=True)
+            return ToolResult.fail(f"Error: DeepSeek Fetch failed - {str(e)}")
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid DeepSeek API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: DeepSeek API — insufficient balance. Top up at https://platform.deepseek.com")
+        if resp.status_code == 403:
+            return ToolResult.fail("Error: DeepSeek Fetch rejected the URL (security policy).")
+        if resp.status_code == 404:
+            return ToolResult.fail(f"Error: DeepSeek Fetch could not retrieve usable content for URL: {url}")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: DeepSeek Fetch API rate limit reached (5 QPS per account).")
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: DeepSeek Fetch API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        data = resp.json()
+        # Business-level errors use the OpenAI-compatible {"error": {...}}
+        # envelope, with param always null.
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"] or {}
+            return ToolResult.fail(f"Error: DeepSeek Fetch returned {err.get('code')}: {err.get('message', '')}")
+
+        title = data.get("title") or "Untitled"
+        content = data.get("content") or ""
+        if not content.strip():
+            return ToolResult.fail(f"Error: DeepSeek Fetch returned no content for URL: {url}")
+        return ToolResult.success(f"Title: {title}\n\nContent:\n{content}")
+
+    # ---- Olostep backend ----
+
+    def _fetch_olostep(self, url: str) -> ToolResult:
+        """Fetch a page as Markdown through Olostep's Scrape API.
+
+        Olostep renders the page in a browser, so it also reads JS-heavy
+        sites the direct backend cannot; billed per scrape, so it stays opt-in.
+        """
+        api_key = _olostep_api_key()
+        if not api_key:
+            return ToolResult.fail(
+                "Error: tools.web_fetch.provider is 'olostep' but no Olostep API key is configured. "
+                "Set tools.web_search.olostep_api_key or the OLOSTEP_API_KEY environment variable."
+            )
+
+        endpoint = "https://api.olostep.com/v1/scrapes"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"url_to_scrape": url, "formats": ["markdown"]}
+        logger.debug(f"[WebFetch] olostep: url='{url}'")
+        try:
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=OLOSTEP_TIMEOUT)
+        except requests.Timeout:
+            return ToolResult.fail(f"Error: Olostep scrape request timed out after {OLOSTEP_TIMEOUT}s")
+        except requests.ConnectionError:
+            return ToolResult.fail("Error: Failed to connect to Olostep API")
+        except Exception as e:
+            logger.error(f"[WebFetch] Olostep scrape unexpected error: {e}", exc_info=True)
+            return ToolResult.fail(f"Error: Olostep scrape failed - {str(e)}")
+
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Olostep API key.")
+        if resp.status_code == 402:
+            return ToolResult.fail("Error: Olostep API key is invalid or out of credits. Check https://www.olostep.com/dashboard")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Olostep API rate limit reached.")
+        if resp.status_code == 504:
+            return ToolResult.fail(
+                f"Error: Olostep could not finish scraping in time; the page may be slow or blocked. "
+                f"Retrying may help. URL: {url}"
+            )
+        if resp.status_code != 200:
+            return ToolResult.fail(f"Error: Olostep API returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+        result = (resp.json() or {}).get("result") or {}
+        title = (result.get("page_metadata") or {}).get("title") or "Untitled"
+        content = result.get("markdown_content") or ""
+        if not content.strip():
+            return ToolResult.fail(f"Error: Olostep returned no content for URL: {url}")
+        return ToolResult.success(f"Title: {title}\n\nContent:\n{content}")
 
     # ---- Safe request helper ----
 
     @staticmethod
     def _safe_get(url: str, **kwargs) -> requests.Response:
-        """Issue a GET request while re-validating every redirect hop (SSRF guard).
+        """Issue a GET request through the shared redirect-aware SSRF helper.
 
-        Auto-redirect is disabled and each hop is followed manually so the
-        target of every redirect is re-resolved and checked against the SSRF
-        guard. This prevents a public URL from 3xx-bouncing into a private,
-        loopback, link-local or cloud-metadata address. ``kwargs`` are passed
-        through to ``requests.get`` (e.g. ``stream``).
+        Thin wrapper: it only injects this tool's own headers/timeout.
+        ``agent.tools.utils.url_safety.safe_get`` disables auto-redirect and
+        re-validates every hop, so a public URL cannot 3xx-bounce into a
+        private, loopback, link-local or cloud-metadata address.
 
         Raises:
             ValueError: if any hop resolves to a non-public address.
         """
-        kwargs.pop("allow_redirects", None)
-        current = url
-        for _ in range(MAX_REDIRECTS + 1):
-            response = requests.get(
-                current,
-                headers=DEFAULT_HEADERS,
-                timeout=DEFAULT_TIMEOUT,
-                allow_redirects=False,
-                **kwargs,
-            )
-            if not response.is_redirect and not response.is_permanent_redirect:
-                return response
-
-            location = response.headers.get("Location")
-            if not location:
-                return response
-
-            # Resolve the redirect target relative to the current URL, then
-            # re-validate it before following.
-            current = requests.compat.urljoin(current, location)
-            validate_url_safe(current)
-            response.close()
-
-        raise ValueError(f"Too many redirects (>{MAX_REDIRECTS})")
+        kwargs.setdefault("headers", DEFAULT_HEADERS)
+        kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
+        return safe_get(url, **kwargs)
 
     # ---- Web page fetching ----
 
     def _fetch_webpage(self, url: str) -> ToolResult:
         """Fetch and extract readable text from an HTML web page."""
-        parsed = urlparse(url)
+        response = None
         try:
-            response = self._safe_get(url)
-            response.raise_for_status()
-        except requests.Timeout:
-            return ToolResult.fail(f"Error: Request timed out after {DEFAULT_TIMEOUT}s")
-        except requests.ConnectionError:
-            return ToolResult.fail(f"Error: Failed to connect to {parsed.netloc}")
-        except requests.HTTPError as e:
-            return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
-        except ValueError as e:
-            return ToolResult.fail(f"Error: {e}")
-        except Exception as e:
-            return ToolResult.fail(f"Error: Failed to fetch URL: {e}")
+            parsed = urlparse(url)
+            try:
+                response = self._safe_get(url, stream=True)
+                response.raise_for_status()
+            except requests.Timeout:
+                return ToolResult.fail(f"Error: Request timed out after {DEFAULT_TIMEOUT}s")
+            except requests.ConnectionError:
+                return ToolResult.fail(f"Error: Failed to connect to {parsed.netloc}")
+            except requests.HTTPError as e:
+                return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
+            except ValueError as e:
+                return ToolResult.fail(f"Error: {e}")
+            except Exception as e:
+                return ToolResult.fail(f"Error: Failed to fetch URL: {e}")
 
-        content_type = response.headers.get("Content-Type", "")
-        if self._is_binary_content_type(content_type) and not _is_document_url(url):
-            return self._handle_download_by_content_type(url, response, content_type)
+            content_type = response.headers.get("Content-Type", "")
+            if self._is_binary_content_type(content_type) and not _is_document_url(url):
+                return self._handle_download_by_content_type(url, response, content_type)
 
-        response.encoding = self._detect_encoding(response)
-        html = response.text
-        title = self._extract_title(html)
-        text = self._extract_text(html)
-
-        return ToolResult.success(f"Title: {title}\n\nContent:\n{text}")
-
-    # ---- Document fetching ----
-
-    def _fetch_document(self, url: str) -> ToolResult:
-        """Download a document file and extract its text content."""
-        suffix = _get_url_suffix(url)
-        parsed = urlparse(url)
-        filename = self._extract_filename(url)
-        tmp_dir = self._ensure_tmp_dir()
-
-        local_path = os.path.join(tmp_dir, filename)
-        logger.info(f"[WebFetch] Downloading document: {url} -> {local_path}")
-
-        try:
-            response = self._safe_get(url, stream=True)
-            response.raise_for_status()
-
-            content_length = int(response.headers.get("Content-Length", 0))
+            content_length = _parse_content_length(response)
             if content_length > MAX_FILE_SIZE:
                 return ToolResult.fail(
                     f"Error: File too large ({format_size(content_length)} > {format_size(MAX_FILE_SIZE)})"
                 )
 
-            downloaded = 0
-            with open(local_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE:
-                        f.close()
-                        os.remove(local_path)
-                        return ToolResult.fail(
-                            f"Error: File too large (>{format_size(MAX_FILE_SIZE)}), download aborted"
-                        )
-                    f.write(chunk)
+            try:
+                body = read_response(response, MAX_FILE_SIZE, max_seconds=PAGE_READ_SECONDS)
+            except MediaTooLargeError:
+                return ToolResult.fail(
+                    f"Error: File too large (>{format_size(MAX_FILE_SIZE)}), download aborted"
+                )
+            except requests.Timeout:
+                return ToolResult.fail(f"Error: Reading {parsed.netloc} took longer than {PAGE_READ_SECONDS}s")
+            # .content and .text decode these bytes instead of draining the spent stream.
+            response._content = body
+            response._content_consumed = True
 
-        except requests.Timeout:
-            return ToolResult.fail(f"Error: Download timed out after {DEFAULT_TIMEOUT}s")
-        except requests.ConnectionError:
-            return ToolResult.fail(f"Error: Failed to connect to {parsed.netloc}")
-        except requests.HTTPError as e:
-            return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
-        except ValueError as e:
-            self._cleanup_file(local_path)
-            return ToolResult.fail(f"Error: {e}")
-        except Exception as e:
-            self._cleanup_file(local_path)
-            return ToolResult.fail(f"Error: Failed to download file: {e}")
+            response.encoding = self._detect_encoding(response)
+            html = response.text
+            media_type = content_type.split(";", 1)[0].strip().lower()
+            if media_type in ("text/plain", "application/json"):
+                title = "Untitled"
+                text = html
+            else:
+                title = self._extract_title(html)
+                text = self._extract_text(html, response.url or url)
 
+            return ToolResult.success(f"Title: {title}\n\nContent:\n{text}")
+        finally:
+            if response is not None:
+                response.close()
+
+    # ---- Document fetching ----
+
+    def _fetch_document(self, url: str, suffix: Optional[str] = None,
+                        response: Optional[requests.Response] = None) -> ToolResult:
+        """Download or reuse a document response and extract its text content."""
         try:
-            text = self._parse_document(local_path, suffix)
-        except Exception as e:
-            self._cleanup_file(local_path)
-            return ToolResult.fail(f"Error: Failed to parse document: {e}")
+            suffix = suffix or _get_url_suffix(url)
+            parsed = urlparse(url)
+            filename = self._extract_filename(url)
+            if _get_url_suffix(url) not in ALL_DOC_SUFFIXES:
+                filename += suffix
+            tmp_dir = self._ensure_tmp_dir()
 
-        if not text or not text.strip():
+            local_path = os.path.join(tmp_dir, filename)
+            logger.info(f"[WebFetch] Downloading document: {url} -> {local_path}")
+
+            try:
+                if response is None:
+                    response = self._safe_get(url, stream=True)
+                response.raise_for_status()
+
+                content_length = _parse_content_length(response)
+                if content_length > MAX_FILE_SIZE:
+                    return ToolResult.fail(
+                        f"Error: File too large ({format_size(content_length)} > {format_size(MAX_FILE_SIZE)})"
+                    )
+
+                save_response(response, local_path, MAX_FILE_SIZE, max_seconds=PAGE_READ_SECONDS)
+
+            except MediaTooLargeError:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: File too large (>{format_size(MAX_FILE_SIZE)}), download aborted")
+            except requests.Timeout:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: Download from {parsed.netloc} timed out after {DEFAULT_TIMEOUT}s")
+            except requests.ConnectionError:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: Download from {parsed.netloc} failed: connection error")
+            except requests.HTTPError as e:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: HTTP {e.response.status_code} for URL: {url}")
+            except ValueError as e:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: {e}")
+            except Exception as e:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: Failed to download file: {e}")
+
+            try:
+                charset = _extract_charset_from_content_type(response.headers.get("Content-Type", ""))
+                text = self._parse_document(local_path, suffix, charset=charset)
+            except Exception as e:
+                self._cleanup_file(local_path)
+                return ToolResult.fail(f"Error: Failed to parse document: {e}")
+
+            if not text or not text.strip():
+                file_size = os.path.getsize(local_path)
+                return ToolResult.success(
+                    f"File downloaded to: {local_path} ({format_size(file_size)})\n"
+                    f"No text content could be extracted. The file may contain only images or be encrypted."
+                )
+
+            truncation = truncate_head(text)
+            result_text = truncation.content
+
             file_size = os.path.getsize(local_path)
-            return ToolResult.success(
-                f"File downloaded to: {local_path} ({format_size(file_size)})\n"
-                f"No text content could be extracted. The file may contain only images or be encrypted."
-            )
+            header = f"[Document: {filename} | Size: {format_size(file_size)} | Saved to: {local_path}]\n\n"
 
-        truncation = truncate_head(text)
-        result_text = truncation.content
+            if truncation.truncated:
+                header += f"[Content truncated: showing {truncation.output_lines} of {truncation.total_lines} lines]\n\n"
 
-        file_size = os.path.getsize(local_path)
-        header = f"[Document: {filename} | Size: {format_size(file_size)} | Saved to: {local_path}]\n\n"
+            return ToolResult.success(header + result_text)
+        finally:
+            if response is not None:
+                response.close()
 
-        if truncation.truncated:
-            header += f"[Content truncated: showing {truncation.output_lines} of {truncation.total_lines} lines]\n\n"
-
-        return ToolResult.success(header + result_text)
-
-    def _parse_document(self, file_path: str, suffix: str) -> str:
+    def _parse_document(self, file_path: str, suffix: str, charset: Optional[str] = None) -> str:
         """Parse document file and return extracted text."""
         if suffix in PDF_SUFFIXES:
             return self._parse_pdf(file_path)
         elif suffix in WORD_SUFFIXES:
             return self._parse_word(file_path)
         elif suffix in TEXT_SUFFIXES:
-            return self._parse_text(file_path)
+            return self._parse_text(file_path, charset=charset)
         elif suffix in SPREADSHEET_SUFFIXES:
             return self._parse_spreadsheet(file_path)
         elif suffix in PPT_SUFFIXES:
@@ -297,24 +624,24 @@ class WebFetch(BaseTool):
 
     def _parse_word(self, file_path: str) -> str:
         """Extract text from Word documents (.docx)."""
-        try:
-            from docx import Document
-        except ImportError:
-            raise ImportError(
-                "python-docx library is required for .docx parsing. Install with: pip install python-docx"
-            )
-        doc = Document(file_path)
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        return "\n\n".join(paragraphs)
+        from common.office_text import docx_blocks
+        return "\n\n".join(text for text in docx_blocks(file_path) if text.strip())
 
-    def _parse_text(self, file_path: str) -> str:
-        """Read plain text files (txt, md, csv, etc.)."""
+    def _parse_text(self, file_path: str, charset: Optional[str] = None) -> str:
+        """Read plain text, trying a declared charset before existing fallbacks."""
         encodings = ["utf-8", "utf-8-sig", "gbk", "gb2312", "latin-1"]
+        if charset and charset.lower() in _BROWSER_CHARSETS:
+            # Downloads with a legacy label are often UTF-8 anyway, and the browser
+            # codec would read much of that as garbage, so UTF-8 goes first. Real
+            # legacy text is rarely valid UTF-8.
+            encodings.insert(1, _BROWSER_CHARSETS[charset.lower()])
+        elif charset:
+            encodings.insert(0, charset)
         for enc in encodings:
             try:
                 with open(file_path, "r", encoding=enc) as f:
                     return f.read()
-            except (UnicodeDecodeError, UnicodeError):
+            except (UnicodeError, LookupError):
                 continue
         raise ValueError(f"Unable to decode file with any supported encoding: {encodings}")
 
@@ -327,44 +654,25 @@ class WebFetch(BaseTool):
                 "openpyxl library is required for .xlsx parsing. Install with: pip install openpyxl"
             )
 
-        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        from common.office_text import spreadsheet_sheets
         result_parts = []
+        with spreadsheet_sheets(file_path, openpyxl.load_workbook) as sheets:
+            for name, sheet_rows in sheets:
+                rows = [" | ".join(cells) for cells in sheet_rows if any(cells)]
+                if rows:
+                    result_parts.append(f"--- Sheet: {name} ---\n" + "\n".join(rows))
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows = []
-            for row in ws.iter_rows(values_only=True):
-                cells = [str(c) if c is not None else "" for c in row]
-                if any(cells):
-                    rows.append(" | ".join(cells))
-            if rows:
-                result_parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows))
-
-        wb.close()
         return "\n\n".join(result_parts)
 
     def _parse_ppt(self, file_path: str) -> str:
         """Extract text from PowerPoint files (.ppt/.pptx)."""
-        try:
-            from pptx import Presentation
-        except ImportError:
-            raise ImportError(
-                "python-pptx library is required for .pptx parsing. Install with: pip install python-pptx"
-            )
-
-        prs = Presentation(file_path)
+        from common.office_text import pptx_slides
+        slides = pptx_slides(file_path)
         text_parts = []
 
-        for slide_num, slide in enumerate(prs.slides, 1):
-            slide_texts = []
-            for shape in slide.shapes:
-                if shape.has_text_frame:
-                    for paragraph in shape.text_frame.paragraphs:
-                        text = paragraph.text.strip()
-                        if text:
-                            slide_texts.append(text)
+        for slide_num, slide_texts in enumerate(slides, 1):
             if slide_texts:
-                text_parts.append(f"--- Slide {slide_num}/{len(prs.slides)} ---\n" + "\n".join(slide_texts))
+                text_parts.append(f"--- Slide {slide_num}/{len(slides)} ---\n" + "\n".join(slide_texts))
 
         return "\n\n".join(text_parts)
 
@@ -372,27 +680,32 @@ class WebFetch(BaseTool):
 
     @staticmethod
     def _detect_encoding(response: requests.Response) -> str:
-        """Detect response encoding with priority: Content-Type header > HTML meta > chardet > utf-8."""
+        """Detect response encoding with priority: Content-Type header > HTML meta > chardet > utf-8.
+
+        The detected label is mapped to the codec a browser decodes it with.
+        """
         # 1. Check Content-Type header for explicit charset
         content_type = response.headers.get("Content-Type", "")
         charset = _extract_charset_from_content_type(content_type)
         if charset:
-            return charset
+            return _browser_charset(charset)
 
         # 2. Scan raw bytes for HTML meta charset declaration
         raw = response.content[:4096]
         charset = _extract_charset_from_html_meta(raw)
         if charset:
-            return charset
+            return _browser_charset(charset)
 
         # 3. Use apparent_encoding (chardet-based detection) if confident enough
         apparent = response.apparent_encoding
         if apparent:
             apparent_lower = apparent.lower()
-            # Trust CJK / Windows encodings detected by chardet
+            # Trust CJK / Windows encodings detected by chardet, including the Japanese
+            # and Korean Windows code pages, which it names CP932 and CP949
             trusted_prefixes = ("utf", "gb", "big5", "euc", "shift_jis", "iso-2022", "windows", "ascii")
-            if any(apparent_lower.startswith(p) for p in trusted_prefixes):
-                return apparent
+            trusted_names = ("cp932", "cp949")
+            if apparent_lower in trusted_names or any(apparent_lower.startswith(p) for p in trusted_prefixes):
+                return _browser_charset(apparent)
 
         # 4. Fallback
         return "utf-8"
@@ -456,19 +769,13 @@ class WebFetch(BaseTool):
                 break
 
         if detected_suffix and detected_suffix in ALL_DOC_SUFFIXES:
-            # Re-fetch as document
-            return self._fetch_document(url if _get_url_suffix(url) in ALL_DOC_SUFFIXES
-                                        else self._rewrite_url_with_suffix(url, detected_suffix))
+            # Content-Type selects the parser, not a different network URL.
+            # Reuse this response, including for signed or single-use downloads.
+            return self._fetch_document(url, suffix=detected_suffix, response=response)
+        response.close()
         return ToolResult.fail(f"Error: URL returned binary content ({content_type}), not a supported document type")
 
-    @staticmethod
-    def _rewrite_url_with_suffix(url: str, suffix: str) -> str:
-        """Append a suffix to the URL path so _get_url_suffix works correctly."""
-        parsed = urlparse(url)
-        new_path = parsed.path.rstrip("/") + suffix
-        return parsed._replace(path=new_path).geturl()
-
-    # ---- HTML extraction (unchanged) ----
+    # ---- HTML extraction ----
 
     @staticmethod
     def _extract_title(html: str) -> str:
@@ -476,14 +783,15 @@ class WebFetch(BaseTool):
         return match.group(1).strip() if match else "Untitled"
 
     @staticmethod
-    def _extract_text(html: str) -> str:
-        text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.IGNORECASE | re.DOTALL)
-        text = re.sub(r"<[^>]+>", "", text)
-        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        text = text.replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " ")
+    def _extract_text(html: str, base_url: str = "") -> str:
+        parser = _PageTextParser(base_url)
+        parser.feed(html)
+        parser.close()
+        text = "".join(parser.parts)
         text = re.sub(r"[^\S\n]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         lines = [line.strip() for line in text.splitlines()]
         text = "\n".join(lines)
-        return text.strip()
+        # Code in <pre> keeps its indentation, spacing and blank lines.
+        pre_blocks = iter(parser.pre_blocks)
+        return re.sub(_PRE_MARK, lambda _: next(pre_blocks), text.strip())

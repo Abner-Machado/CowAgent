@@ -5,7 +5,7 @@ Translates agent events (message_update, message_end, tool_execution_end, etc.)
 into the CHAT socket protocol format (content chunks with segment_id, tool_calls chunks).
 """
 
-import time
+import uuid
 from typing import Callable, Optional
 
 from common.log import logger
@@ -34,31 +34,40 @@ class ChatService:
         send_chunk_fn: Callable[[dict], None],
         channel_type: str = "",
         agent_id: str = None,
+        request_id: str = None,  # noqa: RUF013
+        speaker_agent_id: str = None,
+        members: list = None,
+        transcript: list = None,
+        persist: bool = True,
+        model_override: tuple = None,
     ):
         """
         Run the agent for *query* and stream results back via *send_chunk_fn*.
 
         The method blocks until the agent finishes. After it returns the SDK
-        will automatically send the final (streaming=false) message.
+        will automatically send the final (streaming=false) message. Returns
+        the provider usage summed over the run's model calls, or None.
 
         :param query: user query text
         :param session_id: session identifier for agent isolation
         :param send_chunk_fn: callable(chunk_data: dict) to send a streaming chunk
         :param channel_type: source channel (e.g. "web", "feishu") for persistence
-        :param agent_id: selected agent profile; defaults to the configured default
+        :param agent_id: agent that owns the conversation; defaults to the configured default
+        :param request_id: per-request cancellation key; defaults to session scope
+        :param speaker_agent_id: teammate addressed for this turn; it answers in
+            the owner's conversation, so the transcript stays in one place
+        :param members: roster of the conversation (teammate ids). When given it
+            is authoritative and reconciled onto the session, like a team channel
+        :param transcript: attributed messages to run against instead of the
+            restored history (conversation kept elsewhere)
+        :param persist: store the turn in the conversation history; off for a
+            one-off request whose caller keeps the conversation itself
+        :param model_override: ``(provider, model)`` to answer this turn on,
+            instead of the conversation's or the Agent's own model
         """
+        # The conversation belongs to ``resolved_agent_id`` (its owner); only the
+        # voice answering this turn may differ. Same model as agent_reply.
         resolved_agent_id = self.agent_bridge._resolve_agent_id(agent_id)
-        agent = self.agent_bridge.get_agent(
-            session_id=session_id, agent_id=resolved_agent_id
-        )
-        if agent is None:
-            raise RuntimeError("Failed to initialise agent for the session")
-
-        # Pass context metadata to model for downstream API requests
-        if hasattr(agent, 'model'):
-            agent.model.channel_type = channel_type or ""
-            agent.model.session_id = session_id or ""
-            agent.model.agent_id = resolved_agent_id
 
         # Build a context so context-aware tools (e.g. scheduler) can resolve the
         # receiver/session. This streaming path bypasses agent_bridge.agent_reply,
@@ -66,6 +75,63 @@ class ChatService:
         context = self._build_context(
             query, session_id, channel_type, resolved_agent_id
         )
+        speaker_id = resolved_agent_id
+        model_query = query
+        is_team = False
+        cached = False
+        if speaker_agent_id or members is not None:
+            if members is not None:
+                context["members"] = list(members)
+            if speaker_agent_id:
+                context["speaker_agent_id"] = speaker_agent_id
+            self.agent_bridge._seed_team_members(session_id, resolved_agent_id, context)
+            peer_speaker = self._peer_speaker(speaker_agent_id, resolved_agent_id)
+            if peer_speaker is not None:
+                self._run_on_peer(
+                    query, session_id, channel_type, resolved_agent_id,
+                    peer_speaker, send_chunk_fn,
+                )
+                return
+            speaker_id = self.agent_bridge._resolve_speaker(resolved_agent_id, context)
+            is_team = speaker_id != resolved_agent_id or self._has_team(session_id, resolved_agent_id)
+            if speaker_agent_id:
+                # What the model is asked once the address has been acted on
+                # (also when the owner itself was named); the transcript keeps
+                # the verbatim query.
+                model_query = self.agent_bridge._strip_address(query, speaker_id)
+            cached = self.agent_bridge._has_runtime(speaker_id, session_id)
+            agent = self.agent_bridge.get_agent(
+                session_id=session_id,
+                agent_id=speaker_id,
+                host_agent_id=resolved_agent_id,
+            )
+        else:
+            agent = self.agent_bridge.get_agent(
+                session_id=session_id, agent_id=resolved_agent_id
+            )
+        if agent is None:
+            raise RuntimeError("Failed to initialise agent for the session")
+        if is_team:
+            # One transcript per team conversation: reload it with author labels
+            # so this speaker sees the turns others spoke since it last ran. A
+            # runtime built for this turn has only just restored it.
+            if cached:
+                self.agent_bridge._sync_shared_transcript(agent, session_id, resolved_agent_id)
+            self._send_speaker(send_chunk_fn, speaker_id)
+        if transcript is not None:
+            with agent.messages_lock:
+                agent.messages = list(transcript)
+        # Lasts until the next fetch of this runtime re-applies the
+        # conversation's own settings.
+        if model_override and hasattr(getattr(agent, "model", None), "set_session_override"):
+            agent.model.set_session_override(*model_override)
+
+        # Pass context metadata to model for downstream API requests
+        if hasattr(agent, 'model'):
+            agent.model.channel_type = channel_type or ""
+            agent.model.session_id = session_id or ""
+            agent.model.agent_id = speaker_id
+
         self._attach_context_aware_tools(agent, context)
 
         # Mark this session as mid-run so the self-evolution idle scan does not
@@ -74,6 +140,31 @@ class ChatService:
 
         # State shared between the event callback and this method
         state = _StreamState()
+
+        from agent.protocol.step_writer import StepWriter
+
+        # The store is the owner's: a guest speaker writes into the shared
+        # transcript, stamped as author.
+        def write_run_messages(messages: list):
+            if not persist:
+                return
+            workspace_root = agent.workspace_dir
+            if is_team:
+                messages = self.agent_bridge._attribute_to_speaker(messages, speaker_id)
+                messages = self.agent_bridge._strip_speaker_prefix_from_messages(messages)
+                workspace_root = self._owner_workspace(resolved_agent_id, agent)
+            # Only the first chunk carries the run's query.
+            if model_query != query and not writer.started:
+                messages = self._restore_verbatim_query(messages, model_query, query)
+            persisted = self._persist_messages(
+                session_id, list(messages), channel_type, workspace_root=workspace_root,
+            )
+            if persisted is False:
+                # StepWriter only marks a chunk written after this callback
+                # succeeds. Keep a refused batch pending for the next flush.
+                raise RuntimeError("conversation write failed; step remains pending")
+
+        writer = StepWriter(write_run_messages)
 
         def flush_file_links():
             """Emit any buffered file links as content, then drop them."""
@@ -118,6 +209,13 @@ class ChatService:
                     # After tool_calls are executed the next content will be
                     # a new segment; collect tool results until turn_end.
                     state.pending_tool_results = []
+
+            elif event_type == "tool_retrieval":
+                # Forward sanitized retrieval metadata for progress displays.
+                send_chunk_fn({
+                    "chunk_type": "tool_retrieval",
+                    "data": data,
+                })
 
             elif event_type == "file_to_send":
                 url = data.get("url") or ""
@@ -178,6 +276,21 @@ class ChatService:
                     "id": tool_call_id,
                 }
 
+                # A call settles when its own tool finishes, not when the round
+                # does. A delegated turn holds the round open for as long as the
+                # teammate works, so every call made inside one - the hand-off
+                # included - would otherwise sit unfinished until it returns.
+                send_chunk_fn({
+                    "chunk_type": "tool_end",
+                    "tool_id": tool_call_id,
+                    "tool": tool_name,
+                    "status": status,
+                    "result": result,
+                    "elapsed": elapsed_str,
+                })
+
+                # Still collected for the closing batch: a client that predates
+                # the chunk above learns the outcome there, as it always did.
                 if state.pending_tool_results is not None:
                     state.pending_tool_results.append(tool_info)
 
@@ -198,6 +311,25 @@ class ChatService:
                     "status": data.get("status"),
                     "execution_time": data.get("execution_time"),
                     "error": data.get("error"),
+                })
+
+            elif event_type == "peer_message_start":
+                # A teammate takes over for a stretch of this turn. What follows
+                # is its reply, in the same chunks as any other, until the
+                # matching end marker hands the floor back.
+                send_chunk_fn({
+                    "chunk_type": "peer_start",
+                    "card_id": data.get("card_id"),
+                    "agent_id": data.get("agent_id"),
+                    "agent_name": data.get("agent_name"),
+                })
+
+            elif event_type == "peer_message_end":
+                send_chunk_fn({
+                    "chunk_type": "peer_end",
+                    "card_id": data.get("card_id"),
+                    "agent_id": data.get("agent_id"),
+                    "status": data.get("status", "done"),
                 })
 
             elif event_type == "artifact":
@@ -222,6 +354,7 @@ class ChatService:
                 # Now that the tool results are out, the links belong to the
                 # content that follows them.
                 flush_file_links()
+                writer.step()
 
         # Run the agent with our event callback ---------------------------
         logger.info(
@@ -230,7 +363,7 @@ class ChatService:
         )
 
         from config import conf
-        max_context_turns = conf().get("agent_max_context_turns", 20)
+        max_context_turns = conf().get("agent_max_context_turns", 30)
 
         # Get full system prompt with skills
         full_system_prompt = agent.get_full_system_prompt()
@@ -243,11 +376,11 @@ class ChatService:
         from agent.protocol.agent_stream import AgentStreamExecutor
 
         # Register a cancel token so /cancel can abort this in-flight run.
-        # IM channels key on session_id (no per-turn request_id here).
+        # API calls can key by request; IM channels remain session scoped.
         from agent.protocol import get_cancel_registry, get_steer_registry
         registry = get_cancel_registry()
         steer_registry = get_steer_registry()
-        cancel_key = (
+        scoped_session_key = (
             self.agent_bridge._cancel_key(
                 resolved_agent_id,
                 session_id,
@@ -256,17 +389,24 @@ class ChatService:
             if session_id
             else None
         )
+        cancel_key = (
+            self.agent_bridge._cancel_key(
+                resolved_agent_id,
+                request_id,
+                self.agent_bridge.agent_registry.default_agent_id,
+            )
+            if request_id
+            else scoped_session_key
+        )
         # Both the token and its session grouping are namespaced: two Agents
         # serving the same session id must not cancel or steer each other.
         cancel_event = (
-            registry.register(cancel_key, session_id=cancel_key)
+            registry.register(cancel_key, session_id=scoped_session_key)
             if cancel_key
             else None
         )
         steer_inbox = (
-            steer_registry.register(cancel_key)
-            if cancel_key
-            else None
+            steer_registry.register(scoped_session_key) if scoped_session_key else None
         )
 
         executor = AgentStreamExecutor(
@@ -281,10 +421,19 @@ class ChatService:
             cancel_event=cancel_event,
             steer_inbox=steer_inbox,
         )
+        writer.bind(executor)
 
         try:
-            response = executor.run_stream(query)
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info(
+                    f"[ChatService] Skipping pre-cancelled run: agent={resolved_agent_id}, "
+                    f"session={session_id}"
+                )
+                return
+            executor.run_stream(model_query)
         except Exception:
+            # Keep the steps finished before the failure.
+            writer.step()
             # If executor cleared messages (context overflow), sync back
             if len(executor.messages) == 0:
                 with agent.messages_lock:
@@ -295,13 +444,13 @@ class ChatService:
             # Clear the mid-run flag so idle scans can review this session again.
             self._mark_run_active(agent, False)
             # Release cancel token to keep the registry bounded.
-            if session_id:
+            if cancel_key:
                 try:
                     registry.unregister(cancel_key)
                 except Exception:
                     pass
-            if cancel_key and steer_inbox is not None:
-                steer_registry.unregister(cancel_key, steer_inbox)
+            if scoped_session_key and steer_inbox is not None:
+                steer_registry.unregister(scoped_session_key, steer_inbox)
 
         # A run that ends without a closing turn_end (e.g. the last turn had no
         # tool calls to flush) must still deliver whatever the send tool uploaded.
@@ -313,8 +462,11 @@ class ChatService:
         # appending would leave stale pre-trim messages in agent.messages
         # and cause the same trim to fire on every subsequent request.
         with agent.messages_lock:
+            run_start = executor.run_start_index()
             trimmed = len(executor.messages) < original_length
-            if trimmed:
+            if run_start is not None:
+                new_messages = list(executor.messages[run_start:])
+            elif trimmed:
                 # Context was trimmed: the executor appended the new user
                 # query *before* trimming, so the new messages (user +
                 # assistant + tools) sit at the tail of the trimmed list.
@@ -359,14 +511,9 @@ class ChatService:
             agent.messages = list(executor.messages)
 
         # Persist new messages to SQLite so they survive restarts and
-        # can be queried via the HISTORY interface.
-        if new_messages:
-            self._persist_messages(
-                session_id,
-                list(new_messages),
-                channel_type,
-                workspace_root=agent.workspace_dir,
-            )
+        # can be queried via the HISTORY interface. Steps already stored at
+        # turn_end are skipped.
+        writer.finish(new_messages)
 
         # Store executor reference for files_to_send access
         agent.stream_executor = executor
@@ -377,12 +524,18 @@ class ChatService:
         # Record this user turn for the self-evolution idle trigger. This
         # streaming path bypasses agent_bridge.agent_reply, so the activity must
         # be noted here, otherwise idle scans never see any signal to evolve.
-        self._note_evolution_turn(agent, context)
+        if persist:
+            self._note_evolution_turn(agent, context)
+
+        if persist and session_id:
+            self._remember_context_usage(agent, session_id, resolved_agent_id)
 
         logger.info(
             f"[ChatService] Agent run completed: agent={resolved_agent_id}, "
             f"session={session_id}"
         )
+        run_usage = getattr(executor, "run_usage", None)
+        return dict(run_usage) if run_usage else None
 
 
 
@@ -407,8 +560,254 @@ class ChatService:
         return ctx
 
     @staticmethod
-    def _attach_context_aware_tools(agent, context):
-        """Attach the current context to tools that need it (scheduler)."""
+    def _has_team(session_id: str, host_agent_id: str) -> bool:
+        """Whether the session has teammates on it (a shared conversation)."""
+        if not session_id:
+            return False
+        try:
+            from agent.workspace import session_prefs
+            return bool(session_prefs.get_prefs(session_id, host_agent_id).get("members"))
+        except Exception:
+            return False
+
+    def _send_speaker(self, send_chunk_fn, speaker_id: str) -> None:
+        """Tell the client who is answering this turn, so a shared conversation
+        can attribute the reply to the right agent as it streams."""
+        try:
+            profile = self.agent_bridge.agent_registry.get(speaker_id, require_enabled=False)
+            send_chunk_fn({
+                "chunk_type": "speaker",
+                "agent_id": profile.id,
+                "name": profile.name,
+                "avatar": profile.avatar or "",
+            })
+        except Exception as e:
+            logger.debug(f"[ChatService] speaker chunk skipped: {e}")
+
+    # ---- peer speaker --------------------------------------------------------
+
+    def _peer_speaker(self, addressed_id: str, owner_agent_id: str):
+        """The addressed peer, or None when the id is empty, the owner, a local
+        agent, or unknown to the transport."""
+        addressed_id = str(addressed_id or "").strip()
+        if not addressed_id or addressed_id == owner_agent_id:
+            return None
+        try:
+            self.agent_bridge.agent_registry.get_addressed(addressed_id, require_enabled=False)
+            return None
+        except Exception:
+            pass
+        try:
+            from agent.multiagent import get_transport, peer as peer_of
+        except Exception:
+            return None
+        if get_transport() is None:
+            return None
+        return peer_of(addressed_id)
+
+    def _run_on_peer(
+        self,
+        query: str,
+        session_id: str,
+        channel_type: str,
+        owner_agent_id: str,
+        peer,
+        send_chunk_fn: Callable[[dict], None],
+    ) -> None:
+        """The addressed peer answers this turn; its reply streams under its
+        name and is stored in the owner's transcript, like a local guest."""
+        from agent.multiagent import MODE_SPEAK, InvokeRequest, get_transport
+
+        transport = get_transport()
+        owner = self.agent_bridge.agent_registry.get(owner_agent_id, require_enabled=False)
+        roster = self._roster(session_id, owner_agent_id)
+
+        members = [owner.id, *(m for m in roster if m not in (owner.id, peer.id))]
+        peers = []
+        for member_id in members:
+            profile = self._teammate_profile(member_id)
+            if profile is not None:
+                peers.append(profile)
+
+        request = InvokeRequest(
+            request_id=uuid.uuid4().hex,
+            target_id=peer.id,
+            task=self._strip_peer_address(query, peer),
+            source_id=owner.id,
+            source_name=owner.name,
+            root_session_id=session_id,
+            trace=(owner.id,),
+            depth=0,
+            members=tuple(members),
+            peers=tuple(peers),
+            timeout_seconds=self._speak_timeout(),
+            mode=MODE_SPEAK,
+            history=tuple(self._shared_history(session_id, owner)),
+        )
+
+        send_chunk_fn({
+            "chunk_type": "speaker",
+            "agent_id": peer.id,
+            "name": peer.name,
+            "avatar": "",
+        })
+        logger.info(
+            f"[ChatService] Turn addressed to peer {peer.id}; "
+            f"answering in {owner.id}'s conversation, session={session_id}"
+        )
+
+        spoken = []
+
+        def forward(event) -> None:
+            if not isinstance(event, dict) or event.get("type") != "chunk":
+                return
+            chunk = event.get("data")
+            if not isinstance(chunk, dict):
+                return
+            kind = chunk.get("chunk_type")
+            if kind == "speaker":
+                return
+            if kind == "content":
+                spoken.append(str(chunk.get("delta") or ""))
+            send_chunk_fn(chunk)
+
+        result = transport.invoke(request, on_event=forward)
+        if not result.ok:
+            raise RuntimeError(f"{peer.name} could not answer: {result.error}")
+
+        content = result.content or "".join(spoken)
+        if content and not spoken:
+            # nothing was streamed: deliver the reply in one piece
+            send_chunk_fn({"chunk_type": "content", "delta": content, "segment_id": 0})
+        turn = [
+            {"role": "user", "content": [{"type": "text", "text": query}]},
+            {"role": "assistant", "content": [{"type": "text", "text": content}]},
+        ]
+        self._persist_messages(
+            session_id,
+            self.agent_bridge._attribute_to_speaker(turn, peer.id),
+            channel_type,
+            workspace_root=owner.workspace,
+        )
+
+    def _roster(self, session_id: str, owner_agent_id: str) -> list:
+        """Teammate ids on the session, as stored."""
+        if not session_id:
+            return []
+        try:
+            from agent.workspace import session_prefs
+            return list(session_prefs.get_prefs(session_id, owner_agent_id).get("members") or [])
+        except Exception:
+            return []
+
+    @staticmethod
+    def _teammate_profile(agent_id: str):
+        """A PeerAgent for anyone on the team, local or not; None if unknown."""
+        from agent.multiagent import PeerAgent, resolve_teammate
+
+        found = resolve_teammate(agent_id)
+        return PeerAgent.from_any(found) if found else None
+
+    @staticmethod
+    def _strip_peer_address(query: str, peer) -> str:
+        """Drop the leading "@name" aimed at ``peer``; see AgentBridge._strip_address."""
+        from agent.team_addressing import strip_address
+
+        return strip_address(query, [peer.name, peer.id])
+
+    @staticmethod
+    def _restore_verbatim_query(messages: list, model_query: str, query: str) -> list:
+        """Put the verbatim query back into the turn's user message.
+
+        The model is asked ``model_query`` (the "@name" already acted on), but
+        the transcript must keep what was typed, or replay loses the address.
+        Copies are returned; the in-memory context keeps what the model saw.
+        """
+        restored = list(messages)
+        for i, msg in enumerate(restored):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and model_query in content:
+                restored[i] = {**msg, "content": content.replace(model_query, query, 1)}
+                return restored
+            if isinstance(content, list):
+                for j, block in enumerate(content):
+                    text = block.get("text") if isinstance(block, dict) and block.get("type") == "text" else None
+                    if text and model_query in text:
+                        blocks = list(content)
+                        blocks[j] = {**block, "text": text.replace(model_query, query, 1)}
+                        restored[i] = {**msg, "content": blocks}
+                        return restored
+        return restored
+
+    @staticmethod
+    def _speak_timeout() -> float:
+        try:
+            from config import conf
+            return float((conf().get("agent_delegation") or {}).get("timeout_seconds") or 600)
+        except Exception:
+            return 600.0
+
+    def _shared_history(self, session_id: str, owner) -> list:
+        """Text-only history with authors, oldest first."""
+        try:
+            from config import conf
+            if not conf().get("conversation_persistence", True):
+                return []
+            from agent.memory import get_conversation_store
+            from bridge.agent_initializer import AgentInitializer
+
+            max_turns = conf().get("agent_max_context_turns", 30)
+            saved = get_conversation_store(owner.workspace).load_messages(
+                session_id, max_turns=max(3, max_turns // 2), with_authors=True
+            )
+        except Exception as e:
+            logger.warning(f"[ChatService] shared history unavailable for {session_id}: {e}")
+            return []
+        history = []
+        for message in AgentInitializer._filter_text_only_messages(saved or []):
+            blocks = message.get("content") or []
+            text = blocks[0].get("text", "") if blocks and isinstance(blocks[0], dict) else ""
+            if not text:
+                continue
+            entry = {"role": message["role"], "text": text}
+            if message["role"] == "assistant":
+                entry["agent_id"] = self._outside_agent_id(
+                    message.get("agent_id") or owner.id
+                )
+            history.append(entry)
+        return history
+
+    def _outside_agent_id(self, agent_id):
+        """The default Agent goes out under the reserved alias, as speaker chunks do."""
+        try:
+            from agent.registry import DEFAULT_AGENT_ALIAS
+
+            if agent_id and agent_id == self.agent_bridge.agent_registry.default_agent_id:
+                return DEFAULT_AGENT_ALIAS
+        except Exception as e:
+            logger.debug(f"[ChatService] alias lookup failed: {e}")
+        return agent_id
+
+    def _remember_context_usage(self, agent, session_id: str, owner_agent_id: str) -> None:
+        """Best-effort: a turn that answered must not fail over the usage chart."""
+        try:
+            self.agent_bridge.remember_context_usage(agent, session_id, owner_agent_id)
+        except Exception as e:
+            logger.debug(f"[ChatService] Context usage snapshot skipped: {e}")
+
+    def _owner_workspace(self, owner_agent_id: str, agent) -> str:
+        """Workspace whose store holds the conversation: the owner's."""
+        try:
+            return self.agent_bridge.agent_registry.get(
+                owner_agent_id, require_enabled=False
+            ).workspace
+        except Exception:
+            return agent.workspace_dir
+
+    def _attach_context_aware_tools(self, agent, context):
+        """Attach the current context to tools that need turn metadata."""
         try:
             if not (context and getattr(agent, "tools", None)):
                 return
@@ -416,7 +815,9 @@ class ChatService:
                 if tool.name == "scheduler":
                     from agent.tools.scheduler.integration import attach_scheduler_to_tool
                     attach_scheduler_to_tool(tool, context)
-                    break
+                elif tool.name == "agent_delegate":
+                    from agent.tools.agent_delegate.agent_delegate import attach_agent_delegate_to_tool
+                    attach_agent_delegate_to_tool(tool, self.agent_bridge, context)
         except Exception as e:
             logger.warning(f"[ChatService] Failed to attach context to scheduler: {e}")
 
@@ -449,21 +850,34 @@ class ChatService:
         channel_type: str = "",
         workspace_root: str = None,
     ):
+        """Best-effort write, reporting failure to the incremental writer."""
         try:
             from config import conf
             if not conf().get("conversation_persistence", True):
-                return
+                return True
         except Exception:
             pass
+        stored = False
         try:
             from agent.memory import get_conversation_store
-            get_conversation_store(workspace_root).append_messages(
+            store = get_conversation_store(workspace_root)
+            stored = store.append_messages(
                 session_id, new_messages, channel_type=channel_type
             )
+            if stored:
+                from agent.protocol.artifact import index_message_artifacts
+                index_message_artifacts(
+                    store, session_id, new_messages,
+                    workspace_root=workspace_root,
+                    agent_id=getattr(store, "_agent_id", None) or None,
+                )
+            return stored
         except Exception as e:
             logger.warning(
                 f"[ChatService] Failed to persist messages for session={session_id}: {e}"
             )
+            # Artifact indexing happens after the append committed; do not replay it.
+            return bool(stored)
 
 
 class _StreamState:

@@ -1,6 +1,6 @@
 ---
 title: Features
-description: CowAgent long-term memory, task planning, skills system, CLI commands, and browser tool in detail
+description: "A tour of CowAgent's core features: layered long-term memory with Deep Dream, self-evolution, a personal knowledge base and graph, task planning and tools, scheduling, skills, CLI and browser control."
 ---
 
 ## 1. Long-term Memory
@@ -143,3 +143,19 @@ cow install-browser    # Install browser tool
 ```
 
 See [Command Overview](https://docs.cowagent.ai/en/cli) for details.
+
+## 6. Multi-Agent Teams
+
+CowAgent is no longer just a single Agent. You can create multiple Agents to form a team, each with its own responsibilities, model, skills, and knowledge, with isolated workspaces and memory. They can work independently or be brought into the same session to collaborate. A channel can bind a single Agent or the whole team to serve externally, making it easy to set up a team of digital employees.
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/team-overview.png" width="800" />
+</Frame>
+
+In a group-chat session, multiple Agents can participate together: use `@` to direct a member to answer, or let the lead Agent automatically **delegate** a task to a more suitable member and consolidate the reply. The lead Agent can also spin up temporary **sub-Agents** to handle independent subtasks in parallel, returning only the conclusion without cluttering the main conversation's context.
+
+<Frame>
+  <img src="https://cdn.jsdelivr.net/gh/zhayujie/cowagent-assets@main/screenshots/en/agent-group-session.png" width="800" />
+</Frame>
+
+See [Agent Teams](/multi-agent/team), [Task Delegation](/tools/delegate), and [Sub-Agents](/multi-agent/subagent) for details.

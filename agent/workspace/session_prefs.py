@@ -34,9 +34,15 @@ import threading
 import time
 from typing import Dict, Optional
 
+from common.atomic_write import write_json_atomic
 from common.log import logger
 
-_FIELDS = ("provider", "model", "permission")
+# ``members`` is the roster of a team conversation: the Agent ids the session's
+# owner may hand work to. Here rather than in a table of its own for the same
+# reason the model override is — it can be set before the conversation has a
+# single message, so there is no row to hang it off yet. An empty roster is
+# stored as absent, which is exactly "not a team conversation".
+_FIELDS = ("provider", "model", "permission", "members")
 
 _lock = threading.Lock()
 
@@ -57,6 +63,8 @@ def _load() -> Dict:
     except Exception as e:
         logger.warning(f"[SessionPrefs] Could not read {path}: {e}")
         return {"sessions": {}}
+    if not isinstance(data, dict):
+        return {"sessions": {}}
     if not isinstance(data.get("sessions"), dict):
         data["sessions"] = {}
     return data
@@ -66,12 +74,10 @@ def _save(data: Dict) -> None:
     path = _store_file()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        write_json_atomic(path, data, indent=2)
     except Exception as e:
         logger.warning(f"[SessionPrefs] Could not write {path}: {e}")
+        raise
 
 
 def _session_key(session_id: str, agent_id: Optional[str]) -> str:
@@ -89,6 +95,26 @@ def get_prefs(session_id: str, agent_id: Optional[str] = None) -> Dict:
     if not isinstance(entry, dict):
         return {}
     return {k: entry[k] for k in _FIELDS if entry.get(k)}
+
+
+def members_index() -> Dict[tuple, list]:
+    """Every team conversation's roster, keyed by ``(agent_id, session_id)``.
+
+    Listing conversations needs the roster for a whole page at once, and asking
+    per row would re-read and re-parse the file once per conversation. Only
+    team conversations appear here, so an empty result means nobody has ever
+    invited anybody.
+    """
+    with _lock:
+        data = _load()
+    index: Dict[tuple, list] = {}
+    for key, entry in data["sessions"].items():
+        if not isinstance(entry, dict) or not entry.get("members"):
+            continue
+        agent_id, _, session_id = str(key).partition("::")
+        if session_id:
+            index[(agent_id, session_id)] = list(entry["members"])
+    return index
 
 
 def set_prefs(
@@ -137,6 +163,51 @@ def forget_session(session_id: str, agent_id: Optional[str] = None) -> None:
     with _lock:
         data = _load()
         if data["sessions"].pop(key, None) is not None:
+            _save(data)
+
+
+def forget_agent(agent_id: str) -> None:
+    """Erase every trace of a deleted Agent from the prefs store.
+
+    Deleting an Agent leaves two kinds of dangling references here that would
+    otherwise linger forever:
+
+    - Its own sessions' overrides, keyed ``{agent_id}::*`` — orphaned, because
+      the conversations they belonged to were removed with the Agent's
+      workspace.
+    - Its id sitting in *other* Agents' team ``members`` rosters — a ghost
+      teammate the composer/settings would keep offering as ``available:false``.
+
+    Both are pruned in one pass; a row left with nothing pinned is dropped
+    rather than kept as an empty husk.
+    """
+    if not agent_id:
+        return
+    owner_prefix = f"{agent_id}::"
+    with _lock:
+        data = _load()
+        sessions = data["sessions"]
+        changed = False
+
+        for key in [k for k in sessions if str(k).startswith(owner_prefix)]:
+            sessions.pop(key, None)
+            changed = True
+
+        for key, entry in list(sessions.items()):
+            if not isinstance(entry, dict) or not entry.get("members"):
+                continue
+            members = [m for m in entry["members"] if m != agent_id]
+            if len(members) == len(entry["members"]):
+                continue
+            changed = True
+            if members:
+                entry["members"] = members
+            else:
+                entry.pop("members", None)
+                if not any(entry.get(f) for f in _FIELDS):
+                    sessions.pop(key, None)
+
+        if changed:
             _save(data)
 
 

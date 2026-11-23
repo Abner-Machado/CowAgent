@@ -1,6 +1,7 @@
 # Provider types
 OPEN_AI = "openAI"
 OPENAI = "openai"
+CODEX = "codex"  # Codex App Server with ChatGPT sign-in
 CHATGPT = "chatGPT"  # legacy alias for OPENAI, kept for backward compatibility
 BAIDU = "baidu"
 QIANFAN = "qianfan"
@@ -16,8 +17,14 @@ MOONSHOT = "moonshot"
 MiniMax = "minimax"
 DEEPSEEK = "deepseek"
 MIMO = "mimo"  # Xiaomi MiMo
+COWAGENT = "cowagent"  # CowAgent model API, OpenAI-compatible
 CUSTOM = "custom"  # custom OpenAI-compatible API, bot_type won't auto-switch on model change
 MODELSCOPE = "modelscope"
+
+# CowAgent model API sites. Accounts and keys are separate per site: a key
+# only works against the site that issued it.
+COWAGENT_API_BASE_CN = "https://api.cowagent.cn/v1"
+COWAGENT_API_BASE_GLOBAL = "https://api.cowagent.ai/v1"
 
 # Model list
 # Claude (Anthropic)
@@ -30,6 +37,7 @@ CLAUDE_35_SONNET = "claude-3-5-sonnet-latest"  # "latest" tag always points to t
 CLAUDE_35_SONNET_1022 = "claude-3-5-sonnet-20241022"  # dated name pinned to a specific release
 CLAUDE_35_SONNET_0620 = "claude-3-5-sonnet-20240620"
 CLAUDE_4_OPUS = "claude-opus-4-0"
+CLAUDE_FABLE_5_1 = "claude-fable-5-1"    # Claude Fable 5.1 - alternative Claude 5 flagship
 CLAUDE_FABLE_5 = "claude-fable-5"        # Claude Fable 5 - alternative Claude 5 flagship
 CLAUDE_4_8_OPUS = "claude-opus-4-8"      # Claude Opus 4.8 - Agent recommended model
 CLAUDE_4_7_OPUS = "claude-opus-4-7"      # Claude Opus 4.7
@@ -38,7 +46,10 @@ CLAUDE_4_SONNET = "claude-sonnet-4-0"    # Claude Sonnet 4.0
 CLAUDE_4_5_SONNET = "claude-sonnet-4-5"  # Claude Sonnet 4.5 - Agent recommended model
 CLAUDE_4_6_SONNET = "claude-sonnet-4-6"  # Claude Sonnet 4.6 - Agent recommended model
 CLAUDE_SONNET_5 = "claude-sonnet-5"      # Claude Sonnet 5 - balanced Claude 5 flagship
-CLAUDE_OPUS_5 = "claude-opus-5"          # Claude Opus 5 - default flagship model for Claude
+CLAUDE_OPUS_5 = "claude-opus-5"          # Claude Opus 5 - previous Opus flagship
+CLAUDE_OPUS_5_5 = "claude-opus-5-5"      # Claude Opus 5.5 - default flagship model for Claude
+CLAUDE_SONNET_5_5 = "claude-sonnet-5-5"  # Claude Sonnet 5.5 - balanced speed and intelligence
+CLAUDE_HAIKU_5_5 = "claude-haiku-5-5"    # Claude Haiku 5.5 - fastest, for high-volume tasks
 
 # Gemini (Google)
 GEMINI_PRO = "gemini-1.0-pro"
@@ -55,6 +66,8 @@ GEMINI_31_FLASH_LITE_PRE = "gemini-3.1-flash-lite-preview"  # Gemini 3.1 Flash L
 GEMINI_35_FLASH = "gemini-3.5-flash"  # Gemini 3.5 Flash
 GEMINI_36_FLASH = "gemini-3.6-flash"  # Gemini 3.6 Flash
 GEMINI_37_FLASH = "gemini-3.7-flash"  # Gemini 3.7 Flash - Agent recommended model (default)
+GEMINI_38_FLASH = "gemini-3.8-flash"  # Gemini 3.8 Flash
+GEMINI_4_ARGON = "gemini-4-argon"  # Gemini 4 Argon - default, most capable, always thinking (thinkingLevel low/medium/high)
 
 # OpenAI
 GPT35 = "gpt-3.5-turbo"
@@ -83,7 +96,14 @@ GPT_54 = "gpt-5.4"  # GPT-5.4 - Agent recommended model
 GPT_54_MINI = "gpt-5.4-mini"
 GPT_54_NANO = "gpt-5.4-nano"
 GPT_55 = "gpt-5.5"  # GPT-5.5 - top-tier (expensive), not default
-GPT_56_LUNA = "gpt-5.6-luna"    # GPT-5.6 Luna - default flagship model for GPT
+GPT_62_SOL = "gpt-6.2-sol"      # GPT-6.2 Sol - default model for GPT (Responses API)
+GPT_62_ASTRA = "gpt-6.2-astra"  # GPT-6.2 Astra - most intelligent flagship (Responses API, higher cost)
+GPT_61_TERRA = "gpt-6.1-terra"  # GPT-6.1 Terra - fast and efficient (Responses API)
+GPT_61_SOL = "gpt-6.1-sol"      # GPT-6.1 Sol - flagship (Responses API)
+GPT_6_LUNA = "gpt-6-luna"       # GPT-6 Luna (Responses API)
+GPT_6_SOL = "gpt-6-sol"         # GPT-6 Sol (Responses API)
+GPT_6_ASTRA = "gpt-6-astra"     # GPT-6 Astra - most intelligent flagship (Responses API, higher cost)
+GPT_56_LUNA = "gpt-5.6-luna"    # GPT-5.6 Luna
 GPT_56_TERRA = "gpt-5.6-terra"  # GPT-5.6 Terra
 GPT_56_SOL = "gpt-5.6-sol"      # GPT-5.6 Sol - highest intelligence, higher latency
 O1 = "o1-preview"
@@ -95,8 +115,10 @@ TTS_1_HD = "tts-1-hd"
 # DeepSeek
 DEEPSEEK_CHAT = "deepseek-chat"  # DeepSeek-V3 chat model
 DEEPSEEK_REASONER = "deepseek-reasoner"  # DeepSeek-R1 model
-DEEPSEEK_V4_FLASH = "deepseek-v4-flash"  # DeepSeek V4 Flash - default recommendation (thinking + tool calls)
+DEEPSEEK_FLASH = "deepseek-flash"  # DeepSeek V4.1 Flash - default recommendation (native multimodal, thinking + tool calls)
+DEEPSEEK_V4_FLASH = "deepseek-v4-flash"  # DeepSeek V4 Flash (thinking + tool calls)
 DEEPSEEK_V4_PRO = "deepseek-v4-pro"  # DeepSeek V4 Pro - stronger on complex tasks (thinking + tool calls)
+DEEPSEEK_V4_FLASH_VISION_EXP = "deepseek-v4-flash-vision-exp"  # DeepSeek V4 Flash vision (experimental, multimodal)
 
 # Baidu Qianfan / ERNIE
 ERNIE_5_1 = "ernie-5.1"  # ERNIE 5.1 - default recommendation, latest flagship
@@ -119,17 +141,20 @@ QWEN36_PLUS = "qwen3.6-plus"  # Qwen3.6 Plus - Omni model (MultiModalConversatio
 QWEN37_PLUS = "qwen3.7-plus"  # Qwen3.7 Plus - Omni model (MultiModalConversation)
 QWEN37_MAX = "qwen3.7-max"  # Qwen3.7 Max - Agent recommended model
 QWEN38_MAX = "qwen3.8-max"  # Qwen3.8 Max - native effort model (multimodal endpoint)
+QWEN38_FLASH = "qwen3.8-flash"  # Qwen3.8 Flash - Agent recommended model (default), 1M context / 128K output (MultiModalConversation)
 QWQ_PLUS = "qwq-plus"
 
 # MiniMax
-MINIMAX_M3 = "MiniMax-M3"  # MiniMax M3 - Latest (default)
+MINIMAX_M3_1_FLASH = "MiniMax-M3.1-Flash"  # MiniMax M3.1 Flash - Latest (default), native multimodal, always thinking
+MINIMAX_M3 = "MiniMax-M3"  # MiniMax M3, native multimodal (vision)
 MINIMAX_M2_7 = "MiniMax-M2.7"  # MiniMax M2.7
 MINIMAX_M2_7_HIGHSPEED = "MiniMax-M2.7-highspeed"  # MiniMax M2.7 highspeed
-MINIMAX_TEXT_01 = "MiniMax-Text-01"  # MiniMax multimodal (vision)
+MINIMAX_TEXT_01 = "MiniMax-Text-01"  # MiniMax Text-01
 MINIMAX_ABAB6_5 = "abab6.5-chat"  # MiniMax abab6.5
 
 # GLM (Zhipu AI)
-GLM_5_3 = "glm-5.3"  # GLM-5.3 - Agent recommended model (default)
+GLM_5_3_FLASH = "glm-5.3-flash"  # GLM-5.3 Flash - Agent recommended model (default), 1M context / 128K output
+GLM_5_3 = "glm-5.3"  # GLM-5.3 - Agent recommended model
 GLM_5_2 = "glm-5.2"  # GLM-5.2
 GLM_5_1 = "glm-5.1"  # GLM-5.1
 GLM_5_TURBO = "glm-5-turbo"  # GLM-5-Turbo
@@ -147,7 +172,9 @@ GLM_4_7 = "glm-4.7"  # GLM-4.7 - Agent recommended model
 
 # Kimi (Moonshot)
 MOONSHOT = "moonshot"
-KIMI_K3 = "kimi-k3"  # Kimi K3 - Agent recommended model (default)
+KIMI_K3_1_PRO = "kimi-k3.1-pro"  # Kimi K3.1 Pro - Agent recommended model (default), 1M context
+KIMI_K3_1_PRO_HIGHSPEED = "kimi-k3.1-pro-highspeed"  # Kimi K3.1 Pro highspeed
+KIMI_K3 = "kimi-k3"  # Kimi K3
 KIMI_K2_7_CODE = "kimi-k2.7-code"  # Kimi K2.7 Code
 KIMI_K2_7_CODE_HIGHSPEED = "kimi-k2.7-code-highspeed"  # Kimi K2.7 Code highspeed
 KIMI_K2 = "kimi-k2"
@@ -155,11 +182,15 @@ KIMI_K2_5 = "kimi-k2.5"
 KIMI_K2_6 = "kimi-k2.6"
 
 # Xiaomi MiMo
-MIMO_V2_5_PRO = "mimo-v2.5-pro"      # MiMo V2.5 Pro - flagship, long context (default recommendation)
-MIMO_V2_5 = "mimo-v2.5"              # MiMo V2.5 - multimodal (text/image/audio/video)
-MIMO_V2_PRO = "mimo-v2-pro"          # MiMo V2 Pro
-MIMO_V2_OMNI = "mimo-v2-omni"        # MiMo V2 Omni - multimodal
-MIMO_V2_FLASH = "mimo-v2-flash"      # MiMo V2 Flash - high-speed
+MIMO_V2_6_PRO = "mimo-v2.6-pro"      # MiMo V2.6 Pro - flagship, omni-modal, 1M context (default recommendation)
+MIMO_V2_6_FLASH = "mimo-v2.6-flash"  # MiMo V2.6 Flash - omni-modal, faster and cheaper
+# Retired by the vendor; requests to these ids now fail, so MimoBot maps them
+# onto the V2.6 replacements.
+MIMO_V2_5_PRO = "mimo-v2.5-pro"
+MIMO_V2_5 = "mimo-v2.5"
+MIMO_V2_PRO = "mimo-v2-pro"
+MIMO_V2_OMNI = "mimo-v2-omni"
+MIMO_V2_FLASH = "mimo-v2-flash"
 
 # Doubao (Volcengine Ark)
 DOUBAO = "doubao"
@@ -196,25 +227,25 @@ MODELSCOPE_MODEL_LIST = ["deepseek-ai/DeepSeek-R1-0528", "deepseek-ai/DeepSeek-R
 
 MODEL_LIST = [
               # DeepSeek
-              DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, DEEPSEEK_CHAT, DEEPSEEK_REASONER,
+              DEEPSEEK_FLASH, DEEPSEEK_V4_FLASH, DEEPSEEK_V4_PRO, DEEPSEEK_CHAT, DEEPSEEK_REASONER,
 
               # Baidu Qianfan / ERNIE
               QIANFAN, ERNIE_5_1, ERNIE_5, ERNIE_X1_1, ERNIE_45_TURBO_128K, ERNIE_45_TURBO_32K, ERNIE_4_TURBO_8K,
               ERNIE_45_TURBO_VL, ERNIE_45_TURBO_VL_32K,
 
               # MiniMax
-              MiniMax, MINIMAX_M3, MINIMAX_M2_7, MINIMAX_M2_7_HIGHSPEED, MINIMAX_ABAB6_5,
+              MiniMax, MINIMAX_M3_1_FLASH, MINIMAX_M3, MINIMAX_M2_7, MINIMAX_M2_7_HIGHSPEED, MINIMAX_ABAB6_5,
 
               # Xiaomi MiMo
-              MIMO, MIMO_V2_5_PRO, MIMO_V2_5, MIMO_V2_PRO, MIMO_V2_OMNI, MIMO_V2_FLASH,
+              MIMO, MIMO_V2_6_PRO, MIMO_V2_6_FLASH, MIMO_V2_5_PRO, MIMO_V2_5, MIMO_V2_PRO, MIMO_V2_OMNI, MIMO_V2_FLASH,
 
               # Claude
-              CLAUDE_OPUS_5, CLAUDE_SONNET_5, CLAUDE_FABLE_5, CLAUDE3, CLAUDE_4_8_OPUS, CLAUDE_4_7_OPUS, CLAUDE_4_6_SONNET, CLAUDE_4_6_OPUS, CLAUDE_4_OPUS, CLAUDE_4_5_SONNET, CLAUDE_4_SONNET, CLAUDE_3_OPUS, CLAUDE_3_OPUS_0229,
+              CLAUDE_OPUS_5_5, CLAUDE_SONNET_5_5, CLAUDE_HAIKU_5_5, CLAUDE_OPUS_5, CLAUDE_SONNET_5, CLAUDE_FABLE_5_1, CLAUDE_FABLE_5, CLAUDE3, CLAUDE_4_8_OPUS, CLAUDE_4_7_OPUS, CLAUDE_4_6_SONNET, CLAUDE_4_6_OPUS, CLAUDE_4_OPUS, CLAUDE_4_5_SONNET, CLAUDE_4_SONNET, CLAUDE_3_OPUS, CLAUDE_3_OPUS_0229,
               CLAUDE_35_SONNET, CLAUDE_35_SONNET_1022, CLAUDE_35_SONNET_0620, CLAUDE_3_SONNET, CLAUDE_3_HAIKU,
               "claude", "claude-3-haiku", "claude-3-sonnet", "claude-3-opus", "claude-3.5-sonnet",
 
               # Gemini
-              GEMINI_37_FLASH, GEMINI_36_FLASH, GEMINI_35_FLASH, GEMINI_31_FLASH_LITE_PRE, GEMINI_31_PRO_PRE, GEMINI_3_PRO_PRE, GEMINI_3_FLASH_PRE, GEMINI_25_PRO_PRE, GEMINI_25_FLASH_PRE,
+              GEMINI_4_ARGON, GEMINI_38_FLASH, GEMINI_37_FLASH, GEMINI_36_FLASH, GEMINI_35_FLASH, GEMINI_31_FLASH_LITE_PRE, GEMINI_31_PRO_PRE, GEMINI_3_PRO_PRE, GEMINI_3_FLASH_PRE, GEMINI_25_PRO_PRE, GEMINI_25_FLASH_PRE,
               GEMINI_20_FLASH, GEMINI_20_flash_exp, GEMINI_15_PRO, GEMINI_15_flash, GEMINI_PRO, GEMINI,
 
               # OpenAI
@@ -223,17 +254,18 @@ MODEL_LIST = [
               GPT4_TURBO, GPT4_TURBO_PREVIEW, GPT4_TURBO_01_25, GPT4_TURBO_11_06, GPT4_TURBO_04_09,
               GPT_4o, GPT_4O_0806, GPT_4o_MINI,
               GPT_41, GPT_41_MINI, GPT_41_NANO,
+              GPT_62_SOL, GPT_62_ASTRA, GPT_61_TERRA, GPT_61_SOL, GPT_6_LUNA, GPT_6_SOL, GPT_6_ASTRA,
               GPT_56_LUNA, GPT_56_TERRA, GPT_56_SOL,
               GPT_5, GPT_5_MINI, GPT_5_NANO,
               GPT_54, GPT_55, GPT_54_MINI, GPT_54_NANO,
               O1, O1_MINI,
 
               # GLM (Zhipu AI)
-              ZHIPU_AI, GLM_5_3, GLM_5_2, GLM_5_1, GLM_5_TURBO, GLM_5, GLM_4, GLM_4_PLUS, GLM_4_flash, GLM_4_LONG, GLM_4_ALLTOOLS,
+              ZHIPU_AI, GLM_5_3_FLASH, GLM_5_3, GLM_5_2, GLM_5_1, GLM_5_TURBO, GLM_5, GLM_4, GLM_4_PLUS, GLM_4_flash, GLM_4_LONG, GLM_4_ALLTOOLS,
               GLM_4_0520, GLM_4_AIR, GLM_4_AIRX, GLM_4_7,
 
               # Qwen
-              QWEN37_PLUS, QWEN37_MAX, QWEN38_MAX, QWEN36_PLUS, QWEN35_PLUS, QWEN3_MAX, QWEN_MAX, QWEN_PLUS, QWEN_TURBO, QWEN_LONG,
+              QWEN38_FLASH, QWEN37_PLUS, QWEN37_MAX, QWEN38_MAX, QWEN36_PLUS, QWEN35_PLUS, QWEN3_MAX, QWEN_MAX, QWEN_PLUS, QWEN_TURBO, QWEN_LONG,
 
               # Doubao
               DOUBAO, DOUBAO_SEED_2_1_PRO, DOUBAO_SEED_2_1_TURBO,
@@ -241,7 +273,7 @@ MODEL_LIST = [
 
               # Kimi (Moonshot)
               MOONSHOT, "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k",
-              KIMI_K3, KIMI_K2_7_CODE, KIMI_K2_7_CODE_HIGHSPEED, KIMI_K2_6, KIMI_K2_5, KIMI_K2,
+              KIMI_K3_1_PRO, KIMI_K3_1_PRO_HIGHSPEED, KIMI_K3, KIMI_K2_7_CODE, KIMI_K2_7_CODE_HIGHSPEED, KIMI_K2_6, KIMI_K2_5, KIMI_K2,
 
               # ModelScope
               MODELSCOPE,
@@ -258,7 +290,7 @@ MODEL_LIST = MODEL_LIST + GITEE_AI_MODEL_LIST + MODELSCOPE_MODEL_LIST
 # Fallback model when `model` is missing from the config. Keep in sync with
 # config-template.json so a config without an explicit model behaves the same
 # as a fresh install.
-DEFAULT_MODEL = DEEPSEEK_V4_FLASH
+DEFAULT_MODEL = DEEPSEEK_FLASH
 
 # channel
 FEISHU = "feishu"

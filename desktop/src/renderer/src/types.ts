@@ -2,6 +2,12 @@
 // Electron bridge
 // ============================================================
 
+export type ThemeImportResult =
+  | { status: 'ok'; id: string; name: string }
+  | { status: 'exists'; id: string; name: string; path: string }
+  | { status: 'canceled' }
+  | { status: 'error'; code: 'no_theme' | 'bad_json' | 'bad_zip' | 'too_large' | 'failed' }
+
 export interface ElectronAPI {
   getBackendPort: () => Promise<number | null>
   getBackendStatus: () => Promise<string>
@@ -9,11 +15,21 @@ export interface ElectronAPI {
   getBackendError: () => Promise<BackendFailure | null>
   /** Data dir holding config.json and run.log (~/.cow in packaged builds). */
   getDataDir: () => Promise<string>
+  /** Per-launch secret shared with the spawned backend (desktop-only requests). */
+  getDesktopToken?: () => Promise<string>
+  /** On-disk path of a picked/dropped File; '' when it has none (pasted image). */
+  getPathForFile?: (file: File) => string
+  /** This machine's IPv4 addresses on private networks. */
+  getLanAddresses?: () => Promise<string[]>
+  /** The computer's name, used to label this app in other instances' device lists. */
+  getHostName?: () => Promise<string>
   restartBackend: () => Promise<boolean>
   selectDirectory: () => Promise<string | null>
   selectFile: (filters?: { name: string; extensions: string[] }[]) => Promise<string | null>
   /** Open a local file with the OS default app. Resolves to '' on success. */
   openPath: (targetPath: string) => Promise<string>
+  /** Show a local file selected in Finder / Explorer. */
+  revealPath?: (targetPath: string) => Promise<void>
   // Listener registrars return an unsubscribe fn for cleanup.
   onBackendStatus: (callback: (data: BackendStatusEvent) => void) => () => void
   onBackendLog: (callback: (line: string) => void) => () => void
@@ -25,18 +41,26 @@ export interface ElectronAPI {
   onMenuAction?: (callback: (action: string) => void) => () => void
   // Current app version string (e.g. "0.0.5").
   getAppVersion?: () => Promise<string>
+  // OS-level microphone access (prompts once on macOS; true elsewhere).
+  requestMicAccess?: () => Promise<boolean>
   // Launch-at-login toggle (macOS + Windows). get returns the effective state;
   // set returns the real outcome so the UI can surface refusals/errors.
   getLoginItemEnabled?: () => Promise<boolean>
   setLoginItemEnabled?: (
     enabled: boolean
   ) => Promise<{ ok: boolean; enabled: boolean; error: string }>
-  // Themes (bundled + user themes from ~/.cow/themes), images inlined.
+  // Themes (bundled + user themes from <workspace>/system/themes), images inlined.
   listThemes?: () => Promise<Record<string, unknown>[]>
   getThemesDir?: () => Promise<string>
+  importTheme?: (opts: {
+    path?: string
+    title?: string
+    overwrite?: boolean
+    reserved?: string[]
+  }) => Promise<ThemeImportResult>
   // Optional app config: first-run default theme + display name. Null when
   // the build ships no app config (standard build).
-  getAppConfig?: () => Promise<{ defaultTheme?: string; appName?: string } | null>
+  getAppConfig?: () => Promise<{ defaultTheme?: string; hiddenThemes?: string[]; appName?: string } | null>
   // Generic HTTPS relay via the main process (bypasses renderer CORS).
   httpRelay?: (req: {
     url: string
@@ -48,6 +72,9 @@ export interface ElectronAPI {
   checkForUpdate?: (lang?: string) => Promise<void>
   downloadUpdate?: (lang?: string) => Promise<void>
   installUpdate?: () => Promise<void>
+  // Extra query parameters appended to the update feed URL; {} clears them.
+  // Unused by the standard build.
+  setUpdateFeedQuery?: (params: Record<string, string>) => Promise<void>
   onUpdateStatus?: (callback: (status: UpdateStatus) => void) => () => void
   // Override the window/Dock/taskbar icon and title at runtime (cached across
   // launches). Used by product extensions; unused by the standard build.
@@ -55,8 +82,11 @@ export interface ElectronAPI {
   setAppTitle?: (title: string) => Promise<boolean>
   // Show a native OS notification; clicking it focuses the window and fires
   // onOpenSession with the session id.
-  notify?: (payload: { title?: string; body?: string; sessionId?: string; silent?: boolean }) => Promise<boolean>
+  notify?: (payload: { title?: string; body?: string; sessionId?: string; silent?: boolean; force?: boolean }) => Promise<boolean>
   onOpenSession?: (callback: (sessionId: string) => void) => () => void
+  // Number of conversations with unseen results, shown as a badge on the
+  // taskbar (Windows) / Dock (macOS) icon; 0 clears it.
+  setUnreadBadge?: (count: number) => void
   platform: string
   // OS UI language (e.g. "zh-CN"); used to default the language on first run.
   systemLocale?: string
@@ -116,10 +146,23 @@ export interface SubStep {
   error?: string
 }
 
+export interface ToolRetrievalMetadata {
+  mode: 'retrieved' | 'fallback'
+  total_mcp_tools: number
+  selected_mcp_tools: number
+  builtin_tools: number
+  top_k: number
+  candidate_count: number
+  selected_tools: string[]
+  ranked_tools: Array<{ name: string; score: number }>
+  fallback_reason?: string | null
+}
+
 /** A single ordered step inside an assistant turn (matches backend history). */
 export interface MessageStep {
-  type: 'thinking' | 'content' | 'tool'
+  type: 'thinking' | 'content' | 'tool' | 'retrieval'
   content?: string
+  retrieval?: ToolRetrievalMetadata
   // tool step fields
   id?: string
   name?: string
@@ -141,10 +184,22 @@ export interface MessageStep {
 }
 
 /** Local UI message model (superset of backend history message). */
+/** Provider-reported token usage summed over one reply's model calls. */
+export interface MessageUsage {
+  prompt_tokens?: number
+  completion_tokens?: number
+  total_tokens?: number
+  prompt_cache_hit_tokens?: number
+  prompt_cache_miss_tokens?: number
+  calls?: number
+}
+
 export interface ChatMessage {
   id: string
   role: Role
   content: string
+  /** Shown in place of `content` on a user turn; the agent still gets `content`. */
+  display?: string
   /** Unix seconds. Backend history uses `created_at`; we normalize to `timestamp`. */
   timestamp: number
   attachments?: Attachment[]
@@ -159,11 +214,14 @@ export interface ChatMessage {
   /** Sequence numbers from backend (for delete/regenerate). */
   userSeq?: number
   botSeq?: number
+  usage?: MessageUsage
   /** Self-evolution bubble flag; 'divider' renders a context-cleared separator. */
   kind?: 'evolution' | 'divider'
   extras?: Record<string, unknown>
   isStreaming?: boolean
   isCancelled?: boolean
+  /** A reply that never reached its answer: cut off (a crash, a quit) or still running. */
+  runState?: RunState
   error?: string
   /** request_id of a server-pushed (scheduler) message, used to dedupe polls. */
   pushRequestId?: string
@@ -214,6 +272,32 @@ export interface WorkspaceEntry {
   abs_path?: string
   raw_url?: string
   preview_url?: string
+  /** The conversation turn that produced it, when a file card or the turn's auto-open opened it. */
+  origin?: ArtifactOrigin
+}
+
+/** Response of GET /api/workspace/read: the editor's initial content. */
+export interface WorkspaceReadResult {
+  path: string
+  content: string
+  /** The read stopped at the size cap, so the tail is missing. */
+  truncated: boolean
+  /** Bytes had to be replaced to decode as UTF-8. */
+  lossy: boolean
+  size: number
+  /** Baseline passed back on save so the backend can detect a mid-edit rewrite. */
+  mtime: number
+  /** False when saving would be refused: wrong kind, truncated or lossy. */
+  editable: boolean
+}
+
+/** Response of POST /api/workspace/write. */
+export interface WorkspaceWriteResult {
+  path?: string
+  size?: number
+  mtime?: number
+  /** `"conflict"` when the file changed on disk since `expected_mtime`. */
+  code?: string
 }
 
 export interface WorkspaceTree {
@@ -256,6 +340,72 @@ export interface Artifact {
   preview_url: string
 }
 
+/** Where in the conversations a file was produced. */
+export interface ArtifactOrigin {
+  session_id: string
+  agent_id: string
+  /** The turn's question, or null for a turn not persisted yet. */
+  turn_seq: number | null
+}
+
+/** One row of GET /api/artifacts: a file some conversation produced. */
+export interface ArtifactListItem extends Artifact {
+  id: number
+  /** The name the user gave it in the view; '' shows the file name. */
+  title: string
+  exists: boolean
+  agent_id: string
+  agent_name: string
+  session_id: string
+  session_title: string
+  turn_seq: number | null
+  /** The producing conversation is a console one that still exists. */
+  can_jump: boolean
+  source: string
+  created_at: number
+  updated_at: number
+  pinned_at: number
+}
+
+// ============================================================
+// Menu the user arranged (/api/menu), shared with the web console
+// ============================================================
+
+/** What the backend works out on each read to show an artifact entry. */
+export interface MenuFile {
+  file_name: string
+  kind: FileKind
+  exists: boolean
+  previewable?: boolean
+  raw_url: string
+  preview_url: string
+}
+
+export interface MenuItem {
+  id: string
+  /** `builtin` names a page by `view`; `artifact` shows a file by `path`; `url` shows a web page. */
+  type: 'builtin' | 'artifact' | 'url'
+  title: string
+  icon: string
+  view?: string
+  hidden?: boolean
+  path?: string
+  url?: string
+  open?: 'embed' | 'tab'
+  file?: MenuFile
+}
+
+export interface MenuGroup {
+  id: string
+  title: string
+  items: MenuItem[]
+}
+
+export interface MenuDoc {
+  version?: number
+  groups: MenuGroup[]
+}
+
 /** Live tool event during SSE streaming. */
 export interface ToolCall {
   type: 'tool_start' | 'tool_end' | 'tool_progress'
@@ -271,10 +421,13 @@ export interface ToolCall {
 export type StreamEventType =
   | 'delta'
   | 'reasoning'
+  | 'tool_retrieval'
   | 'tool_start'
   | 'tool_progress'
   | 'tool_end'
   | 'subagent_step'
+  | 'peer_start'
+  | 'peer_end'
   | 'message_end'
   | 'phase'
   | 'file_to_send'
@@ -300,14 +453,29 @@ export interface StreamEvent {
   display?: string
   execution_time?: number
   has_tool_calls?: boolean
+  /** `tool_retrieval`: sanitized MCP retrieval decision metadata. */
+  mode?: 'retrieved' | 'fallback'
+  total_mcp_tools?: number
+  selected_mcp_tools?: number
+  builtin_tools?: number
+  top_k?: number
+  candidate_count?: number
+  selected_tools?: string[]
+  ranked_tools?: Array<{ name: string; score: number }>
+  fallback_reason?: string | null
   /** `tool_end`: true when the call was refused by the session permission mode. */
   permission_denied?: boolean
   /** `tool_end`: the mode that refused the call. */
   permission_mode?: string
+  /** `error`: why the stream ended, e.g. `unknown_request` once the backend restarted. */
+  reason?: string
   /** `subagent_step` event fields: which step of which card, and how it went. */
   card_id?: string
   step_id?: string
   phase?: 'start' | 'end'
+  /** `peer_start` / `peer_end`: the teammate whose turn this is. */
+  agent_id?: string
+  agent_name?: string
   error?: string
   path?: string
   abs_path?: string
@@ -326,6 +494,8 @@ export interface StreamEvent {
   timestamp?: number
   user_seq?: number
   bot_seq?: number
+  /** `done`: usage of the reply just persisted. */
+  usage?: MessageUsage
   message?: string
 }
 
@@ -343,6 +513,18 @@ export interface SessionItem {
   pinned?: boolean
   /** Bound project workspace, or null/absent for the default workspace. */
   project?: { path: string; name: string } | null
+  /** The Agent whose store holds this conversation (multi-Agent backends). */
+  agent?: AgentBadge
+  /** Everyone in the conversation (owner first) when more than one Agent is
+   *  in it; absent for an ordinary solo chat. */
+  participants?: AgentBadge[]
+}
+
+/** The compact Agent identity the backend attaches to sessions and teams. */
+export interface AgentBadge {
+  id: string
+  name: string
+  avatar?: string
 }
 
 export interface SessionsPage {
@@ -365,14 +547,20 @@ export interface SessionModelProvider {
   id: string
   label: string | { zh: string; en: string }
   models: string[]
+  // Display names for some of `models` (custom providers only).
+  labels?: Record<string, string>
 }
 
 export interface SessionSettingsState {
   model: {
     model: string
     provider: string
-    source: 'session' | 'global'
+    // Where the effective model comes from: the conversation's own pin, the
+    // owning Agent's default model, or the global config (in that order).
+    source: 'session' | 'agent' | 'global'
     global: { model: string; provider: string }
+    // The owning Agent's default model, when it has one (never for the default Agent).
+    agent?: { model: string; provider: string } | null
     providers: SessionModelProvider[]
   }
   permission: {
@@ -381,12 +569,24 @@ export interface SessionSettingsState {
     global: string
     modes: string[]
   }
+  /** Who else is on this conversation (multi-Agent backends only). */
+  team?: SessionTeam
+}
+
+export interface SessionTeam {
+  owner: AgentBadge
+  /** Invited teammates; `available: false` marks an archived/disabled one. */
+  members: (AgentBadge & { available?: boolean })[]
+  /** Enabled Agents that could still be invited. */
+  candidates: AgentBadge[]
 }
 
 /** Backend history message (as returned by /api/history). */
 export interface HistoryMessage {
   role: Role
   content: string
+  /** User turns sent with a display text. */
+  display?: string
   created_at: number
   steps?: MessageStep[]
   tool_calls?: Array<{ id?: string; name: string; arguments?: Record<string, unknown>; result?: string }>
@@ -397,7 +597,12 @@ export interface HistoryMessage {
   artifacts?: Artifact[]
   /** Per-message sequence number used by delete/regenerate APIs. */
   _seq?: number
+  usage?: MessageUsage
+  /** Set on an assistant turn whose run stopped short of its answer. */
+  run_state?: RunState
 }
+
+export type RunState = 'interrupted' | 'running'
 
 export interface HistoryPage {
   messages: HistoryMessage[]
@@ -406,6 +611,40 @@ export interface HistoryPage {
   page_size: number
   has_more: boolean
   context_start_seq?: number
+}
+
+/** One entry in the navigation timeline: a user message, by its stored seq. */
+export interface UserMessageIndexEntry {
+  seq: number
+  preview: string
+  created_at: number
+}
+
+export interface UserMessageIndex {
+  messages: UserMessageIndexEntry[]
+  total: number
+}
+
+/** Heuristic breakdown of what is occupying the session's context window.
+ *  `available` is false when the session has no live agent yet (fresh session,
+ *  or one just cleared) — the other fields are then absent. */
+export interface ContextUsage {
+  available: boolean
+  estimated?: boolean
+  model?: string | null
+  /** Model's total context window (input + output). */
+  window?: number
+  /** Input budget the trimmer targets — the denominator for the chart. */
+  limit?: number
+  /** system + tools + history. May exceed `limit`: tool schemas are not budgeted. */
+  used?: number
+  messages?: number
+  breakdown?: {
+    system: number
+    tools: number
+    history: number
+    free: number
+  }
 }
 
 // ============================================================
@@ -443,10 +682,13 @@ export interface ProviderMeta {
 export interface ConfigData {
   use_agent: boolean
   title: string
+  /** This CowAgent device: its id and the name other devices show for it. */
+  device?: { id: string; name: string }
   model: string
   bot_type: string
   use_linkai: boolean
   channel_type: string
+  /** Optional manual override for the input budget; 0 = derive from the model. */
   agent_max_context_tokens: number
   agent_max_context_turns: number
   agent_max_steps: number
@@ -465,6 +707,8 @@ export interface ConfigData {
   // Real password, only returned to the desktop app (trusted local machine) so
   // it can be edited in place. Undefined for browser access.
   web_password?: string
+  // Registry used for installs by name; empty means the default Skill Hub.
+  skill_hub_url?: string
 }
 
 // ============================================================
@@ -477,6 +721,27 @@ export interface ModelOption {
   hint?: string
 }
 export type ModelEntry = string | ModelOption
+
+// Capability tags a catalog model carries: which tool positions it appears
+// in. "text" marks a conversational model (main-model / switcher candidate).
+export type ModelCapability = 'text' | 'vision' | 'video' | 'image' | 'embedding' | 'asr' | 'tts'
+
+// One user-managed entry in a provider's model catalog.
+export interface ModelCatalogEntry {
+  name: string
+  capabilities: ModelCapability[]
+  context_window?: number
+  max_output_tokens?: number
+  // Optional display name, custom providers only.
+  alias?: string
+}
+
+export interface ApiBasePreset {
+  label: LocalizedLabel
+  value: string
+  /** Where keys for this base are created. */
+  keys_url?: string
+}
 
 export interface ModelProvider {
   id: string
@@ -492,6 +757,22 @@ export interface ModelProvider {
   api_base?: string
   api_base_default?: string
   api_base_placeholder?: string
+  /** One-click bases offered next to the API Base field. */
+  api_base_presets?: ApiBasePreset[]
+  // The model catalog is an OVERLAY on the presets, not a replacement:
+  // - `catalog` is the user's raw overrides (edited/added entries),
+  // - `hidden` is the preset names the user removed (tombstones),
+  // - `seed` is the preset base (typed with real capabilities),
+  // - `effective` is the merged list (presets − hidden + overrides) the editor
+  //   loads and the chat switcher offers.
+  // A custom provider has no presets, so `catalog` is simply its whole list and
+  // `effective` equals it.
+  catalog?: ModelCatalogEntry[]
+  hidden?: string[]
+  /** Preset models pre-typed with their real capabilities (built-in vendors). */
+  seed?: ModelCatalogEntry[]
+  /** The merged list the editor prefills (presets − hidden + overrides). */
+  effective?: ModelCatalogEntry[]
   models: ModelEntry[]
 }
 
@@ -505,6 +786,16 @@ export interface SearchProviderMeta {
   configured: boolean
   needs_dedicated_key: boolean
   api_key_masked?: string
+  // AnySearch can be "configured" via anonymous mode (no key). The backend
+  // sets this flag so the UI can badge it and offer the anonymous opt-in.
+  anonymous?: boolean
+  // SearXNG holds a self-hosted instance URL instead of an API key. When
+  // needs_url is set the editor shows a URL field; url_masked echoes the saved
+  // URL (not a secret, so returned verbatim) for prefill/edit.
+  needs_url?: boolean
+  url_masked?: string
+  // DeepSeek only: the model vendor's base URL, edited together with its key.
+  api_base?: string
 }
 
 export interface CapabilityState {
@@ -537,6 +828,28 @@ export interface CapabilityState {
   [k: string]: unknown
 }
 
+/** One link in the fallback chain: tried after the one before it fails. */
+export interface ChatFallbackLink {
+  provider: string
+  model: string
+}
+
+/** Backup chat models, tried in order after the primary one fails a turn. */
+export interface ChatFallbackCapabilityState {
+  editable?: boolean
+  /** Opt-in: when false the fallback never engages. */
+  enabled?: boolean
+  /** Ordered links; index 0 is tried first. Unbounded by design. */
+  chain?: ChatFallbackLink[]
+  current_provider?: string
+  current_model?: string
+  providers?: string[]
+  provider_models?: Record<string, ModelEntry[]>
+  /** The primary model, shown so the user sees what is being backed up. */
+  primary_provider?: string
+  primary_model?: string
+}
+
 export interface SearchCapabilityState {
   editable?: boolean
   providers: SearchProviderMeta[]
@@ -552,6 +865,7 @@ export interface ModelsData {
   providers: ModelProvider[]
   capabilities: {
     chat: CapabilityState
+    chat_fallback?: ChatFallbackCapabilityState
     vision: CapabilityState
     asr: CapabilityState
     tts: CapabilityState
@@ -568,9 +882,21 @@ export type ModelsAction =
   | { action: 'set_custom_provider'; name: string; id?: string; api_base: string; api_key?: string; model?: string; make_active?: boolean }
   | { action: 'delete_custom_provider'; id: string }
   | { action: 'set_active_custom_provider'; id: string }
-  | { action: 'set_capability'; capability: CapabilityKey; provider_id?: string; model?: string; voice?: string; strategy?: string; provider?: string }
+  // Persist a provider's model catalog overlay. `models` are the overrides
+  // (edited/added entries) and `hidden` the removed preset names; the backend
+  // drops the provider's overlay entirely when both are empty (back to presets).
+  | { action: 'save_catalog'; provider_id: string; models: ModelCatalogEntry[]; hidden: string[] }
+  | { action: 'discover_models'; provider_id?: string; api_key?: string; api_base?: string }
+  // `chat_fallback` is not a first-class CapabilityKey (it has no top-level
+  // card), but it is persisted through the same set_capability action, so it
+  // is accepted here alongside its opt-in fields.
+  | { action: 'set_capability'; capability: CapabilityKey | 'chat_fallback'; provider_id?: string; model?: string; voice?: string; strategy?: string; provider?: string; enabled?: boolean; chain?: ChatFallbackLink[] }
   | { action: 'set_voice_reply_mode'; mode: 'off' | 'voice_if_voice' | 'always' }
-  | { action: 'set_search_credential'; api_key: string }
+  // Dedicated search-provider credentials (bocha / anysearch / serply / tavily
+  // use api_key; searxng uses url). The provider field defaults to bocha
+  // server-side when omitted; anonymous is AnySearch-only (save with an empty
+  // key to enable the anonymous tier).
+  | { action: 'set_search_credential'; provider?: string; api_key?: string; url?: string; anonymous?: boolean }
 
 // ============================================================
 // Channels
@@ -592,9 +918,80 @@ export interface ChannelInfo {
   active: boolean
   fields: ChannelField[]
   login_status?: string
+  // Multi-instance fields (present only for one-card-per-instance entries the
+  // backend returns in `data.instances` when the install is in multi-Agent
+  // mode). Absent on legacy per-type cards, keeping single-Agent behavior.
+  instance_id?: string
+  channel_type?: string
+  agent_id?: string
+  members?: string[]
+  // User-editable display name for this instance (e.g. "微信2"); empty falls back
+  // to the instance id. Present only on per-instance cards (multi-Agent mode).
+  instance_name?: string
+  project_dir?: string
+  session_namespace?: boolean
 }
 
-export type ChannelAction = 'save' | 'connect' | 'disconnect'
+// The full /api/channels response. Legacy single-Agent installs only populate
+// `channels`; multi-Agent installs additionally set the flags and `instances`.
+export interface ChannelsResponse {
+  status: string
+  channels: ChannelInfo[]
+  multi_agent?: boolean
+  multi_instance_types?: string[]
+  instances?: ChannelInfo[]
+}
+
+export type ChannelAction = 'save' | 'connect' | 'disconnect' | 'rename'
+
+// ============================================================
+// Agents / team roster (multi-Agent mode)
+// ============================================================
+
+// One Agent in the roster, mirroring the backend AgentProfile.to_dict().
+export interface AgentProfile {
+  id: string
+  name: string
+  workspace?: string
+  enabled: boolean
+  description?: string
+  model?: string
+  bot_type?: string
+  avatar?: string
+  // Cache-busting token from the avatar file's mtime; changes on every upload
+  // so the <img> refetches even when the roster revision hasn't moved.
+  avatar_rev?: string
+  skills?: string[]
+  knowledge?: string[]
+  // "shared" (reads the default Agent's knowledge base) or "own" (private dir).
+  knowledge_mode?: 'shared' | 'own'
+}
+
+// A stored channel_instances record from the roster (team.json).
+export interface ChannelInstanceRecord {
+  instance_id: string
+  channel_type: string
+  agent_id?: string
+  members?: string[]
+  credentials?: Record<string, unknown>
+}
+
+// The /api/agents GET snapshot.
+export interface RosterSnapshot {
+  status?: string
+  default_agent_id: string
+  agents: AgentProfile[]
+  channel_instances: ChannelInstanceRecord[]
+  revision: string
+}
+
+export type AgentAction =
+  | 'create'
+  | 'update'
+  | 'archive'
+  | 'delete'
+  | 'set_knowledge_mode'
+  | 'bind_channel_instance'
 
 // ============================================================
 // Tools / skills
@@ -609,9 +1006,130 @@ export interface SkillInfo {
   name: string
   display_name?: string
   description: string
+  /** Shown in place of `description`, which stays what the agent reads */
+  display_description?: string
   source?: string
   enabled: boolean
   category?: string
+  icon?: string
+  version?: string
+  /** Epoch seconds the skill first showed up in the library */
+  installed_at?: number
+  ships_with_install?: boolean
+  deletable?: boolean
+}
+
+/** What an installer records about a skill it installs; every field is optional. */
+export interface SkillInstallMeta {
+  category?: string
+  display_name?: string
+  display_description?: string
+  icon?: string
+  version?: string
+}
+
+export type McpTransport = 'stdio' | 'sse' | 'streamable-http'
+export type McpServerStatus = 'pending' | 'ready' | 'failed' | 'needs_auth' | 'disabled' | 'idle' | 'unknown'
+
+export interface McpServerConfig {
+  name: string
+  type?: McpTransport | string
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+  scope?: string
+  tool_name_prefix?: string
+  disabled?: boolean
+  timeout?: number
+  status?: McpServerStatus | string
+}
+
+export interface McpServersResult {
+  status: string
+  servers: McpServerConfig[]
+  path?: string
+  hint?: string
+  message?: string
+}
+
+export interface McpTestResult {
+  status: string
+  ok: boolean
+  tools: Array<{ name: string; description?: string }>
+  error?: string | null
+  needs_auth?: boolean
+  message?: string
+}
+
+export type SkillMarketSource = 'hub' | 'github' | 'clawhub'
+
+/** One skill found in a staged fetch or upload, shown for review before installing. */
+export interface SkillPreviewItem {
+  name: string
+  display_name: string
+  description: string
+  source: string
+  skill_md: string
+  skill_md_truncated: boolean
+  has_skill_md: boolean
+  files: string[]
+  file_count: number
+  size: number
+  /** A skill with this name is already installed and would be replaced. */
+  exists: boolean
+}
+
+export interface SkillPreviewResult {
+  status: string
+  message?: string
+  token?: string
+  skills?: SkillPreviewItem[]
+  messages?: string[]
+}
+
+/** Response of GET /api/skills/content: a skill's definition file. */
+export interface SkillContent extends WorkspaceReadResult {
+  name: string
+  /** `builtin` or `custom`, by where the loader resolved the skill. */
+  source: string
+  /** File being shown, relative to the skill's own directory. */
+  filename: string
+  /**
+   * True when the file is replaced from the installation on startup, so an edit
+   * would not survive. Reported apart from `source`, which reads `custom` for
+   * the workspace copy of a builtin skill and so cannot answer this.
+   */
+  ships_with_install: boolean
+}
+
+/**
+ * One entry of GET /api/skills/files: a file or directory inside a skill.
+ *
+ * Listed depth first in the order a tree draws them, so `depth` is all a
+ * renderer needs to show the nesting.
+ */
+export interface SkillFileEntry {
+  /** Relative to the skill's own directory, as the content endpoint takes it. */
+  path: string
+  name: string
+  depth: number
+  is_dir: boolean
+  /** Coarse preview kind: `markdown`, `code`, `image`, `directory`, ... */
+  kind: string
+  /** Whether showing it as text is meaningful; false for a bundled asset. */
+  text: boolean
+  size: number
+  mtime: number
+}
+
+/** Response of POST /api/skills/create: the skill written from the form. */
+export interface SkillCreateResult {
+  /** The name it was created under, reduced from the title that was typed. */
+  name: string
+  /** The bundled files, by the path each kept inside the skill directory. */
+  files: string[]
 }
 
 // ============================================================
@@ -632,6 +1150,18 @@ export interface MemoryPage {
   total: number
   page: number
   page_size: number
+}
+
+/** Response of GET /api/memory/content. */
+export interface MemoryDoc {
+  filename: string
+  /**
+   * Path relative to the agent's state root, which is what the workspace read
+   * and write endpoints take. Resolved by the backend because a memory file is
+   * addressed by name and category, not by path.
+   */
+  rel_path: string
+  content: string
 }
 
 // ============================================================
@@ -658,18 +1188,41 @@ export interface KnowledgeList {
   enabled: boolean
 }
 
+// What `/api/knowledge/read` answers. `mtime` and `editable` mirror the
+// workspace read endpoint, which is what lets a knowledge page drive the same
+// document editor the memory and skill pages use.
+export interface KnowledgeReadResult {
+  status: string
+  message?: string
+  content: string
+  path: string
+  mtime: number
+  editable: boolean
+  /** Absolute directory of the page, for resolving its relative image srcs. */
+  dir?: string
+}
+
 export interface KnowledgeGraph {
   nodes: Array<{ id: string; label: string; category?: string }>
   links: Array<{ source: string; target: string }>
 }
 
-export type KnowledgeAction =
+// An optional `agent_id` scopes the write to a specific Agent's knowledge base
+// (used by the Knowledge page's per-Agent view). Omitted in single-Agent mode.
+export type KnowledgeAction = { agent_id?: string } & (
   | { action: 'create_category'; payload: { path: string } }
   | { action: 'create_document'; payload: { path: string; content: string; overwrite?: boolean } }
+  // `expected_mtime` is the timestamp the editor started from; the backend
+  // refuses the save when the Agent has rewritten the page since.
+  | {
+      action: 'update_document'
+      payload: { path: string; content: string; expected_mtime?: number | null }
+    }
   | { action: 'rename_category'; payload: { path: string; new_path: string } }
   | { action: 'delete_category'; payload: { path: string; confirm?: boolean } }
   | { action: 'delete_documents'; payload: { paths: string[] } }
   | { action: 'move_documents'; payload: { paths: string[]; target_category: string } }
+)
 
 // Result row from a bulk import (one per uploaded file).
 export interface KnowledgeImportResult {
@@ -705,6 +1258,15 @@ export interface TaskAction {
   receiver_name?: string
   is_group?: boolean
   channel_type?: string
+  // The exact channel login this task delivers through. For a legacy
+  // single-instance channel it equals channel_type. Ownership derives from this.
+  instance_id?: string
+  // Session the push/notification is threaded into; preserved across edits.
+  notify_session_id?: string
+  // Channel-specific delivery hints preserved across edits when the target is
+  // unchanged (e.g. DingTalk needs the sender staff id to reply).
+  dingtalk_sender_staff_id?: string
+  silent?: boolean
 }
 
 export interface SchedulerTask {
@@ -716,6 +1278,76 @@ export interface SchedulerTask {
   schedule: TaskSchedule
   action: TaskAction
   next_run_at?: string
+  // The Agent that owns this task. Present only in multi-Agent installs; used to
+  // route mutations to the right store and to show the owner badge on the card.
+  // For an IM task this is the *effective* owner the backend derives from the
+  // delivery instance's current binding, so it stays honest after a re-bind.
+  agent_id?: string
+}
+
+// One recorded execution of a scheduled task, read from the global runs ledger
+// (task_source='scheduler'). Mirrors GET /api/scheduler/runs.
+export interface SchedulerRun {
+  run_id: string
+  // The Agent that ran it. Present in multi-Agent installs; '' is the default.
+  agent_id?: string
+  session_id: string
+  task_id: string
+  // 'running' | 'done' | 'error'. Open runs (still executing) show 'running'.
+  status: string
+  // Unix seconds. ended_at is null while a run is still in flight.
+  started_at: number
+  ended_at?: number | null
+  error?: string
+  // Snapshot fields lifted from the run's extras index at record time, so
+  // history stays readable even after the task is renamed or deleted.
+  task_name?: string
+  action_type?: string
+  channel_type?: string
+  // The delivery channel instance that ran it; resolved to a friendly name
+  // client-side against the instance directory.
+  instance_id?: string
+  // How the tick fired: 'scheduled' (timer) or 'manual' (run-now).
+  trigger?: string
+  // Short, length-capped peek at what was delivered.
+  output_preview?: string
+}
+
+// One run plus the full delivered body, for the history detail dialog. Mirrors
+// GET /api/scheduler/runs/detail. full_output is the complete message recovered
+// from the receiver's session; null when it was pruned or never injected, in
+// which case the UI falls back to output_preview.
+export interface SchedulerRunDetail extends SchedulerRun {
+  full_output?: string | null
+}
+
+// A channel instance the console can deliver a scheduled task through. The
+// task-create flow picks one of these first, then a recipient within it.
+// Mirrors GET /api/scheduler/instances.
+export interface SchedulerInstance {
+  instance_id: string
+  channel_type: string
+  // User-friendly instance name (falls back to a bot name / type label / id).
+  name: string
+  // Friendly channel-type label (e.g. "微信"), shown on the right of the picker.
+  channel_label: string
+  // The Agent this instance is bound to (""/absent -> default Agent).
+  agent_id?: string
+  recipient_count: number
+}
+
+// A trusted recipient learned from an inbound message on some instance. Mirrors
+// GET /api/scheduler/recipients.
+export interface TaskRecipient {
+  channel_type: string
+  instance_id: string
+  receiver: string
+  name: string
+  is_group: boolean
+  session_id: string
+  // Friendly name of the instance that saw this recipient.
+  instance_name?: string
+  last_seen_at?: string
 }
 
 // ============================================================

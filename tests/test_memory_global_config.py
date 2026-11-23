@@ -14,15 +14,26 @@ import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from common.utils import expand_path
 from config import conf, load_config
+
+
+#: The setup below isolates each test by pointing "~" at a temp dir, and
+#: `expand_path` resolves "~" through `os.path.expanduser`. On Windows,
+#: `ntpath.expanduser` reads USERPROFILE and ignores HOME entirely, so
+#: redirecting HOME alone left the code under test still resolving the real
+#: home directory - the "isolated" workspace was never the one actually used,
+#: which made these assertions either vacuous or a read of live user data.
+_HOME_VARS = ("HOME", "USERPROFILE")
 
 
 class TestMemoryGlobalConfigSync(unittest.TestCase):
     def setUp(self):
         load_config()
         self.tmp = tempfile.mkdtemp()
-        self._real_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.tmp
+        self._real_home = {name: os.environ.get(name) for name in _HOME_VARS}
+        for name in _HOME_VARS:
+            os.environ[name] = self.tmp
         self.workspace = os.path.join(self.tmp, "custom_workspace")
         os.makedirs(self.workspace)
 
@@ -45,10 +56,11 @@ class TestMemoryGlobalConfigSync(unittest.TestCase):
         else:
             conf()["agent_workspace"] = self._orig_agent_workspace
 
-        if self._real_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._real_home
+        for name, value in self._real_home.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_setup_memory_system_syncs_global_config(self):
@@ -129,10 +141,16 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
     def setUp(self):
         load_config()
         self.tmp = tempfile.mkdtemp()
-        self._real_home = os.environ.get("HOME")
-        os.environ["HOME"] = self.tmp
+        self._real_home = {name: os.environ.get(name) for name in _HOME_VARS}
+        for name in _HOME_VARS:
+            os.environ[name] = self.tmp
 
-        self.legacy_root = os.path.join(self.tmp, "cow")
+        # Resolved through the same helper the code under test uses, so the
+        # assertions below compare like with like. An os.path.join(self.tmp,
+        # "cow") expectation never matched on Windows: expanduser keeps the
+        # literal "/cow" from "~/cow", so the warning text carries a mixed
+        # separator the hand-built path doesn't reproduce.
+        self.legacy_root = expand_path("~/cow")
         self.new_workspace = os.path.join(self.tmp, "custom_workspace")
         os.makedirs(self.new_workspace)
 
@@ -144,10 +162,11 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
         else:
             conf()["agent_workspace"] = self._orig_agent_workspace
 
-        if self._real_home is None:
-            os.environ.pop("HOME", None)
-        else:
-            os.environ["HOME"] = self._real_home
+        for name, value in self._real_home.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write_legacy_db(self):
@@ -161,6 +180,23 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
 
         conf()["agent_workspace"] = workspace_root
         app._warn_if_legacy_workspace_data_exists()
+
+    def _assert_no_legacy_warning(self, mock_warning):
+        """No warning *about the legacy root*, which is all these tests claim.
+
+        Not a bare assert_not_called(): "log" is the process-wide logger, and
+        the suite leaves memory-sync daemon threads running behind it, so any
+        unrelated line logged from one of them inside the patched window would
+        fail a test that has nothing to do with it.
+        """
+        offenders = [
+            str(call.args[0])
+            for call in mock_warning.call_args_list
+            if call.args and self.legacy_root in str(call.args[0])
+        ]
+        self.assertEqual(
+            offenders, [], f"Expected no legacy-workspace warning, got: {offenders}"
+        )
 
     def test_warns_when_legacy_data_exists_at_a_different_path(self):
         self._write_legacy_db()
@@ -195,7 +231,7 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
         logger = logging.getLogger("log")
         with unittest.mock.patch.object(logger, "warning") as mock_warning:
             self._check(self.legacy_root)
-        mock_warning.assert_not_called()
+        self._assert_no_legacy_warning(mock_warning)
 
     def test_no_warning_when_only_hidden_files_are_left_over(self):
         """
@@ -211,7 +247,7 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
         logger = logging.getLogger("log")
         with unittest.mock.patch.object(logger, "warning") as mock_warning:
             self._check(self.new_workspace)
-        mock_warning.assert_not_called()
+        self._assert_no_legacy_warning(mock_warning)
 
     def test_no_warning_when_paths_differ_only_by_case(self):
         """
@@ -235,7 +271,7 @@ class TestLegacyWorkspaceWarning(unittest.TestCase):
         logger = logging.getLogger("log")
         with unittest.mock.patch.object(logger, "warning") as mock_warning:
             self._check(differently_cased_workspace)
-        mock_warning.assert_not_called()
+        self._assert_no_legacy_warning(mock_warning)
 
 
 if __name__ == "__main__":

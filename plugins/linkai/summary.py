@@ -4,22 +4,32 @@ from common.log import logger
 import os
 import html
 
+from .utils import Util
+
 
 class LinkSummary:
     def __init__(self):
         pass
 
     def summary_file(self, file_path: str, app_code: str):
-        file_body = {
-            "file": open(file_path, "rb"),
-            "name": file_path.split("/")[-1]
-        }
         body = {
             "app_code": app_code
         }
         url = self.base_url() + "/v1/summary/file"
         logger.info(f"[LinkSum] file summary, app_code={app_code}")
-        res = requests.post(url, headers=self.headers(), files=file_body, data=body, timeout=(5, 300))
+        # os.path.basename, not split("/"): the name is what travels in the
+        # multipart header, and on Windows a path is separated by backslashes,
+        # so the whole local path used to be sent.
+        name = os.path.basename(file_path)
+        # The handle has to stay open for the duration of the request and be
+        # closed afterwards: requests does not own it, so every summary leaked a
+        # descriptor (and kept the file locked on Windows).
+        with open(file_path, "rb") as file:
+            file_body = {
+                "file": (name, file),
+                "name": name,
+            }
+            res = requests.post(url, headers=self.headers(), files=file_body, data=body, timeout=(5, 300))
         return self._parse_summary_res(res)
 
     def summary_url(self, url: str, app_code: str):
@@ -37,34 +47,26 @@ class LinkSummary:
             "summary_id": summary_id
         }
         res = requests.post(url=self.base_url() + "/v1/summary/chat", headers=self.headers(), json=body, timeout=(5, 180))
-        if res.status_code == 200:
-            res = res.json()
-            logger.debug(f"[LinkSum] chat open, res={res}")
-            if res.get("code") == 200:
-                data = res.get("data")
-                return {
-                    "questions": data.get("questions"),
-                    "file_id": data.get("file_id")
-                }
-        else:
-            res_json = res.json()
-            logger.error(f"[LinkSum] summary error, status_code={res.status_code}, msg={res_json.get('message')}")
+        ok, data, message = Util.parse_linkai_response(res)
+        logger.debug(f"[LinkSum] chat open, ok={ok}, message={message}")
+        if not ok:
+            logger.error(f"[LinkSum] summary error, status_code={res.status_code}, msg={message}")
             return None
+        return {
+            "questions": data.get("questions"),
+            "file_id": data.get("file_id")
+        }
 
     def _parse_summary_res(self, res):
-        if res.status_code == 200:
-            res = res.json()
-            logger.debug(f"[LinkSum] summary result, res={res}")
-            if res.get("code") == 200:
-                data = res.get("data")
-                return {
-                    "summary": data.get("summary"),
-                    "summary_id": data.get("summary_id")
-                }
-        else:
-            res_json = res.json()
-            logger.error(f"[LinkSum] summary error, status_code={res.status_code}, msg={res_json.get('message')}")
+        ok, data, message = Util.parse_linkai_response(res)
+        logger.debug(f"[LinkSum] summary result, ok={ok}, message={message}")
+        if not ok:
+            logger.error(f"[LinkSum] summary error, status_code={res.status_code}, msg={message}")
             return None
+        return {
+            "summary": data.get("summary"),
+            "summary_id": data.get("summary_id")
+        }
 
     def base_url(self):
         return conf().get("linkai_api_base", "https://api.link-ai.tech")
@@ -79,7 +81,11 @@ class LinkSummary:
             logger.warn(f"[LinkSum] file size exceeds limit, No processing, file_size={file_size}KB")
             return False
 
-        suffix = file_path.split(".")[-1]
+        # Matched case-insensitively, like the media classifier in
+        # models/linkai/link_ai_bot.py (`urlparse(url).path.lower()`): a
+        # "REPORT.PDF" used to come back from `split(".")[-1]` as "PDF", get
+        # reported as unsupported, and the file was silently skipped.
+        suffix = os.path.splitext(file_path)[1].lstrip(".").lower()
         support_list = ["txt", "csv", "docx", "pdf", "md", "jpg", "jpeg", "png"]
         if suffix not in support_list:
             logger.warn(f"[LinkSum] unsupported file, suffix={suffix}, support_list={support_list}")

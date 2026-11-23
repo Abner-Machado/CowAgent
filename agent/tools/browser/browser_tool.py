@@ -82,7 +82,7 @@ class BrowserTool(BaseTool):
             },
             "selector": {
                 "type": "string",
-                "description": "CSS selector as fallback when ref is unavailable (for click/fill/select/wait/get_text)"
+                "description": "CSS selector as fallback when ref is unavailable (for click/fill/select/wait/get_text), or to scope a snapshot to one region"
             },
             "text": {
                 "type": "string",
@@ -99,6 +99,10 @@ class BrowserTool(BaseTool):
             "direction": {
                 "type": "string",
                 "description": "Scroll direction: up, down, left, right (for 'scroll' action, default: down)"
+            },
+            "amount": {
+                "type": "integer",
+                "description": "Scroll distance in pixels (for 'scroll' action, default: 500)"
             },
             "script": {
                 "type": "string",
@@ -270,7 +274,7 @@ class BrowserTool(BaseTool):
         )
 
     def execute(self, args: Dict[str, Any]) -> ToolResult:
-        action = args.get("action", "").strip().lower()
+        action = (args.get("action") or "").strip().lower()
         if not action:
             return ToolResult.fail("Error: 'action' parameter is required")
 
@@ -303,7 +307,7 @@ class BrowserTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _do_navigate(self, args: Dict[str, Any]) -> ToolResult:
-        url = args.get("url", "").strip()
+        url = (args.get("url") or "").strip()
         if not url:
             return ToolResult.fail("Error: 'url' is required for navigate action")
         # Only auto-prepend https:// for bare hosts; preserve file://, about:, data:, etc.
@@ -324,6 +328,23 @@ class BrowserTool(BaseTool):
         result = service.navigate(url, timeout=timeout)
         if "error" in result:
             return ToolResult.fail(result["error"])
+        # page.goto follows redirects, so the page it landed on is checked too.
+        # On a refusal the browser leaves it, or the next snapshot would read it.
+        final_url = result.get("url") or ""
+        if (
+            final_url
+            and final_url != url
+            and final_url.split(":", 1)[0].lower() in ("http", "https")
+            and not self._allow_private_targets()
+        ):
+            try:
+                self._validate_url_safe(final_url)
+            except ValueError as e:
+                try:
+                    service.navigate("about:blank")
+                except Exception:
+                    pass
+                return ToolResult.fail(f"Error: {e}")
         # Auto-snapshot after navigation so the agent gets page content in one call
         snapshot_text = service.snapshot()
         return ToolResult.success(
@@ -343,26 +364,26 @@ class BrowserTool(BaseTool):
         result = self._get_service().click(ref=ref, selector=selector, timeout=timeout)
         if "error" in result:
             return ToolResult.fail(result["error"])
-        return ToolResult.success(f"Clicked successfully. Use 'snapshot' to see updated page.")
+        return ToolResult.success("Clicked successfully. Use 'snapshot' to see updated page.")
 
     def _do_fill(self, args: Dict[str, Any]) -> ToolResult:
-        text = args.get("text", "")
+        text = args.get("text")
         ref = args.get("ref")
         selector = args.get("selector")
         timeout = args.get("timeout", 5000)
-        if not text and text != "":
+        if not isinstance(text, str):
             return ToolResult.fail("Error: 'text' is required for fill action")
         result = self._get_service().fill(text, ref=ref, selector=selector, timeout=timeout)
         if "error" in result:
             return ToolResult.fail(result["error"])
-        return ToolResult.success(f"Filled text into element. Use 'snapshot' to verify.")
+        return ToolResult.success("Filled text into element. Use 'snapshot' to verify.")
 
     def _do_select(self, args: Dict[str, Any]) -> ToolResult:
-        value = args.get("value", "")
+        value = args.get("value")
         ref = args.get("ref")
         selector = args.get("selector")
         timeout = args.get("timeout", 5000)
-        if not value:
+        if not isinstance(value, str):
             return ToolResult.fail("Error: 'value' is required for select action")
         result = self._get_service().select(value, ref=ref, selector=selector, timeout=timeout)
         if "error" in result:
@@ -371,9 +392,7 @@ class BrowserTool(BaseTool):
 
     def _do_scroll(self, args: Dict[str, Any]) -> ToolResult:
         direction = args.get("direction", "down")
-        amount = args.get("timeout", 500)  # reuse timeout field or default
-        if "amount" in args:
-            amount = args["amount"]
+        amount = args.get("amount", 500)
         result = self._get_service().scroll(direction=direction, amount=amount)
         if "error" in result:
             return ToolResult.fail(result["error"])
@@ -391,7 +410,7 @@ class BrowserTool(BaseTool):
         result = self._get_service().wait(selector=selector, timeout=timeout)
         if "error" in result:
             return ToolResult.fail(result["error"])
-        return ToolResult.success(f"Wait completed.")
+        return ToolResult.success("Wait completed.")
 
     def _do_back(self, args: Dict[str, Any]) -> ToolResult:
         result = self._get_service().go_back()
@@ -406,7 +425,7 @@ class BrowserTool(BaseTool):
         return ToolResult.success(f"Navigated forward to: {result['url']}")
 
     def _do_get_text(self, args: Dict[str, Any]) -> ToolResult:
-        selector = args.get("selector", "").strip()
+        selector = (args.get("selector") or "").strip()
         if not selector:
             return ToolResult.fail("Error: 'selector' is required for get_text action")
         result = self._get_service().get_text(selector)
@@ -415,7 +434,7 @@ class BrowserTool(BaseTool):
         return ToolResult.success(result["text"])
 
     def _do_press(self, args: Dict[str, Any]) -> ToolResult:
-        key = args.get("key", "").strip()
+        key = (args.get("key") or "").strip()
         if not key:
             return ToolResult.fail("Error: 'key' is required for press action")
         result = self._get_service().press(key)
@@ -424,7 +443,7 @@ class BrowserTool(BaseTool):
         return ToolResult.success(f"Pressed key: {key}")
 
     def _do_evaluate(self, args: Dict[str, Any]) -> ToolResult:
-        script = args.get("script", "").strip()
+        script = (args.get("script") or "").strip()
         if not script:
             return ToolResult.fail("Error: 'script' is required for evaluate action")
         result = self._get_service().evaluate(script)
